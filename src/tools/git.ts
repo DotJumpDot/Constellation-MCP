@@ -36,8 +36,13 @@ function wrap(line: string, width: number): string {
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await exec('git', args, { cwd, windowsHide: true, maxBuffer: 16 * 1024 * 1024 })
-  return stdout
+  try {
+    const { stdout } = await exec('git', args, { cwd, windowsHide: true, maxBuffer: 16 * 1024 * 1024 })
+    return stdout
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`${message.trim()}\n(ran in "${cwd}" — the MCP server's own cwd, not your session cwd. Pass repo: "<absolute path>" for your repo.)`)
+  }
 }
 
 export function registerGitTools(server: ToolRegistrar): void {

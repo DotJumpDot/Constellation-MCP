@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { createRequire } from 'node:module'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -174,4 +175,59 @@ test('cli args override config', () => {
 test('entryMatches path prefix semantics', () => {
   assert.equal(entryMatches('acme.com/api/', new URL('https://acme.com/api/v1')), true)
   assert.equal(entryMatches('acme.com/api/', new URL('https://acme.com/apix')), false)
+})
+
+test('oob: tokens and events survive a server restart via the JSONL log', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oob-persist-'))
+  const file = path.join(dir, 'oob-log.jsonl')
+  const first = new OobStore(18801, undefined, file)
+  const entry = first.newToken('survivor')
+  await first.ensureServer()
+  await fetch(first.urls(entry.token).local + '/cb?a=1', { method: 'POST', body: 'kept' })
+  await new Promise(r => setTimeout(r, 150))
+  await first.dispose()
+  // "restart": a fresh store reading the same persist file
+  const second = new OobStore(18801, undefined, file)
+  const revived = second.events(entry.token)
+  assert.ok(revived !== undefined, 'token restored from disk')
+  assert.equal(revived.length, 1)
+  assert.equal(revived[0]!.body, 'kept')
+  assert.equal(second.list()[0]!.label, 'survivor')
+  // and the restarted store still records NEW hits for the old token
+  await second.ensureServer()
+  await fetch(second.urls(entry.token).local + '/after-restart')
+  await new Promise(r => setTimeout(r, 150))
+  assert.equal(second.events(entry.token)!.length, 2)
+  await second.dispose()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('oob: a second instance falls back to an ephemeral port instead of dying', async () => {
+  const a = new OobStore(18802)
+  const b = new OobStore(18802)
+  try {
+    const portA = await a.ensureServer()
+    const portB = await b.ensureServer()
+    assert.equal(portA, 18802)
+    assert.notEqual(portB, 18802, 'second instance must not reuse the taken port')
+    const ta = a.newToken('a')
+    const tb = b.newToken('b')
+    await fetch(b.urls(tb.token).local)
+    await new Promise(r => setTimeout(r, 150))
+    assert.equal(b.events(tb.token)!.length, 1, 'hit landed on the fallback instance')
+    assert.equal(a.events(ta.token)!.length, 0, 'first instance untouched')
+  } finally {
+    await a.dispose()
+    await b.dispose()
+  }
+})
+
+test('run-code compiler: accepts async (page, require) and rejects junk', async () => {
+  const { makeUserFn } = await import('../src/browser/tools.js')
+  const fn = makeUserFn('async (page, require) => ({ title: await page.title(), fs: typeof require("node:fs").writeFileSync })')
+  const fakePage = { title: async () => 'smoke page' }
+  const result = await fn(fakePage, createRequire(import.meta.url)) as { title: string; fs: string }
+  assert.equal(result.title, 'smoke page')
+  assert.equal(result.fs, 'function', 'Node require is injected server-side')
+  assert.throws(() => makeUserFn('not a function at all'), /must be a function expression/)
 })

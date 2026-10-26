@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import path from 'node:path'
 import type { ConstellationConfig } from './config.js'
 import { ScopeGuard } from './scope.js'
 import { OwnerRegistry } from './browser/registry.js'
@@ -19,7 +20,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   const registry = new OwnerRegistry(config)
   const scope = new ScopeGuard(config.scopeFile, config.auditFile)
   const env: ToolEnv = { config, registry, scope }
-  const oob = new OobStore(config.oobPort, config.oobPublicBase)
+  const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
 
   const mcp = new McpServer({ name: 'constellation', version: '0.1.0' }, {
     instructions: [
@@ -28,6 +29,8 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
       'Call browser_map for the ownership map; tab_open/tab_lease to hold tabs; browser_reset {keep:["shared"]} at lane end.',
       'scope_set before engaging a target — http_request and navigation are then scope-enforced and audited.',
       'Secrets: reference $secret:NAME inside http_request instead of pasting values.',
+      'browser_run_code_unsafe is the escape hatch (full Page API + Node require, NOT scope-guarded inside) — use it only when guarded tools cannot express the step.',
+      'human_task_* / lane_freeze / team_snapshot are NATIVE team tools with no mcp__ prefix — do not add a server prefix to them.',
     ].join('\n'),
   })
 

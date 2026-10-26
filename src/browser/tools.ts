@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { z } from 'zod'
 import type { Page } from 'playwright-core'
@@ -28,6 +29,20 @@ const TAB_FIELD = { tab: z.number().int().optional().describe('Tab index as list
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}\n… [truncated ${s.length - max} chars]`
+}
+
+/** Compile a user-supplied `async (page, require) => {...}` expression. Pure
+ *  so tests can pin the shape without a browser. */
+export function makeUserFn(code: string): (page: unknown, requireFn: NodeJS.Require) => Promise<unknown> {
+  let fn: unknown
+  try {
+    fn = (0, eval)(`(${code})`)
+  } catch (error) {
+    throw new Error(`code must be a function expression like \`async (page, require) => { ... }\` (${error instanceof Error ? error.message : String(error)})`)
+  }
+  if (typeof fn !== 'function')
+    throw new Error('code must be a function expression like `async (page, require) => { ... }`')
+  return fn as (page: unknown, requireFn: NodeJS.Require) => Promise<unknown>
 }
 
 function sessionOf(env: ToolEnv, ownerRaw: string | undefined): { session: BrowserSession; owner: string } {
@@ -288,7 +303,9 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const snaps = await env.registry.snapshot()
       const scope = env.scope.current()
       const lines = snaps.length === 0 ? ['(no sessions launched yet — sessions appear when an owner first uses a browser tool)'] : snaps.map(snap => {
-        const head = `${snap.owner === SHARED_OWNER ? 'shared (human)' : snap.owner} — ${snap.windowLabel} — profile: ${snap.userDir}`
+        const head = snap.owner === SHARED_OWNER
+          ? `shared (human session, no label prefix) — profile: ${snap.userDir}`
+          : `${snap.owner} — own window, titles prefixed "[${snap.owner}]" — profile: ${snap.userDir}`
         const tabs = snap.tabs.map(tab => {
           const marks = [snap.selected === tab.id ? '▶' : ' ', tab.leasedBy ? `leased:${tab.leasedBy}${tab.purpose ? `(${tab.purpose})` : ''}` : '', tab.openedBy !== SHARED_OWNER && tab.openedBy !== snap.owner ? `openedBy:${tab.openedBy}` : ''].filter(Boolean).join(' ')
           return `   ${marks} [${tab.index}] ${tab.title} — ${tab.url}`
@@ -345,6 +362,18 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         await cdp.detach().catch(() => {})
       }
       return textResult(`Dispatched ${action} via CDP.\n\n${truncate(await snapshotOf(page), 40_000)}`)
+    })
+
+  t('browser_run_code_unsafe', 'UNSAFE escape hatch: run `async (page, require) => {...}` server-side with the full Playwright Page API on the owner\'s current tab, plus Node `require` (fs, path, …) for saving artifacts. NOT scope-guarded inside — only use it when the guarded tools cannot express the step (bulk sweeps, waitUntil networkidle, complex flows).',
+    { code: z.string().describe('Function expression, e.g. `async (page, require) => { await page.goto(url); return page.title() }`'), ...OWNER_FIELD, ...TAB_FIELD },
+    async ({ code, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      const fn = makeUserFn(code)
+      const nodeRequire = createRequire(import.meta.url)
+      const result = await fn(page, nodeRequire)
+      const rendered = result === undefined ? 'undefined' : JSON.stringify(result, null, 2) ?? String(result)
+      return textResult(truncate(rendered, 50_000))
     })
 
   t('browser_wait_for', 'Wait for text to appear or for a time to pass on the owner\'s current tab.',

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import http from 'node:http'
 import { z } from 'zod'
 import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '../browser/tools.js'
@@ -26,22 +27,55 @@ const MAX_BODY_CAPTURE = 4_096
 export class OobStore {
   private tokens = new Map<string, OobToken>()
   private server?: http.Server
+  private boundPort?: number
 
-  constructor(private port: number, private publicBase?: string) {}
+  constructor(private port: number, private publicBase?: string, private persistFile?: string) {
+    this.loadPersisted()
+  }
+
+  private loadPersisted(): void {
+    if (this.persistFile === undefined) return
+    let text = ''
+    try { text = fs.readFileSync(this.persistFile, 'utf8') } catch { return }
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        const record = JSON.parse(line) as { type: string; token: string; label?: string; createdAt?: number; event?: OobEvent }
+        if (record.type === 'token') {
+          if (!this.tokens.has(record.token)) {
+            this.tokens.set(record.token, {
+              token: record.token,
+              ...(record.label === undefined ? {} : { label: record.label }),
+              createdAt: record.createdAt ?? Date.now(),
+              events: [],
+            })
+          }
+        } else if (record.type === 'event') {
+          const entry = this.tokens.get(record.token)
+          if (entry !== undefined && record.event !== undefined) entry.events.push(record.event)
+        }
+      } catch { /* skip malformed line */ }
+    }
+  }
+
+  private persist(record: object): void {
+    if (this.persistFile === undefined) return
+    try { fs.appendFileSync(this.persistFile, JSON.stringify(record) + '\n') } catch { /* best effort */ }
+  }
 
   newToken(label?: string): OobToken {
     const token = crypto.randomBytes(8).toString('hex')
     const entry: OobToken = { token, ...(label === undefined ? {} : { label }), createdAt: Date.now(), events: [] }
     this.tokens.set(token, entry)
+    this.persist({ type: 'token', token, ...(label === undefined ? {} : { label }), createdAt: entry.createdAt })
     return entry
   }
 
-  /** Start the local receiver (idempotent). Returns the listening port. */
+  /** Start the local receiver (idempotent). Returns the port actually bound —
+   *  when the configured port is taken (a second Constellation session), it
+   *  falls back to an ephemeral port instead of dying. */
   async ensureServer(): Promise<number> {
-    if (this.server !== undefined) {
-      const addr = this.server.address()
-      if (addr !== null && typeof addr === 'object') return addr.port
-    }
+    if (this.server !== undefined && this.boundPort !== undefined) return this.boundPort
     const server = http.createServer((req, res) => {
       const chunks: Buffer[] = []
       req.on('data', chunk => { if (chunks.reduce((n, c) => n + c.length, 0) < MAX_BODY_CAPTURE) chunks.push(chunk as Buffer) })
@@ -61,23 +95,37 @@ export class OobStore {
           if (entry !== undefined) {
             entry.events.push(event)
             if (entry.events.length > MAX_EVENTS_PER_TOKEN) entry.events.shift()
+            this.persist({ type: 'event', token: entry.token, event })
           }
         }
         res.writeHead(200, { 'content-type': 'text/plain' })
         res.end('constellation-oob\n')
       })
     })
-    this.server = server
-    await new Promise<void>((resolve, reject) => {
+    const listen = (port: number) => new Promise<void>((resolve, reject) => {
       server.once('error', reject)
-      server.listen(this.port, '127.0.0.1', () => resolve())
+      server.listen(port, '127.0.0.1', () => resolve())
     })
-    return this.port
+    try {
+      await listen(this.port)
+    } catch {
+      // EADDRINUSE (or bind failure): fall back to an ephemeral port so a
+      // second session keeps working; its oob_new output reports the real port.
+      await listen(0)
+    }
+    // Keep an error handler attached so a late socket error cannot crash the
+    // whole MCP server process.
+    server.on('error', () => {})
+    const address = server.address()
+    this.server = server
+    this.boundPort = typeof address === 'object' && address !== null ? address.port : this.port
+    return this.boundPort
   }
 
   urls(token: string): { local: string; public?: string } {
+    const port = this.boundPort ?? this.port
     return {
-      local: `http://127.0.0.1:${this.port}/oob/${token}`,
+      local: `http://127.0.0.1:${port}/oob/${token}`,
       ...(this.publicBase === undefined ? {} : { public: `${this.publicBase.replace(/\/$/, '')}/oob/${token}` }),
     }
   }
@@ -100,6 +148,7 @@ export class OobStore {
       if (this.server === undefined) return resolve()
       this.server.close(() => resolve())
       this.server = undefined
+      this.boundPort = undefined
     })
   }
 }
@@ -110,7 +159,7 @@ export function registerOobTools(server: ToolRegistrar, store: OobStore): void {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('oob_new', 'Create an out-of-band callback token for SSRF/blind-XSS proof. Local receiver on 127.0.0.1; set CONSTELLATION_OOB_PUBLIC_BASE for a public tunnel URL.',
+  t('oob_new', 'Create an out-of-band callback token for SSRF/blind-XSS proof. Local receiver on 127.0.0.1; set CONSTELLATION_OOB_PUBLIC_BASE for a public tunnel URL. Tokens and hits survive a server restart.',
     { label: z.string().optional().describe('What this token is for, e.g. "launchdarkly-webhook"') },
     async ({ label }: any) => {
       const port = await store.ensureServer()
@@ -119,7 +168,7 @@ export function registerOobTools(server: ToolRegistrar, store: OobStore): void {
       return textResult([
         `token: ${entry.token}${label === undefined ? '' : ` (${label})`}`,
         `local:  ${urls.local}`,
-        ...(urls.public !== undefined ? [`public: ${urls.public}`] : ['public: set CONSTELLATION_OOB_PUBLIC_BASE (e.g. a cloudflared/ngrok tunnel to 127.0.0.1:8787) and re-run for a public URL']),
+        ...(urls.public !== undefined ? [`public: ${urls.public}`] : ['public: set CONSTELLATION_OOB_PUBLIC_BASE (e.g. a cloudflared/ngrok tunnel to this port) and re-run for a public URL']),
         `receiver listening on 127.0.0.1:${port} — call oob_events {token} to read hits`,
       ].join('\n'))
     })
