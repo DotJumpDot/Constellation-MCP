@@ -92,34 +92,74 @@ export function evaluateScope(rule: ScopeRule | null, rawUrl: string, options: {
   }
 }
 
+/** The persisted shape: one global rule plus optional per-owner (per-lane)
+ *  rules — a 10-teammate run spans 10 engagements, and a single global list
+ *  would force every lane into one union scope. */
+export interface ScopeFile {
+  global: ScopeRule | null
+  perOwner: Record<string, ScopeRule>
+}
+
 export class ScopeGuard {
   private rule: ScopeRule | null
+  private perOwner: Record<string, ScopeRule> = {}
 
   constructor(private scopeFile: string, private auditFile: string, private requireScope = false) {
     try {
-      this.rule = JSON.parse(fs.readFileSync(scopeFile, 'utf8')) as ScopeRule
+      const parsed = JSON.parse(fs.readFileSync(scopeFile, 'utf8')) as ScopeFile | ScopeRule
+      if ('global' in parsed && 'perOwner' in parsed) {
+        this.rule = parsed.global
+        this.perOwner = parsed.perOwner ?? {}
+      } else {
+        // v1 single-rule file
+        this.rule = parsed as ScopeRule
+      }
     } catch {
       this.rule = null
     }
   }
 
-  current(): ScopeRule | null {
+  current(owner?: string): ScopeRule | null {
+    if (owner !== undefined && this.perOwner[owner] !== undefined) return this.perOwner[owner]
     return this.rule
   }
 
-  set(rule: ScopeRule): void {
-    this.rule = rule
-    fs.writeFileSync(this.scopeFile, JSON.stringify(rule, null, 2) + '\n')
+  set(rule: ScopeRule, owner?: string): void {
+    if (owner === undefined) this.rule = rule
+    else this.perOwner[owner] = rule
+    this.persist()
   }
 
-  check(rawUrl: string): ScopeDecision {
-    return evaluateScope(this.rule, rawUrl, { requireScope: this.requireScope })
+  /** Drop the global rule and every per-owner rule (or just one owner's). */
+  clear(owner?: string): void {
+    if (owner === undefined) {
+      this.rule = null
+      this.perOwner = {}
+    } else {
+      delete this.perOwner[owner]
+    }
+    this.persist()
+  }
+
+  owners(): string[] {
+    return Object.keys(this.perOwner).sort()
+  }
+
+  private persist(): void {
+    const file: ScopeFile = { global: this.rule, perOwner: this.perOwner }
+    fs.writeFileSync(this.scopeFile, JSON.stringify(file, null, 2) + '\n')
+  }
+
+  check(rawUrl: string, owner?: string): ScopeDecision {
+    const rule = owner !== undefined && this.perOwner[owner] !== undefined ? this.perOwner[owner]! : this.rule
+    return evaluateScope(rule, rawUrl, { requireScope: this.requireScope })
   }
 
   /** Enforcement entry point: throws with a refusal message when denied.
-   *  Every decision is audited, allow and deny alike. */
+   *  Per-owner rules win for that owner; everyone else falls back to the
+   *  global rule. Every decision is audited, allow and deny alike. */
   assert(rawUrl: string, owner: string, tool: string): ScopeDecision {
-    const decision = this.check(rawUrl)
+    const decision = this.check(rawUrl, owner)
     this.audit(rawUrl, owner, tool, decision)
     if (!decision.allowed)
       throw new Error(`SCOPE DENIED: ${decision.reason}. Requested: ${rawUrl}`)

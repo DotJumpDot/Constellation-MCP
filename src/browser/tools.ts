@@ -302,11 +302,14 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Released lease on tab [${index}] id=${meta.id}`)
     })
 
-  t('browser_map', 'Ownership map: every browser session (per owner), its window label, tabs, leases, plus scope status. The Lead\'s view.',
-    {},
-    async () => {
-      const snaps = await env.registry.snapshot()
-      const scope = env.scope.current()
+  t('browser_map', 'Ownership map: browser sessions, window labels, tabs, leases, plus scope status. Default shows EVERY owner (the Lead\'s view); pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
+    { owner: z.string().optional().describe('Your owner name: scopes the map to your session + shared') },
+    async ({ owner }: any) => {
+      const who = owner === undefined ? undefined : resolveOwner(owner)
+      const all = await env.registry.snapshot()
+      const snaps = who === undefined ? all : all.filter(snap => snap.owner === who || snap.owner === SHARED_OWNER)
+      const scopeRule = env.scope.current(who)
+      const perOwners = env.scope.owners()
       const lines = snaps.length === 0 ? ['(no sessions launched yet — sessions appear when an owner first uses a browser tool)'] : snaps.map(snap => {
         const head = snap.owner === SHARED_OWNER
           ? `shared (human session, no label prefix) — profile: ${snap.userDir}`
@@ -317,7 +320,9 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         })
         return [head, ...(tabs.length === 0 ? ['   (no tabs)'] : tabs)].join('\n')
       })
-      const scopeLine = scope === null ? 'scope: UNRESTRICTED (call scope_set before engaging a target)' : `scope: ${scope.engagement ?? '(unnamed)'} — in: ${scope.in_scope.join(', ') || '∅'} — out: ${scope.out_scope.join(', ') || '∅'}`
+      const scopeLine = scopeRule === null
+        ? `scope: UNRESTRICTED (call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
+        : `scope${who === undefined ? '' : ` (${who})`}: ${scopeRule.engagement ?? '(unnamed)'} — in: ${scopeRule.in_scope.join(', ') || '∅'} — out: ${scopeRule.out_scope.join(', ') || '∅'}${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
       return textResult([...lines, '', scopeLine].join('\n'))
     })
 

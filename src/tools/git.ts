@@ -45,10 +45,14 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   }
 }
 
-/** The MCP server's process cwd is NOT the session workspace, so prefer any
- *  harness-provided workspace env before falling back. */
+/** The MCP server's process cwd is NOT the session workspace, and dsh sets
+ *  no workspace env for MCP children — so remember the last repo the team
+ *  named explicitly: the first repo_status/repo_commit with `repo:` seeds
+ *  the default for every later call in the run (workers stop passing it). */
+let lastRepo: string | undefined
 function defaultRepo(): string {
-  return process.env.DSH_WORKSPACE
+  return lastRepo
+    ?? process.env.DSH_WORKSPACE
     ?? process.env.DSH_SESSION_CWD
     ?? process.env.DSH_CWD
     ?? process.cwd()
@@ -60,9 +64,10 @@ export function registerGitTools(server: ToolRegistrar): void {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('repo_status', 'Git status + branch + ahead/behind for a repo.',
-    { repo: z.string().optional().describe('Repo path (default: server cwd)') },
+  t('repo_status', 'Git status + branch + ahead/behind for a repo. Pass `repo` once per run — later calls reuse it.',
+    { repo: z.string().optional().describe('Repo path (defaults to the last repo used this run, else the server cwd)') },
     async ({ repo }: any) => {
+      if (repo !== undefined) lastRepo = repo
       const cwd = repo ?? defaultRepo()
       const status = await git(cwd, 'status', '--porcelain=v1', '-b')
       return textResult(status === '' ? '(clean)' : status.trimEnd())
@@ -79,6 +84,7 @@ export function registerGitTools(server: ToolRegistrar): void {
       push: z.boolean().optional().describe('Push after committing'),
     },
     async ({ type, subject, bullets, verification, paths, repo, push }: any) => {
+      if (repo !== undefined) lastRepo = repo
       const cwd = repo ?? defaultRepo()
       const staged = (await git(cwd, 'diff', '--cached', '--name-only')).split('\n').map(s => s.trim()).filter(s => s !== '')
       const wanted = new Set(paths)

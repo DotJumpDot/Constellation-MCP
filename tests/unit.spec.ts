@@ -294,3 +294,45 @@ test('http: non-http scheme rejected before any fetch; body preview capped but s
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('scope: per-owner (per-lane) rules win for that owner; others keep the global rule', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scope-owner-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  guard.set({ engagement: 'global-mbb', in_scope: ['global.com'], out_scope: [] })
+  guard.set({ engagement: 'ynab-mbb', in_scope: ['ynab.com'], out_scope: [] }, 'ynab-worker')
+  assert.equal(guard.check('https://ynab.com/', 'ynab-worker').allowed, true)
+  assert.equal(guard.check('https://global.com/', 'ynab-worker').allowed, false, 'owner rule replaces, not extends')
+  assert.equal(guard.check('https://global.com/', 'other-worker').allowed, true, 'others fall back to global')
+  // persistence: per-owner rules survive reload (the v2 file shape)
+  const reloaded = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  assert.equal(reloaded.check('https://ynab.com/', 'ynab-worker').allowed, true)
+  assert.deepEqual(reloaded.owners(), ['ynab-worker'])
+  // targeted clear drops one lane, keeps the rest
+  reloaded.clear('ynab-worker')
+  assert.equal(reloaded.check('https://ynab.com/', 'ynab-worker').allowed, false, 'lane rule gone; global fallback denies ynab')
+  assert.equal(reloaded.check('https://global.com/', 'ynab-worker').allowed, true)
+  reloaded.clear()
+  assert.equal(reloaded.current(), null)
+})
+
+test('scope tools: scope_clear clears the stale-rule surprise; repo default is sticky', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scopetools2-'))
+  const { ScopeGuard } = await import('../src/scope.js')
+  const { registerScopeTools } = await import('../src/tools/scope.js')
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  guard.set({ engagement: 'stale-engagement', in_scope: ['old.com'], out_scope: [] })
+  const calls = new Map<string, (args: any) => Promise<any>>()
+  const registrar = { registerTool: (name: string, _i: unknown, _s: unknown, handler: (a: any) => Promise<any>) => { calls.set(name, handler) } } as never
+  registerScopeTools(registrar, guard, false)
+  const cleared = await calls.get('scope_clear')!({})
+  assert.match(cleared.content[0].text, /scope CLEARED/)
+  assert.equal(guard.current(), null)
+  guard.set({ engagement: 'one-lane', in_scope: ['a.com'], out_scope: [] }, 'lane-a')
+  const clearedOne = await calls.get('scope_clear')!({ owner: 'lane-a' })
+  assert.match(clearedOne.content[0].text, /owner "lane-a"/)
+  assert.equal(guard.owners().length, 0)
+  // per-owner set through the tool
+  const set = await calls.get('scope_set')!({ engagement: 'ynab', in_scope: ['ynab.com'], owner: 'ynab-worker' })
+  assert.match(set.content[0].text, /owner "ynab-worker"/)
+  assert.equal(guard.check('https://ynab.com/', 'ynab-worker').allowed, true)
+})

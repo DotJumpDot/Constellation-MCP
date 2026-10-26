@@ -210,9 +210,14 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
         const lb = rb.body.split('\n')
         for (let i = 0; i < Math.max(la.length, lb.length); i++) {
           if (la[i] !== lb[i]) {
+            const show = (line: string | undefined): string => {
+              if (line === undefined) return '(no line)'
+              const trimmed = line.trim()
+              return trimmed === '' ? '(blank line)' : line.slice(0, 300)
+            }
             lines.push(`first body divergence at line ${i + 1}:`)
-            lines.push(`  A: ${(la[i] ?? '').slice(0, 300)}`)
-            lines.push(`  B: ${(lb[i] ?? '').slice(0, 300)}`)
+            lines.push(`  A: ${show(la[i])}`)
+            lines.push(`  B: ${show(lb[i])}`)
             break
           }
         }
