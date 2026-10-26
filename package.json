@@ -1,51 +1,37 @@
 {
-  "name": "@playwright/mcp",
-  "version": "0.0.83",
-  "description": "Playwright Tools for MCP",
+  "name": "constellation-mcp",
+  "version": "0.1.0",
+  "description": "Constellation MCP — orchestration-aware browser isolation and engagement tooling for agent teams (DST-Comet)",
+  "type": "module",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/microsoft/playwright-mcp.git"
+    "url": "git+https://github.com/DotJumpDot/Constellation-MCP.git"
   },
-  "homepage": "https://playwright.dev",
   "engines": {
-    "node": ">=18"
-  },
-  "author": {
-    "name": "Microsoft Corporation"
-  },
-  "license": "Apache-2.0",
-  "mcpName": "io.github.microsoft/playwright-mcp",
-  "scripts": {
-    "lint": "node update-readme.js",
-    "test": "playwright test",
-    "ctest": "playwright test --project=chrome",
-    "ftest": "playwright test --project=firefox",
-    "wtest": "playwright test --project=webkit",
-    "dtest": "MCP_IN_DOCKER=1 playwright test --project=chromium-docker",
-    "build": "echo OK",
-    "npm-publish": "npm run lint && npm run test && npm publish",
-    "docker-build": "docker build --no-cache -t playwright-mcp-dev:latest .",
-    "docker-rm": "docker rm playwright-mcp-dev",
-    "docker-run": "docker run -it -p 8080:8080 --name playwright-mcp-dev playwright-mcp-dev:latest",
-    "roll": "node roll.js"
-  },
-  "exports": {
-    "./package.json": "./package.json",
-    ".": {
-      "types": "./index.d.ts",
-      "default": "./index.js"
-    }
-  },
-  "dependencies": {
-    "playwright": "1.64.0-alpha-1790635538000",
-    "playwright-core": "1.64.0-alpha-1790635538000"
-  },
-  "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.2",
-    "@playwright/test": "1.64.0-alpha-1790635538000",
-    "@types/node": "^24.3.0"
+    "node": ">=20"
   },
   "bin": {
-    "playwright-mcp": "cli.js"
+    "constellation-mcp": "cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx/esm --test tests/*.spec.ts",
+    "smoke": "node --import tsx/esm scripts/smoke.ts",
+    "verify": "npm run build && npm run test && npm run mcp-smoke",
+    "mcp-smoke": "node --import tsx/esm scripts/mcp-smoke.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "imapflow": "^1.0.218",
+    "mailparser": "^3.7.4",
+    "playwright-core": "^1.56.1",
+    "tough-cookie": "^5.1.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
   }
 }
