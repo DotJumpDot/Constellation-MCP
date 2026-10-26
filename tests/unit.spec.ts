@@ -12,6 +12,8 @@ import { renderCommitMessage, type CommitDraft } from '../src/tools/git.js'
 import { JarStore } from '../src/tools/http.js'
 import { OobStore } from '../src/tools/oob.js'
 import { applyCliArgs, defaultConfig } from '../src/config.js'
+import http from 'node:http'
+import { evaluateScope } from '../src/scope.js'
 
 test('scope: unrestricted when no rule set', () => {
   const decision = evaluateScope(null, 'https://example.com/x')
@@ -230,4 +232,65 @@ test('run-code compiler: accepts async (page, require) and rejects junk', async 
   assert.equal(result.title, 'smoke page')
   assert.equal(result.fs, 'function', 'Node require is injected server-side')
   assert.throws(() => makeUserFn('not a function at all'), /must be a function expression/)
+})
+
+test('scope: file/view-source/javascript schemes are denied even unrestricted', () => {
+  assert.match(evaluateScope(null, 'file:///C:/Windows/win.ini').reason, /never allowed/)
+  assert.match(evaluateScope(null, 'view-source:https://x.test/').reason, /never allowed/)
+  assert.equal(evaluateScope(null, 'data:text/html,hi').allowed, true)
+})
+
+test('scope: REQUIRE_SCOPE denies non-local hosts when no scope is set', () => {
+  assert.equal(evaluateScope(null, 'https://acme.com/', { requireScope: true }).allowed, false)
+  assert.equal(evaluateScope(null, 'https://acme.com/', { requireScope: false }).allowed, true)
+})
+
+test('scope tools: scope_set arms the guard end-to-end through the registrar', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scopetools-'))
+  const { ScopeGuard } = await import('../src/scope.js')
+  const { registerScopeTools } = await import('../src/tools/scope.js')
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const calls = new Map<string, (args: any) => Promise<any>>()
+  const registrar = { registerTool: (name: string, _i: unknown, _s: unknown, handler: (a: any) => Promise<any>) => { calls.set(name, handler) } } as never
+  registerScopeTools(registrar, guard, false)
+  const set = await calls.get('scope_set')!({ engagement: 'acme-mbb', in_scope: ['acme.com'], out_scope: ['mail.acme.com'] })
+  assert.match(set.content[0].text, /scope ARMED for acme-mbb/)
+  assert.equal(guard.check('https://acme.com/').allowed, true)
+  assert.equal(guard.check('https://app.acme.com/').allowed, false, 'bare host entry is exact — subdomains need *.acme.com')
+  assert.equal(guard.check('https://mail.acme.com/').allowed, false)
+  const got = await calls.get('scope_get')!({})
+  assert.match(got.content[0].text, /acme-mbb/)
+  guard.assert('https://acme.com/', 'w1', 'http_request')
+  guard.assert('https://acme.com/', 'w2', 'browser_navigate')
+  const audit = await calls.get('scope_audit')!({ owner: 'w1' })
+  assert.match(audit.content[0].text, /ALLOW .*w1 http_request acme\.com/)
+})
+
+test('http: non-http scheme rejected before any fetch; body preview capped but sha covers full body', async () => {
+  const { JarStore, performRequest } = await import('../src/tools/http.js')
+  const { ScopeGuard } = await import('../src/scope.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'httptools-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  await assert.rejects(() => performRequest(jars, guard, { url: 'file:///C:/Windows/win.ini' } as never, 't', 'http_request'), /scheme "file:" is not allowed/)
+  // local http server: big body, small preview
+  const body = 'x'.repeat(50_000)
+  const server = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end(body) })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    const port = (server.address() as { port: number }).port
+    const result = await performRequest(jars, guard, { url: `http://127.0.0.1:${port}/`, max_body_bytes: 1000 } as never, 't', 'http_request')
+    assert.ok(result.body.length < 2000, 'preview capped')
+    assert.match(result.body, /preview of 50000 bytes/)
+    const crypto = (await import('node:crypto')).default
+    assert.equal(result.body_sha256, crypto.createHash('sha256').update(body).digest('hex'), 'sha covers the FULL body')
+    // jar forget clears disk + memory
+    jars.persist('probejar', jars.jar('probejar'))
+    assert.ok(jars.list().includes('probejar'))
+    assert.equal(jars.forget('probejar'), true)
+    assert.ok(!jars.list().includes('probejar'))
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

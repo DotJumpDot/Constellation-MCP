@@ -26,6 +26,7 @@ async function main(): Promise<void> {
     'mail_latest_otp', 'mail_search', 'mail_wait',
     'oob_events', 'oob_list', 'oob_new',
     'repo_commit', 'repo_status',
+    'scope_audit', 'scope_get', 'scope_set',
     'secrets_get', 'secrets_list',
     'tab_lease', 'tab_open', 'tab_release',
   ]

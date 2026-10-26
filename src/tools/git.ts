@@ -45,6 +45,15 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   }
 }
 
+/** The MCP server's process cwd is NOT the session workspace, so prefer any
+ *  harness-provided workspace env before falling back. */
+function defaultRepo(): string {
+  return process.env.DSH_WORKSPACE
+    ?? process.env.DSH_SESSION_CWD
+    ?? process.env.DSH_CWD
+    ?? process.cwd()
+}
+
 export function registerGitTools(server: ToolRegistrar): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
@@ -54,7 +63,7 @@ export function registerGitTools(server: ToolRegistrar): void {
   t('repo_status', 'Git status + branch + ahead/behind for a repo.',
     { repo: z.string().optional().describe('Repo path (default: server cwd)') },
     async ({ repo }: any) => {
-      const cwd = repo ?? process.cwd()
+      const cwd = repo ?? defaultRepo()
       const status = await git(cwd, 'status', '--porcelain=v1', '-b')
       return textResult(status === '' ? '(clean)' : status.trimEnd())
     })
@@ -70,7 +79,7 @@ export function registerGitTools(server: ToolRegistrar): void {
       push: z.boolean().optional().describe('Push after committing'),
     },
     async ({ type, subject, bullets, verification, paths, repo, push }: any) => {
-      const cwd = repo ?? process.cwd()
+      const cwd = repo ?? defaultRepo()
       const staged = (await git(cwd, 'diff', '--cached', '--name-only')).split('\n').map(s => s.trim()).filter(s => s !== '')
       const wanted = new Set(paths)
       const extraneous = staged.filter(s => !wanted.has(s))

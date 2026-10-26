@@ -42,7 +42,14 @@ export function entryMatches(entry: string, url: URL): boolean {
   return url.pathname.startsWith(pathPart)
 }
 
-const LOCAL_SCHEMES = new Set(['data', 'blob', 'about', 'javascript', 'view-source'])
+/** Schemes that never leave the machine (allowed without a scope — they
+ *  cannot reach a target host). */
+const LOCAL_SCHEMES = new Set(['data', 'blob', 'about'])
+/** Schemes navigation must NEVER accept: `file:` reads local disk into the
+ *  agent's transcript, `view-source:`/`javascript:` are injection vectors. */
+const NAV_DENIED_SCHEMES = new Set(['file', 'view-source', 'javascript', 'chrome', 'devtools', 'edge', 'http+unix', 'https+unix'])
+/** The HTTP client speaks exactly these. */
+export const HTTP_SCHEMES = new Set(['http', 'https'])
 
 export function normalizeUrl(raw: string): URL {
   try {
@@ -52,16 +59,23 @@ export function normalizeUrl(raw: string): URL {
   }
 }
 
-export function evaluateScope(rule: ScopeRule | null, rawUrl: string): ScopeDecision {
+export function evaluateScope(rule: ScopeRule | null, rawUrl: string, options: { requireScope?: boolean } = {}): ScopeDecision {
   let url: URL
   try {
     url = normalizeUrl(rawUrl)
   } catch {
     return { allowed: false, reason: `unparseable URL: ${rawUrl}` }
   }
-  if (LOCAL_SCHEMES.has(url.protocol.replace(':', '')))
+  const scheme = url.protocol.replace(':', '')
+  if (NAV_DENIED_SCHEMES.has(scheme))
+    return { allowed: false, reason: `${url.protocol} URLs are never allowed (local-file and injection risk)` }
+  if (LOCAL_SCHEMES.has(scheme))
     return { allowed: true, reason: `${url.protocol} is a local scheme (no network)` }
-  if (rule === null) return { allowed: true, reason: 'no scope set (unrestricted)' }
+  if (rule === null) {
+    if (options.requireScope === true)
+      return { allowed: false, reason: 'no scope set and CONSTELLATION_REQUIRE_SCOPE=1 — call scope_set before touching any host' }
+    return { allowed: true, reason: 'no scope set (unrestricted)' }
+  }
   const host = url.hostname
   for (const entry of rule.out_scope) {
     if (entryMatches(entry, url))
@@ -81,7 +95,7 @@ export function evaluateScope(rule: ScopeRule | null, rawUrl: string): ScopeDeci
 export class ScopeGuard {
   private rule: ScopeRule | null
 
-  constructor(private scopeFile: string, private auditFile: string) {
+  constructor(private scopeFile: string, private auditFile: string, private requireScope = false) {
     try {
       this.rule = JSON.parse(fs.readFileSync(scopeFile, 'utf8')) as ScopeRule
     } catch {
@@ -99,7 +113,7 @@ export class ScopeGuard {
   }
 
   check(rawUrl: string): ScopeDecision {
-    return evaluateScope(this.rule, rawUrl)
+    return evaluateScope(this.rule, rawUrl, { requireScope: this.requireScope })
   }
 
   /** Enforcement entry point: throws with a refusal message when denied.

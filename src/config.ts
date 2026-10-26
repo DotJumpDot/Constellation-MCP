@@ -21,6 +21,9 @@ export interface ConstellationConfig {
   idleTimeoutMin: number
   scopeFile: string
   auditFile: string
+  /** When true (CONSTELLATION_REQUIRE_SCOPE=1): no scope set ⇒ every
+   *  non-local request is denied. Default: unrestricted until scope_set. */
+  requireScope: boolean
 }
 
 function env(name: string): string | undefined {
@@ -51,6 +54,7 @@ export function defaultConfig(): ConstellationConfig {
     idleTimeoutMin: int('IDLE_TIMEOUT_MIN', 45),
     scopeFile: path.join(rootDir, 'scope.json'),
     auditFile: path.join(rootDir, 'scope-audit.jsonl'),
+    requireScope: env('REQUIRE_SCOPE') === '1' || env('REQUIRE_SCOPE') === 'true',
   }
 }
 

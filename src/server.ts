@@ -7,6 +7,7 @@ import { OwnerRegistry } from './browser/registry.js'
 import { registerBrowserTools, type ToolEnv, type ToolRegistrar } from './browser/tools.js'
 import { registerHttpTools } from './tools/http.js'
 import { registerMailTools } from './tools/mail.js'
+import { registerScopeTools } from './tools/scope.js'
 import { registerSecretTools } from './tools/secrets.js'
 import { OobStore, registerOobTools } from './tools/oob.js'
 import { registerGitTools } from './tools/git.js'
@@ -18,7 +19,7 @@ export interface ConstellationServer {
 
 export function buildServer(config: ConstellationConfig): ConstellationServer {
   const registry = new OwnerRegistry(config)
-  const scope = new ScopeGuard(config.scopeFile, config.auditFile)
+  const scope = new ScopeGuard(config.scopeFile, config.auditFile, config.requireScope)
   const env: ToolEnv = { config, registry, scope }
   const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
 
@@ -42,6 +43,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
 
   registerBrowserTools(registrar, env)
   registerHttpTools(registrar, env)
+  registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)
   registerMailTools(registrar)
   registerOobTools(registrar, oob)

@@ -61,7 +61,8 @@ async function tabFor(session: BrowserSession, owner: string, tabIndex: number |
   if (tabIndex === undefined) return session.currentPage()
   const pages = session.pages()
   const page = pages[tabIndex]
-  if (page === undefined) throw new Error(`no tab at index ${tabIndex} (0..${pages.length - 1}); call browser_tabs {action:'list'} first`)
+  if (page === undefined)
+    throw new Error(`no tab at index ${tabIndex} in ${session.owner === SHARED_OWNER ? 'the shared' : `${session.owner}'s`} session (0..${pages.length - 1}) — tab indices are PER-OWNER; call browser_tabs {action:'list'} with your owner to see your tabs`)
   const verdict = canTouchTab(session.metaOf(page), owner, session.owner)
   if (!verdict.ok) throw new Error(verdict.reason ?? 'tab is leased by another owner')
   return page
@@ -257,6 +258,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
   t('tab_open', 'Open a new tab WITH a lease for the calling owner (tab leases: only you may select/act on it until tab_release).',
     { purpose: z.string().optional().describe('Why this tab exists, shown in browser_map'), url: z.string().optional(), ...OWNER_FIELD },
     async ({ purpose, url, owner }: any) => {
+      if (owner === undefined || owner.trim() === '')
+        throw new Error('tab_open requires an explicit owner — a lease held by "shared" protects nothing and cannot be released by you')
       const { session, owner: who } = sessionOf(env, owner)
       if (url !== undefined) env.scope.assert(url, who, 'tab_open')
       const { meta } = await session.newTab(who, url, purpose)
@@ -270,6 +273,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
   t('tab_lease', 'Lease an existing tab: other owners can no longer select or close it.',
     { index: z.number().int(), purpose: z.string().optional(), ...OWNER_FIELD },
     async ({ index, purpose, owner }: any) => {
+      if (owner === undefined || owner.trim() === '')
+        throw new Error('tab_lease requires an explicit owner — a lease held by "shared" protects nothing and cannot be released by you')
       const { session, owner: who } = sessionOf(env, owner)
       const page = session.pages()[index]
       if (page === undefined) throw new Error(`no tab at index ${index}`)
@@ -361,7 +366,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       } finally {
         await cdp.detach().catch(() => {})
       }
-      return textResult(`Dispatched ${action} via CDP.\n\n${truncate(await snapshotOf(page), 40_000)}`)
+      return textResult(`Dispatched ${action} via CDP.\nNow at: ${await pageOverview(page)}\n\n${truncate(await snapshotOf(page), 40_000)}`)
     })
 
   t('browser_run_code_unsafe', 'UNSAFE escape hatch: run `async (page, require) => {...}` server-side with the full Playwright Page API on the owner\'s current tab, plus Node `require` (fs, path, …) for saving artifacts. NOT scope-guarded inside — only use it when the guarded tools cannot express the step (bulk sweeps, waitUntil networkidle, complex flows).',

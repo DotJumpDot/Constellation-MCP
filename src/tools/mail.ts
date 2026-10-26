@@ -103,7 +103,6 @@ async function searchMail(config: MailConfig, query: { alias?: string; from_cont
     secure: config.port === 993,
     auth: { user: config.user, pass: config.pass },
     logger: false,
-    tls: { rejectUnauthorized: false },
   })
   try {
     await client.connect()

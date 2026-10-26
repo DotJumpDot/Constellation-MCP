@@ -6,6 +6,7 @@ import { CookieJar } from 'tough-cookie'
 import type { ConstellationConfig } from '../config.js'
 import type { ScopeGuard } from '../scope.js'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
+import { HTTP_SCHEMES } from '../scope.js'
 import { interpolateDeep } from './secrets.js'
 
 export interface HttpEnv {
@@ -13,7 +14,7 @@ export interface HttpEnv {
   scope: ScopeGuard
 }
 
-const MAX_BODY = 300_000
+const MAX_BODY_DEFAULT = 20_000
 
 interface JarEntry {
   serialized: unknown
@@ -37,6 +38,15 @@ export class JarStore {
       this.jars.set(id, { serialized: jar.toJSON(), savedAt: Date.now() })
       return jar
     }
+  }
+
+  /** Remove a jar from memory and disk — sticky jars from previous runs are
+   *  an A/B-testing hazard (cookies you forgot you have). */
+  forget(id: string): boolean {
+    const known = this.jars.has(id) || this.list().includes(id)
+    this.jars.delete(id)
+    try { fs.rmSync(this.fileFor(id), { force: true }) } catch { /* best effort */ }
+    return known
   }
 
   persist(id: string, jar: CookieJar): void {
@@ -76,6 +86,14 @@ export interface RequestResult {
 }
 
 export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: RequestSpec, owner: string, tool: string): Promise<RequestResult> {
+  let parsedUrl: URL
+  try {
+    parsedUrl = new URL(spec.url)
+  } catch {
+    throw new Error(`unparseable URL: ${spec.url}`)
+  }
+  if (!HTTP_SCHEMES.has(parsedUrl.protocol.replace(':', '')))
+    throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — http_request supports http/https only`)
   scope.assert(spec.url, owner, tool)
   const jar = jars.jar(spec.jar ?? 'default')
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
@@ -108,12 +126,15 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
 
   const headerRecord: Record<string, string> = {}
   response.headers.forEach((value, key) => { headerRecord[key] = value })
+  const maxBody = spec.max_body_bytes ?? MAX_BODY_DEFAULT
   return {
     status: response.status,
     statusText: response.statusText,
     url_final: response.url,
     headers: headerRecord,
-    body: text.length > MAX_BODY ? text.slice(0, MAX_BODY) + `\n…[truncated, ${text.length} total]` : text,
+    // The sha covers the FULL body (diffing stays exact); only the preview
+    // shown to the caller is capped so big pages cannot flood agent context.
+    body: text.length > maxBody ? text.slice(0, maxBody) + `\n…[preview of ${text.length} bytes — sha256 covers the full body; raise max_body_bytes if you need more]` : text,
     body_sha256: crypto.createHash('sha256').update(text).digest('hex'),
     timing_ms: timing,
     set_cookies: setCookies.length,
@@ -128,6 +149,7 @@ export interface RequestSpec {
   jar?: string
   redirect?: 'follow' | 'manual'
   timeout_ms?: number
+  max_body_bytes?: number
 }
 
 function isJsonObject(v: unknown): boolean {
@@ -152,6 +174,7 @@ const REQUEST_SHAPE: z.ZodRawShape = {
   jar: z.string().optional().describe('Cookie jar id (persisted per id); default "default"'),
   redirect: z.enum(['follow', 'manual']).optional(),
   timeout_ms: z.number().int().optional(),
+  max_body_bytes: z.number().int().optional().describe('Body preview cap (default 20000; sha256 always covers the full body)'),
 }
 
 export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
@@ -199,7 +222,14 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
       return textResult(lines.join('\n'))
     })
 
-  t('http_jars', 'List cookie jars known to the HTTP client.',
-    {},
-    async () => textResult(jars.list().length === 0 ? '(no jars yet — created on first http_request)' : jars.list().join('\n')))
+  t('http_jars', 'List cookie jars known to the HTTP client, or `forget` one (deletes it from disk — use before an A/B pair so stale cookies cannot contaminate the matrix).',
+    { forget: z.string().optional().describe('Jar id to delete') },
+    async ({ forget }: any) => {
+      if (forget !== undefined) {
+        const known = jars.forget(forget)
+        return textResult(known ? `Forgot jar "${forget}" (memory + disk).` : `No jar "${forget}" existed.`)
+      }
+      const list = jars.list()
+      return textResult(list.length === 0 ? '(no jars yet — created on first http_request)' : list.join('\n'))
+    })
 }
