@@ -9,6 +9,14 @@ export async function main(argv: string[]): Promise<void> {
     return
   }
   ensureDirs(config)
+  // A long-lived MCP server must never take the session down with one bad
+  // async path — log and keep serving; the tool call itself returns the error.
+  process.on('uncaughtException', error => {
+    process.stderr.write(`constellation-mcp uncaught: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  })
+  process.on('unhandledRejection', reason => {
+    process.stderr.write(`constellation-mcp unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}\n`)
+  })
   const server = buildServer(config)
   process.on('SIGINT', () => { void server.dispose().finally(() => process.exit(0)) })
   process.on('SIGTERM', () => { void server.dispose().finally(() => process.exit(0)) })

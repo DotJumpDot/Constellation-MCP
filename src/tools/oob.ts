@@ -46,7 +46,7 @@ export class OobStore {
       const chunks: Buffer[] = []
       req.on('data', chunk => { if (chunks.reduce((n, c) => n + c.length, 0) < MAX_BODY_CAPTURE) chunks.push(chunk as Buffer) })
       req.on('end', () => {
-        const tokenMatch = /\/oob\/([A-Za-z0-9]+)(?:\/|$)/.exec(req.url ?? '')
+        const tokenMatch = /\/oob\/([A-Za-z0-9]{6,64})(?:[/?#]|$)/.exec(req.url ?? '')
         const event: OobEvent = {
           ts: new Date().toISOString(),
           method: req.method ?? '?',

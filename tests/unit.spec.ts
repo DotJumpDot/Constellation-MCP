@@ -145,9 +145,15 @@ test('oob tokens: creation, url shaping, live receiver capture', async () => {
     assert.match(urls.local, /^http:\/\/127\.0\.0\.1:18787\/oob\//)
     await store.ensureServer()
     await fetch(urls.local + '/hit?x=1', { method: 'POST', body: 'probe-body' })
+    // regression: query string DIRECTLY after the token (no trailing slash) —
+    // the live-run probe found these hits were dropped by the old token regex
+    await fetch(urls.local + '?probe=1&x=y')
     await new Promise(r => setTimeout(r, 150))
     const events = store.events(entry.token)!
-    assert.equal(events.length, 1)
+    assert.equal(events.length, 2)
+    assert.equal(events[1]!.method, 'GET')
+    assert.match(events[1]!.path, /\/oob\/[a-f0-9]+\?probe=1&x=y/)
+    assert.equal(events[1]!.query, 'probe=1&x=y')
     assert.equal(events[0]!.method, 'POST')
     assert.match(events[0]!.path, /\/oob\/[a-f0-9]+\/hit\?x=1/)
     assert.equal(events[0]!.body, 'probe-body')
