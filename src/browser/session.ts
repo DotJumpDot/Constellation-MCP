@@ -29,6 +29,46 @@ export interface NetworkRecord {
 const CONSOLE_RING = 300
 const NET_RING = 200
 
+/** Owner info-label persistence (DST-Comet P3, build-session advice): labels
+ *  were in-memory only, so a browser_reset or server restart brought the
+ *  window back as "no job set". They now live in `<rootDir>/owner-labels.json`
+ *  keyed by owner. Pure helpers so tests can pin the round-trip. */
+const OWNER_LABELS_FILE = 'owner-labels.json'
+
+export interface OwnerLabel {
+  readonly job?: string
+  readonly engagement?: string
+}
+
+export function loadOwnerLabels(rootDir: string): Record<string, OwnerLabel> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(rootDir, OWNER_LABELS_FILE), 'utf8')) as Record<string, unknown>
+    if (parsed === null || typeof parsed !== 'object') return {}
+    const labels: Record<string, OwnerLabel> = {}
+    for (const [owner, label] of Object.entries(parsed)) {
+      if (label === null || typeof label !== 'object') continue
+      const job = (label as { job?: unknown }).job
+      const engagement = (label as { engagement?: unknown }).engagement
+      labels[owner] = {
+        ...(typeof job === 'string' && job !== '' ? { job } : {}),
+        ...(typeof engagement === 'string' && engagement !== '' ? { engagement } : {}),
+      }
+    }
+    return labels
+  } catch {
+    return {}
+  }
+}
+
+export function saveOwnerLabel(rootDir: string, owner: string, label: OwnerLabel): void {
+  try {
+    const all = loadOwnerLabels(rootDir)
+    all[owner] = label
+    fs.mkdirSync(rootDir, { recursive: true })
+    fs.writeFileSync(path.join(rootDir, OWNER_LABELS_FILE), JSON.stringify(all, null, 2) + '\n')
+  } catch { /* best effort: a lost label only costs the info-tab text */ }
+}
+
 export interface SessionSnapshot {
   owner: string
   running: boolean
@@ -63,7 +103,17 @@ export class BrowserSession {
   infoEngagement?: string
   private infoOpenedAt?: string
 
-  constructor(readonly owner: string, readonly userDir: string, private config: ConstellationConfig) {}
+  constructor(readonly owner: string, readonly userDir: string, private config: ConstellationConfig) {
+    // Seed the info-tab label from disk so a reset/restart window still says
+    // what this owner is doing (the last browser_owner_info written wins).
+    if (owner !== SHARED_OWNER) {
+      const label = loadOwnerLabels(config.rootDir)[owner]
+      if (label !== undefined) {
+        if (label.job !== undefined) this.infoJob = label.job
+        if (label.engagement !== undefined) this.infoEngagement = label.engagement
+      }
+    }
+  }
 
   private get windowLabel(): string {
     return this.owner === SHARED_OWNER ? '' : `[${this.owner}] `
@@ -174,10 +224,15 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`
   }
 
-  /** Update the ownership label (browser_owner_info); re-renders a live tab. */
+  /** Update the ownership label (browser_owner_info); re-renders a live tab
+   *  and persists so the label survives resets and restarts. */
   async setOwnerInfo(job?: string, engagement?: string): Promise<{ job?: string; engagement?: string }> {
     if (job !== undefined) this.infoJob = job
     if (engagement !== undefined) this.infoEngagement = engagement
+    saveOwnerLabel(this.config.rootDir, this.owner, {
+      ...(this.infoJob === undefined ? {} : { job: this.infoJob }),
+      ...(this.infoEngagement === undefined ? {} : { engagement: this.infoEngagement }),
+    })
     if (this.context !== undefined) {
       try { await this.openInfoTab() } catch { /* rendered on next ensure */ }
     }

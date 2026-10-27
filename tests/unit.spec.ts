@@ -360,6 +360,32 @@ test('http_download: saves server-side, transcript sees metadata only, sha256_ex
   }
 })
 
+test('owner labels persist and re-seed a session (info tab survives resets)', async () => {
+  const { loadOwnerLabels, saveOwnerLabel, BrowserSession } = await import('../src/browser/session.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ownerlabels-'))
+  try {
+    assert.deepEqual(loadOwnerLabels(dir), {})
+    saveOwnerLabel(dir, 'scout', { job: 'klaviyo lane: signup + MCP', engagement: 'klaviyo-vdp' })
+    saveOwnerLabel(dir, 'clayton', { engagement: 'flourish-vdp' })
+    const labels = loadOwnerLabels(dir)
+    assert.equal(labels.scout!.job, 'klaviyo lane: signup + MCP')
+    assert.equal(labels.scout!.engagement, 'klaviyo-vdp')
+    assert.equal(labels.clayton!.job, undefined)
+    // A fresh session (post-reset/restart) seeds its label from disk.
+    const session = new BrowserSession('scout', path.join(dir, 'profiles', 'scout'), { rootDir: dir } as never)
+    assert.equal(session.infoJob, 'klaviyo lane: signup + MCP')
+    assert.equal(session.infoEngagement, 'klaviyo-vdp')
+    await session.setOwnerInfo('klaviyo lane: round 2')
+    assert.equal(loadOwnerLabels(dir).scout!.job, 'klaviyo lane: round 2')
+    assert.equal(loadOwnerLabels(dir).scout!.engagement, 'klaviyo-vdp', 'unspecified fields persist')
+    // The shared human session never loads or seeds labels.
+    const shared = new BrowserSession('shared', path.join(dir, 'profiles', 'shared'), { rootDir: dir } as never)
+    assert.equal(shared.infoJob, undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('mail: config trims pasted app-password spaces; anchors pair hrefs with text', async () => {
   const { mailConfig, extractAnchors } = await import('../src/tools/mail.js')
   const previous = { ...process.env }
