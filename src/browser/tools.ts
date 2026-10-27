@@ -6,6 +6,7 @@ import { z } from 'zod'
 import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
+import { maskSecrets, PASSWORD_VALUES_SNIPPET, redactSecrets } from '../redact.js'
 import { SHARED_OWNER, canTouchTab, loadOwnerLabels, type BrowserSession } from './session.js'
 import type { OwnerRegistry } from './registry.js'
 
@@ -22,7 +23,7 @@ export function textResult(text: string, isError = false): ToolResult {
 }
 
 export function errorResult(error: unknown): ToolResult {
-  return textResult(`Error: ${describeErrorChain(error)}`, true)
+  return textResult(`Error: ${redactSecrets(describeErrorChain(error))}`, true)
 }
 
 /** Walk an Error's cause chain: Node's fetch throws a bare
@@ -116,9 +117,21 @@ async function pageOverview(page: Page): Promise<string> {
   return `${page.url()}${title === '' ? '' : ` — ${title}`}`
 }
 
+/** Password-field values on the page, collected straight from the DOM (run-5
+ *  advice §6): an aria snapshot serializes filled textboxes, so a login or
+ *  master-password field would otherwise land in the transcript verbatim. */
+async function passwordValuesOf(page: Page): Promise<string[]> {
+  try {
+    return await page.evaluate(PASSWORD_VALUES_SNIPPET) as string[]
+  } catch {
+    return []
+  }
+}
+
 async function snapshotOf(page: Page): Promise<string> {
   try {
-    return await page.locator('html').ariaSnapshot()
+    const [snapshot, secrets] = await Promise.all([page.locator('html').ariaSnapshot(), passwordValuesOf(page)])
+    return maskSecrets(snapshot, secrets)
   } catch (error) {
     return `[aria snapshot unavailable: ${error instanceof Error ? error.message : String(error)}]\nURL: ${page.url()}`
   }
@@ -151,7 +164,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(await afterActionResult(page))
     })
 
-  t('browser_snapshot', 'Accessibility snapshot (YAML) of the owner\'s current tab.',
+  t('browser_snapshot', 'Accessibility snapshot (YAML) of the owner\'s current tab. Password-field values are masked as •••••• — never paste credentials into automation fields you do not own.',
     { ...OWNER_FIELD, ...TAB_FIELD },
     async ({ owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)

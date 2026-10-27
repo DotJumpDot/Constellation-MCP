@@ -14,7 +14,6 @@ import { JarStore } from '../src/tools/http.js'
 import { OobStore } from '../src/tools/oob.js'
 import { applyCliArgs, defaultConfig } from '../src/config.js'
 import http from 'node:http'
-import { evaluateScope } from '../src/scope.js'
 
 test('scope: unrestricted when no rule set', () => {
   const decision = evaluateScope(null, 'https://example.com/x')
@@ -474,4 +473,52 @@ test('scope tools: scope_clear clears the stale-rule surprise; repo default is s
   const set = await calls.get('scope_set')!({ engagement: 'ynab', in_scope: ['ynab.com'], owner: 'ynab-worker' })
   assert.match(set.content[0].text, /owner "ynab-worker"/)
   assert.equal(guard.check('https://ynab.com/', 'ynab-worker').allowed, true)
+})
+
+test('redact: header values, bearer/JWT/base64 runs are masked (run-5 §1)', async () => {
+  const { redactSecrets } = await import('../src/redact.js')
+  // Playwright-style call log echo of an app access token
+  assert.match(redactSecrets('request.headers.authorization: Bearer sk-proj-abcdefghij0123456789ABCDEFGHIJKLMNOP'), /authorization: Bearer sk-pro…\[redacted\]/)
+  // JSON body style — quoted key/value pair and a bare key inside a message
+  assert.match(redactSecrets('{"api_key": "sk-live-abcdef123456"}'), /"api_key": "sk-liv…\[redacted\]"/)
+  assert.match(redactSecrets('{"error":{"message":"invalid api_key: sk-live-abcdef123456"}}'), /api_key: sk-liv…\[redacted\]/)
+  // Query param
+  assert.match(redactSecrets('GET https://x.test/oauth?access_token=SuperSecretValue123&foo=bar'), /access_token=SuperS…\[redacted\]/)
+  assert.match(redactSecrets('GET https://x.test/oauth?access_token=SuperSecretValue123&foo=bar'), /foo=bar/)
+  // JWT
+  assert.match(redactSecrets('token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c rejected'), /\[redacted-jwt\]/)
+  // Long base64-ish run (48+)
+  assert.match(redactSecrets('got response 7f4d9c2a1b8e5f3a6c0d9e2f4a7b8c1d5e9f0a3b6c8d2e4f6a8b0c2d4e6f8a0b'), /\[redacted\]/)
+  // URL path segments and prose survive
+  assert.equal(redactSecrets('GET https://x.test/api/tokens/abc123 returned 404'), 'GET https://x.test/api/tokens/abc123 returned 404')
+  assert.equal(redactSecrets('token authentication failed for the lane'), 'token authentication failed for the lane')
+})
+
+test('redact: describeErrorChain output passes through redactSecrets at the boundary', async () => {
+  const { redactSecrets } = await import('../src/redact.js')
+  const redacted = redactSecrets(describeErrorChain(new Error('POST /api failed: authorization: Bearer sk-proj-abcdefghij0123456789ABCDEFGHIJKLMNOP')))
+  assert.match(redacted, /authorization: Bearer sk-pro…\[redacted\]/)
+})
+
+test('mask: password values are replaced, short values skipped (run-5 §6)', async () => {
+  const { maskSecrets } = await import('../src/redact.js')
+  const snapshot = '- textbox: correct-horse-battery\n- textbox: MyMaster!PW42\n- textbox: ab\n- heading "Login"'
+  const masked = maskSecrets(snapshot, ['MyMaster!PW42', 'ab'])
+  assert.match(masked, /••••••/)
+  assert.doesNotMatch(masked, /MyMaster!PW42/)
+  assert.match(masked, /correct-horse-battery/, 'non-secret text survives')
+  assert.match(masked, /- textbox: ab/, 'sub-4-char values are not replaced')
+})
+
+test('mail: fallback folders pick Spam/Junk + Trash by special-use (run-5 §9)', async () => {
+  const { fallbackFoldersFrom } = await import('../src/tools/mail.js')
+  const boxes = [
+    { path: 'INBOX', specialUse: ['\\inbox'] },
+    { path: '[Gmail]/All Mail', specialUse: ['\\all'] },
+    { path: '[Gmail]/Spam', specialUse: ['\\junk'] },
+    { path: '[Gmail]/อีเมลขยะ', flags: ['\\Junk'] },
+    { path: '[Gmail]/Trash', specialUse: '\\trash' },
+  ]
+  assert.deepEqual(fallbackFoldersFrom(boxes), ['[Gmail]/Spam', '[Gmail]/Trash'])
+  assert.deepEqual(fallbackFoldersFrom([{ path: 'INBOX' }]), [])
 })

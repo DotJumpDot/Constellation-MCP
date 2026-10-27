@@ -86,8 +86,24 @@ export interface MailHit {
   to: string
   date: string
   seq: number
+  /** Folder the hit came from; present when it is NOT the primary folder
+   *  (Gmail Spam/Trash fallback, run-5 advice §9). Pass it to mail_get. */
+  folder?: string
   extracted_links: string[]
   extracted_codes: string[]
+}
+
+/** Fallback folders to scan when the primary mailbox has no match: Gmail's
+ *  \All ("All Mail") EXCLUDES Spam and Trash, so relayed vendor mail that
+ *  Gmail spam-filters was invisible to search while the human could see it
+ *  (run-5 advice §9). */
+export function fallbackFoldersFrom(boxes: readonly MailboxList[]): string[] {
+  const wanted: string[] = []
+  for (const flag of ['\\junk', '\\trash']) {
+    const match = boxes.find(box => specialUseFlags(box).includes(flag))
+    if (match !== undefined && !wanted.includes(match.path)) wanted.push(match.path)
+  }
+  return wanted
 }
 
 export function extractLinks(text: string): string[] {
@@ -242,7 +258,7 @@ async function fetchMessages(client: ImapClient, seqs: number[]): Promise<Scored
   return messages
 }
 
-function toHit(message: ScoredMessage): MailHit {
+function toHit(message: ScoredMessage, folder?: string): MailHit {
   const textBody = bodyText(message.parsed)
   const subject = message.envelope?.subject ?? message.parsed?.subject ?? '(no subject)'
   const addr = (list?: Array<{ name?: string; address?: string }>) =>
@@ -253,6 +269,7 @@ function toHit(message: ScoredMessage): MailHit {
     to: addr(message.envelope?.to),
     date: (message.envelope?.date ?? message.parsed?.date ?? new Date()).toISOString(),
     seq: message.seq,
+    ...(folder === undefined ? {} : { folder }),
     extracted_links: extractLinks(textBody),
     extracted_codes: extractCodesFor(subject, textBody),
   }
@@ -268,37 +285,64 @@ function matchesAlias(message: ScoredMessage, alias: string): boolean {
   return haystack.includes(`+${alias}`)
 }
 
+/** Run one folder's IMAP search + client-side filters on an open client.
+ *  `folderTag` marks the hits' origin (undefined = the primary folder). */
+async function searchOneFolder(client: ImapClient, folderTag: string | undefined, query: MailQuery, limit: number): Promise<Array<{ message: ScoredMessage; hit: MailHit }>> {
+  const search: Record<string, unknown> = {}
+  // Alias never narrows the IMAP search: forwarding relays rewrite To:, and a
+  // `to` filter returned "(no matching mail)" while the message sat in the
+  // inbox (live run 2026-10-27). Filtering happens client-side.
+  if (query.from_contains !== undefined && query.from_contains !== '') search.from = query.from_contains
+  if (query.subject_contains !== undefined && query.subject_contains !== '') search.subject = query.subject_contains
+  if (query.since_hours !== undefined) search.since = new Date(Date.now() - query.since_hours * 3_600_000)
+  const seqs = (await client.search(search)) || []
+  const scanCap = query.alias !== undefined && query.alias !== '' ? Math.min(Math.max(limit * 10, 30), 120) : limit
+  const wanted = seqs.slice(-scanCap)
+  const messages = await fetchMessages(client, wanted)
+  let hits = messages.map(message => ({ message, hit: toHit(message, folderTag) }))
+  if (query.alias !== undefined && query.alias !== '') {
+    hits = hits.filter(row => matchesAlias(row.message, query.alias!))
+  }
+  if (query.from_contains !== undefined && query.from_contains !== '') {
+    hits = hits.filter(row => row.hit.from.toLowerCase().includes(query.from_contains!.toLowerCase()))
+  }
+  if (query.subject_contains !== undefined && query.subject_contains !== '') {
+    hits = hits.filter(row => row.hit.subject.toLowerCase().includes(query.subject_contains!.toLowerCase()))
+  }
+  hits.sort((a, b) => b.hit.date.localeCompare(a.hit.date))
+  return hits
+}
+
 async function searchMail(config: MailConfig, query: MailQuery, limit: number): Promise<MailHit[]> {
   const { client, folder } = await openClient(config)
   try {
-    const search: Record<string, unknown> = {}
-    // Alias never narrows the IMAP search: forwarding relays rewrite To:, and a
-    // `to` filter returned "(no matching mail)" while the message sat in the
-    // inbox (live run 2026-10-27). Filtering happens client-side.
-    if (query.from_contains !== undefined && query.from_contains !== '') search.from = query.from_contains
-    if (query.subject_contains !== undefined && query.subject_contains !== '') search.subject = query.subject_contains
-    if (query.since_hours !== undefined) search.since = new Date(Date.now() - query.since_hours * 3_600_000)
-    const seqs = (await client.search(search)) || []
-    const scanCap = query.alias !== undefined && query.alias !== '' ? Math.min(Math.max(limit * 10, 30), 120) : limit
-    const wanted = seqs.slice(-scanCap)
-    const messages = await fetchMessages(client, wanted)
-    let hits = messages.map(message => ({ message, hit: toHit(message) }))
-    if (query.alias !== undefined && query.alias !== '') {
-      hits = hits.filter(row => matchesAlias(row.message, query.alias!))
-    }
-    if (query.from_contains !== undefined && query.from_contains !== '') {
-      hits = hits.filter(row => row.hit.from.toLowerCase().includes(query.from_contains!.toLowerCase()))
-    }
-    if (query.subject_contains !== undefined && query.subject_contains !== '') {
-      hits = hits.filter(row => row.hit.subject.toLowerCase().includes(query.subject_contains!.toLowerCase()))
+    const primary = await searchOneFolder(client, undefined, query, limit)
+    let hits = primary
+    const scanned: string[] = [folder]
+    if (hits.length === 0) {
+      // Spam/Junk fallback (run-5 advice §9): Gmail's All Mail excludes Spam
+      // and Trash, so a spam-filtered verification mail was invisible here
+      // while the human could see it in their browser. Fallback hits are
+      // folder-tagged; mail_get takes the same folder to read them.
+      try {
+        const boxes = (await client.list?.()) ?? []
+        for (const fallback of fallbackFoldersFrom(boxes)) {
+          await client.mailboxOpen?.(fallback)
+          scanned.push(fallback)
+          const extra = await searchOneFolder(client, fallback, query, limit)
+          hits = [...hits, ...extra]
+          if (hits.length > 0) break
+        }
+      } catch { /* list is advisory: the primary answer stands */ }
     }
     hits.sort((a, b) => b.hit.date.localeCompare(a.hit.date))
     if (hits.length === 0) {
-      lastSearchNote = `searched folder "${folder}": ${seqs.length} message(s) matched IMAP filters`
-        + (query.alias !== undefined && query.alias !== '' ? `, then +${query.alias}@ was matched against To/Delivered-To/X-Original-To/X-Forwarded-To/subject/body of the ${messages.length} scanned` : '')
-        + ' — widen since_hours or drop filters if the mail is older.'
+      lastSearchNote = `searched folder "${folder}"${scanned.length > 1 ? ` + fallback folders (${scanned.slice(1).join(', ')})` : ''}: 0 matches`
+        + (query.alias !== undefined && query.alias !== '' ? ' after the +tag scan of To/Delivered-To/X-Original-To/X-Forwarded-To/subject/body' : '')
+        + ' — widen since_hours, drop filters, or ask the human to check Gmail Spam and paste the link.'
     } else {
-      lastSearchNote = `folder "${folder}"`
+      const fallbackHit = hits.find(row => row.hit.folder !== undefined)
+      lastSearchNote = `folder "${folder}"${fallbackHit !== undefined ? ` (found in fallback folder "${fallbackHit.hit.folder}")` : ''}`
     }
     return hits.slice(0, limit).map(row => row.hit)
   } finally {
@@ -312,7 +356,7 @@ let lastSearchNote = ''
 function formatHits(hits: MailHit[]): string {
   if (hits.length === 0) return `(no matching mail — ${lastSearchNote})`
   return hits.map(h => [
-    `[seq ${h.seq}] ${h.date} — ${h.subject}`,
+    `[seq ${h.seq}]${h.folder !== undefined ? ` [folder: ${h.folder}]` : ''} ${h.date} — ${h.subject}`,
     `  from: ${h.from} → to: ${h.to}`,
     ...(h.extracted_codes.length > 0 ? [`  codes: ${h.extracted_codes.join(', ')}`] : []),
     ...(h.extracted_links.length > 0 ? [`  links: ${h.extracted_links.slice(0, 5).join(' | ')}`] : []),
@@ -363,7 +407,7 @@ export function registerMailTools(server: ToolRegistrar): void {
     return config
   }
 
-  t('mail_search', 'Search the project inbox via IMAP. `alias` matches plus-addressing against To/Delivered-To/X-Original-To/X-Forwarded-To, the subject, and the body (forwarding relays rewrite To:, so no single header is trusted). Returns codes + links extracted; empty results state exactly what was searched.',
+  t('mail_search', 'Search the project inbox via IMAP. `alias` matches plus-addressing against To/Delivered-To/X-Original-To/X-Forwarded-To, the subject, and the body (forwarding relays rewrite To:, so no single header is trusted). When the primary mailbox has no match, Spam/Junk and Trash are scanned as fallbacks (Gmail All Mail excludes them) — fallback hits carry their [folder: …] tag; pass that folder to mail_get. Returns codes + links extracted; empty results state exactly what was searched.',
     {
       alias: z.string().optional().describe('Plus-address tag, matched as a prefix: "flourish" matches dotjumpdot+flourish@… AND +flourish1@…'),
       from_contains: z.string().optional(),
@@ -386,14 +430,18 @@ export function registerMailTools(server: ToolRegistrar): void {
       return textResult(formatHits(withCodes === undefined ? [] : [withCodes]))
     })
 
-  t('mail_get', 'Read one message in full by seq: text and HTML (capped), every link with its anchor text, and each link\'s redirect target resolved with redirects DISABLED (a manual HEAD — never follows into an out-of-scope host).',
+  t('mail_get', 'Read one message in full by seq: text and HTML (capped), every link with its anchor text, and each link\'s redirect target resolved with redirects DISABLED (a manual HEAD — never follows into an out-of-scope host). Pass `folder` when the search hit was tagged with a fallback folder (Spam/Trash).',
     {
       seq: z.number().int().describe('Sequence number from mail_search / mail_latest_otp'),
+      folder: z.string().optional().describe('Folder the hit came from (the [folder: …] tag on a fallback hit); omitted = the primary mailbox'),
       resolve_links: z.boolean().optional().describe('Resolve redirect targets for the first 5 links (default true)'),
     },
-    async ({ seq, resolve_links }: any) => {
+    async ({ seq, folder: folderParam, resolve_links }: any) => {
       const config = requireConfig()
       const { client, folder } = await openClient(config)
+      if (folderParam !== undefined && folderParam !== '') {
+        await client.mailboxOpen?.(folderParam)
+      }
       let message: ScoredMessage | undefined
       try {
         const messages = await fetchMessages(client, [seq])
@@ -402,7 +450,8 @@ export function registerMailTools(server: ToolRegistrar): void {
         try { client.logout().catch(() => undefined) } catch { /* ignore */ }
         try { client.close() } catch { /* ignore */ }
       }
-      if (message === undefined) return textResult(`no message at seq ${seq} in folder "${folder}"`, true)
+      const shownFolder = folderParam !== undefined && folderParam !== '' ? folderParam : folder
+      if (message === undefined) return textResult(`no message at seq ${seq} in folder "${shownFolder}"`, true)
       const text = message.parsed?.text ?? ''
       const html = typeof message.parsed?.html === 'string' ? message.parsed.html : ''
       const lines = [
