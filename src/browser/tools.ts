@@ -6,7 +6,7 @@ import { z } from 'zod'
 import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
-import { SHARED_OWNER, canTouchTab, type BrowserSession } from './session.js'
+import { SHARED_OWNER, canTouchTab, loadOwnerLabels, type BrowserSession } from './session.js'
 import type { OwnerRegistry } from './registry.js'
 
 export interface ToolEnv {
@@ -22,8 +22,22 @@ export function textResult(text: string, isError = false): ToolResult {
 }
 
 export function errorResult(error: unknown): ToolResult {
-  const message = error instanceof Error ? error.message : String(error)
-  return textResult(`Error: ${message}`, true)
+  return textResult(`Error: ${describeErrorChain(error)}`, true)
+}
+
+/** Walk an Error's cause chain: Node's fetch throws a bare
+ *  `TypeError: fetch failed` with the real transport failure (DNS, TLS,
+ *  connect ECONNREFUSED, HTTP/2 …) one level down in `cause`. The generic
+ *  text alone sent an agent to PowerShell to learn why (run-4 advice §3). */
+export function describeErrorChain(error: unknown): string {
+  const parts: string[] = []
+  let at: unknown = error
+  for (let depth = 0; depth < 4 && at !== undefined && at !== null; depth++) {
+    const line = at instanceof Error ? at.message : (depth === 0 ? String(at) : '')
+    if (line !== '' && !parts.includes(line)) parts.push(line)
+    at = (at as { cause?: unknown }).cause
+  }
+  return parts.join(' · caused by: ')
 }
 
 const OWNER_FIELD = { owner: z.string().optional().describe('Agent owner name (your teammate name). Omitted = the shared human session.') }
@@ -199,6 +213,33 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const page = await tabFor(session, who, tab)
       await page.keyboard.press(key)
       return textResult(await afterActionResult(page))
+    })
+
+  t('browser_fill_otp', 'Distribute a verification code across a row of single-character OTP boxes in ONE call (run 4: one browser_type per box cost six calls per login, and a missed box failed silently). Fills the single autocomplete="one-time-code" input when the site uses one; otherwise fills the visible input[maxlength=1] boxes in DOM order.',
+    {
+      code: z.string().min(1).describe('The code exactly as delivered (letters/digits, no spaces)'),
+      ...FRAME_FIELD,
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ code, frame, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      const root = frameFor(page, frame)
+      const chars = [...code]
+      const whole = root.locator('input[autocomplete="one-time-code"]')
+      if (await whole.count() > 0) {
+        await whole.first().fill(code, { timeout: 10_000 })
+        return textResult(`(single one-time-code input filled)\n${await afterActionResult(page)}`)
+      }
+      const boxes = root.locator('input[maxlength="1"]')
+      const found = await boxes.count()
+      if (found < chars.length) {
+        throw new Error(`found ${found} single-char input box(es) but the code has ${chars.length} characters — snapshot the page; if the widget is one full-code input, use browser_type on it instead`)
+      }
+      for (let at = 0; at < chars.length; at++) {
+        await boxes.nth(at).fill(chars[at]!, { timeout: 10_000 })
+      }
+      return textResult(`(filled ${chars.length}/${chars.length} boxes in DOM order)\n${await afterActionResult(page)}`)
     })
 
   t('browser_select_option', 'Select option(s) on a <select> element (by selector or role+name). `frame:` reaches inside cross-origin iframes.',
@@ -515,7 +556,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`could not bring "${who}"'s window to the foreground (exit ${result.code}) — it may be minimized to the tray`, true)
     })
 
-  t('browser_map', 'Ownership map: browser sessions, window labels, tabs, leases, plus scope status. Default shows EVERY owner (the Lead\'s view); pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
+  t('browser_map', 'Ownership map: browser sessions, window labels, tabs, leases, retained (closed) profiles on disk, plus scope status. Default shows EVERY owner (the Lead\'s view); pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
     { owner: z.string().optional().describe('Your owner name: scopes the map to your session + shared') },
     async ({ owner }: any) => {
       const who = owner === undefined ? undefined : resolveOwner(owner)
@@ -523,7 +564,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const snaps = who === undefined ? all : all.filter(snap => snap.owner === who || snap.owner === SHARED_OWNER)
       const scopeRule = env.scope.current(who)
       const perOwners = env.scope.owners()
-      const lines = snaps.length === 0 ? ['(no sessions launched yet — sessions appear when an owner first uses a browser tool)'] : snaps.map(snap => {
+      const lines = snaps.length === 0 ? ['(no live sessions — retained profiles below, if any)'] : snaps.map(snap => {
         const head = snap.owner === SHARED_OWNER
           ? `shared (human session, no label prefix) — profile: ${snap.userDir}`
           : `${snap.owner} — own window, titles prefixed "[${snap.owner}]" — profile: ${snap.userDir}`
@@ -533,6 +574,28 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         })
         return [head, ...(tabs.length === 0 ? ['   (no tabs)'] : tabs)].join('\n')
       })
+      // Retained profiles (run-4 advice §8h): after a restart browser_map said
+      // "no sessions launched yet" while owner labels and profiles persisted
+      // on disk — the Lead could not see what exists for cleanup. A profile
+      // dir with no live session reads as one "(closed)" line with its label
+      // and the directory's last-modified time as a last-use approximation.
+      const live = new Set(snaps.map(snap => snap.owner))
+      const labels = loadOwnerLabels(env.config.rootDir)
+      const retained: string[] = []
+      try {
+        for (const entry of fs.readdirSync(env.config.profilesRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue
+          // A stray non-owner directory must not sink the whole map.
+          if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(entry.name)) continue
+          const profileOwner = entry.name
+          if (live.has(profileOwner) || (who !== undefined && profileOwner !== who && profileOwner !== SHARED_OWNER)) continue
+          const stat = fs.statSync(path.join(env.config.profilesRoot, entry.name))
+          const label = labels[profileOwner]
+          const described = label === undefined ? '' : ` — ${[label.job, label.engagement].filter(Boolean).join(' · ')}`
+          retained.push(`(closed) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`)
+        }
+      } catch { /* profiles dir absent = no retained profiles */ }
+      if (retained.length > 0) lines.push(...retained)
       const scopeLine = scopeRule === null
         ? `scope: UNRESTRICTED (call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
         : `scope${who === undefined ? '' : ` (${who})`}: ${scopeRule.engagement ?? '(unnamed)'} — in: ${scopeRule.in_scope.join(', ') || '∅'} — out: ${scopeRule.out_scope.join(', ') || '∅'}${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`

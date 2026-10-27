@@ -6,7 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { evaluateScope, entryMatches, ScopeGuard, type ScopeRule } from '../src/scope.js'
 import { canTouchTab } from '../src/browser/session.js'
-import { extractCodes, extractLinks, mailConfig } from '../src/tools/mail.js'
+import { extractCodes, extractCodesFor, extractLinks, mailConfig } from '../src/tools/mail.js'
+import { describeErrorChain } from '../src/browser/tools.js'
 import { interpolateSecretRefs, interpolateDeep, secretNames } from '../src/tools/secrets.js'
 import { renderCommitMessage, type CommitDraft } from '../src/tools/git.js'
 import { JarStore } from '../src/tools/http.js'
@@ -79,6 +80,28 @@ test('otp + link extraction', () => {
   assert.deepEqual(extractCodes(mail), ['481923', 'ABC7D2'])
   assert.deepEqual(extractLinks(mail), ['https://example.com/verify?token=1'])
   assert.deepEqual(extractCodes('no codes here'), [])
+})
+
+test('otp: subject-first ordering + palette-hex false positives dropped (run-4 §8d)', () => {
+  // Atlassian's shape: 6 alphanumeric chars in the SUBJECT, body full of
+  // palette hex like #0052CC that used to drown the list.
+  const subject = 'Your Atlassian verification code is 7K2Q9F'
+  const body = '<style>.btn{background:#0052CC}.link{color:#253858}</style><p>Enter the code</p>'
+  assert.deepEqual(extractCodesFor(subject, body), ['7K2Q9F'])
+  // The palette hex alone (when the subject carries nothing) is filtered:
+  assert.deepEqual(extractCodesFor('Your code', body).includes('0052CC'), false)
+  // Digits-only codes pass untouched even when the body has hex.
+  assert.deepEqual(extractCodesFor('code 481923', 'footer #253858'), ['481923'])
+  // Subject codes lead body codes in the ordering.
+  assert.equal(extractCodesFor('code 111222', 'verify 999888')[0], '111222')
+})
+
+test('errors: cause chain is disclosed (run-4 §3 fetch failed)', () => {
+  const cause = new Error('getaddrinfo ENOTFOUND delivery.mp.microsoft.com')
+  const wrapped = new TypeError('fetch failed', { cause })
+  assert.match(describeErrorChain(wrapped), /fetch failed/)
+  assert.match(describeErrorChain(wrapped), /ENOTFOUND/)
+  assert.equal(describeErrorChain(new Error('plain')), 'plain')
 })
 
 test('secrets: interpolation resolves and reports missing', () => {

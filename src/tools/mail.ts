@@ -111,6 +111,23 @@ export function extractCodes(text: string): string[] {
   return [...new Set(codes)].slice(0, 8)
 }
 
+/** An alnum token the body also shows as `#token` is a CSS palette hex, not
+ *  an OTP: run 4's Atlassian mail carried its 6-char code in the SUBJECT
+ *  while the HTML body's palette hex drowned it as false positives. Letters
+ *  or all digits — the `#` prefix is the signature either way (a real code
+ *  is never hash-prefixed anywhere). */
+function looksLikeBodyHex(code: string, body: string): boolean {
+  return new RegExp(`#${code}\\b`).test(body)
+}
+
+/** Subject-first code extraction (run-4 advice §8d): codes from the subject
+ *  lead the list, then body codes minus the palette-hex false positives. */
+export function extractCodesFor(subject: string, body: string): string[] {
+  const fromSubject = extractCodes(subject)
+  const fromBody = extractCodes(body).filter(code => !looksLikeBodyHex(code, body))
+  return [...new Set([...fromSubject, ...fromBody])].slice(0, 8)
+}
+
 /** Human-readable text for any thrown value, including non-Error objects that
  *  imapflow rejects with (`Error: [object Object]` in the live run). */
 function describeError(error: unknown): string {
@@ -227,16 +244,17 @@ async function fetchMessages(client: ImapClient, seqs: number[]): Promise<Scored
 
 function toHit(message: ScoredMessage): MailHit {
   const textBody = bodyText(message.parsed)
+  const subject = message.envelope?.subject ?? message.parsed?.subject ?? '(no subject)'
   const addr = (list?: Array<{ name?: string; address?: string }>) =>
     (list ?? []).map(a => (a.name !== undefined && a.name !== '' ? `${a.name} <${a.address ?? ''}>` : a.address ?? '')).join(', ')
   return {
-    subject: message.envelope?.subject ?? message.parsed?.subject ?? '(no subject)',
+    subject,
     from: addr(message.envelope?.from),
     to: addr(message.envelope?.to),
     date: (message.envelope?.date ?? message.parsed?.date ?? new Date()).toISOString(),
     seq: message.seq,
     extracted_links: extractLinks(textBody),
-    extracted_codes: extractCodes(textBody),
+    extracted_codes: extractCodesFor(subject, textBody),
   }
 }
 
