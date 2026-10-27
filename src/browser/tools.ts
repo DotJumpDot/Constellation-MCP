@@ -477,6 +477,34 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(cookiePreview(cookies))
     })
 
+  t('browser_focus_window', 'Bring one owner\'s Chrome window to the foreground. Resolves the EXACT window: the browser process is found by its unique --user-data-dir on the command line (the owner\'s profile), so no title guessing is involved — a title search matched an unrelated YouTube window in the live run. Windows only.',
+    { owner: z.string().describe('Owner whose window to focus') },
+    async ({ owner }: any) => {
+      const { spawn } = await import('node:child_process')
+      const { session, owner: who } = sessionOf(env, owner)
+      if (session.owner === SHARED_OWNER) throw new Error('browser_focus_window focuses a labeled owner window — pass the teammate name')
+      await session.ensure()
+      const userDirLike = session.userDir.replace(/'/g, "''").replace(/\\/g, '\\\\')
+      const script =
+        `$proc = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" ` +
+        `| Where-Object { $_.CommandLine -like '*${userDirLike}*' } | Select-Object -First 1; ` +
+        `if (-not $proc) { exit 2 }; ` +
+        `$alive = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue; ` +
+        `if (-not $alive -or $alive.MainWindowHandle -eq 0) { exit 3 }; ` +
+        `(New-Object -ComObject WScript.Shell).AppActivate($proc.ProcessId) | Out-Null; ` +
+        `Write-Output $alive.MainWindowTitle`
+      const result = await new Promise<{ code: number | null; stdout: string }>(resolve => {
+        const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], { windowsHide: true })
+        let stdout = ''
+        child.stdout.on('data', chunk => { stdout += String(chunk) })
+        child.on('close', code => resolve({ code, stdout: stdout.trim() }))
+        child.on('error', () => resolve({ code: 1, stdout: '' }))
+      })
+      if (result.code === 0 && result.stdout !== '') return textResult(`Focused "${who}"'s window: ${result.stdout.split('\n')[0]}`)
+      if (result.code === 2) return textResult(`no chrome.exe process carries "${who}"'s profile — the window may have been closed`, true)
+      return textResult(`could not bring "${who}"'s window to the foreground (exit ${result.code}) — it may be minimized to the tray`, true)
+    })
+
   t('browser_map', 'Ownership map: browser sessions, window labels, tabs, leases, plus scope status. Default shows EVERY owner (the Lead\'s view); pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
     { owner: z.string().optional().describe('Your owner name: scopes the map to your session + shared') },
     async ({ owner }: any) => {

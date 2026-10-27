@@ -242,11 +242,12 @@ function toHit(message: ScoredMessage): MailHit {
 
 /** IMAP `TO` misses plus-addressed mail on forwarding relays (Bugcrowd Relay
  *  rewrites To: to the destination account), so alias filtering happens
- *  client-side against every header plus the subject and body. */
+ *  client-side against every header plus the subject and body. The tag is
+ *  matched as a PREFIX (`flourish` also finds `+flourish1@` — the live run's
+ *  exact-tag-only search read as "mail missing"). */
 function matchesAlias(message: ScoredMessage, alias: string): boolean {
-  const tag = `+${alias}@`
   const haystack = [headerBlob(message.parsed), message.envelope?.subject ?? '', bodyText(message.parsed)].join('\n')
-  return haystack.includes(tag)
+  return haystack.includes(`+${alias}`)
 }
 
 async function searchMail(config: MailConfig, query: MailQuery, limit: number): Promise<MailHit[]> {
@@ -346,7 +347,7 @@ export function registerMailTools(server: ToolRegistrar): void {
 
   t('mail_search', 'Search the project inbox via IMAP. `alias` matches plus-addressing against To/Delivered-To/X-Original-To/X-Forwarded-To, the subject, and the body (forwarding relays rewrite To:, so no single header is trusted). Returns codes + links extracted; empty results state exactly what was searched.',
     {
-      alias: z.string().optional().describe('Plus-address tag, e.g. "ynab" matches dotjumpdot+ynab@… anywhere in the headers or body'),
+      alias: z.string().optional().describe('Plus-address tag, matched as a prefix: "flourish" matches dotjumpdot+flourish@… AND +flourish1@…'),
       from_contains: z.string().optional(),
       subject_contains: z.string().optional(),
       since_hours: z.number().optional().describe('Only mail newer than N hours'),

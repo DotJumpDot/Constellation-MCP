@@ -159,7 +159,10 @@ export class BrowserSession {
 
   private infoUrl(): string {
     const esc = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-    const html = `<!doctype html><meta charset="utf-8"><title>info — ${esc(this.infoJob ?? 'no job set')}</title>
+    // The window title MUST carry the [owner] prefix: the label init script
+    // does not run on data: URLs, and the human-wall panel's "focus chrome"
+    // action matches windows by that prefix (live-run bug 2026-10-27).
+    const html = `<!doctype html><meta charset="utf-8"><title>[${esc(this.owner)}] info — ${esc(this.infoJob ?? 'no job set')}</title>
 <body style="font:15px/1.6 system-ui,sans-serif;max-width:38em;margin:auto;padding:3em 2em;background:#101418;color:#e8e8e8">
 <h1 style="margin:0 0 .2em">[${esc(this.owner)}]</h1>
 <p style="margin:.2em 0;color:#9fd0ff">job: <b>${esc(this.infoJob ?? '(not set — the Lead can call browser_owner_info)')}</b></p>
