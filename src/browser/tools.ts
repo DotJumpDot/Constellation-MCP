@@ -484,15 +484,25 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const { session, owner: who } = sessionOf(env, owner)
       if (session.owner === SHARED_OWNER) throw new Error('browser_focus_window focuses a labeled owner window — pass the teammate name')
       await session.ensure()
-      const userDirLike = session.userDir.replace(/'/g, "''").replace(/\\/g, '\\\\')
+      // Only the single quotes need escaping (PS single-quoted string). The
+      // backslashes stay RAW: in a -like pattern a doubled `\\` matches a
+      // literal double backslash and finds nothing — proven against a live
+      // chrome.exe command line (raw path: 8 matches, doubled: 0).
+      const userDirLike = session.userDir.replace(/'/g, "''")
+      // Every chrome.exe child carries --user-data-dir, and only ~1 of the
+      // ~11 processes owns the window — take First and it is almost always a
+      // windowless child. Walk the matching PIDs and pick the one with a
+      // MainWindowHandle.
       const script =
-        `$proc = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" ` +
-        `| Where-Object { $_.CommandLine -like '*${userDirLike}*' } | Select-Object -First 1; ` +
-        `if (-not $proc) { exit 2 }; ` +
+        `$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" ` +
+        `| Where-Object { $_.CommandLine -like '*${userDirLike}*' }; ` +
+        `$target = $null; ` +
+        `foreach ($proc in $procs) { ` +
         `$alive = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue; ` +
-        `if (-not $alive -or $alive.MainWindowHandle -eq 0) { exit 3 }; ` +
-        `(New-Object -ComObject WScript.Shell).AppActivate($proc.ProcessId) | Out-Null; ` +
-        `Write-Output $alive.MainWindowTitle`
+        `if ($alive -and $alive.MainWindowHandle -ne 0) { $target = $alive; break } }; ` +
+        `if (-not $target) { if (-not $procs) { exit 2 } else { exit 3 } }; ` +
+        `(New-Object -ComObject WScript.Shell).AppActivate($target.Id) | Out-Null; ` +
+        `Write-Output $target.MainWindowTitle`
       const result = await new Promise<{ code: number | null; stdout: string }>(resolve => {
         const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], { windowsHide: true })
         let stdout = ''
