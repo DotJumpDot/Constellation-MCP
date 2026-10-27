@@ -1,7 +1,9 @@
 import { createRequire } from 'node:module'
+import fs from 'node:fs'
 import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
-import type { Page } from 'playwright-core'
+import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { SHARED_OWNER, canTouchTab, type BrowserSession } from './session.js'
@@ -26,6 +28,23 @@ export function errorResult(error: unknown): ToolResult {
 
 const OWNER_FIELD = { owner: z.string().optional().describe('Agent owner name (your teammate name). Omitted = the shared human session.') }
 const TAB_FIELD = { tab: z.number().int().optional().describe('Tab index as listed by browser_tabs list; omitted = the session\'s selected tab.') }
+const FRAME_FIELD = { frame: z.string().optional().describe('iframe name or URL substring when the control lives inside a cross-origin iframe (see browser_frames_list)') }
+
+/** Resolve an iframe root by name or URL substring. A locator timeout inside a
+ *  frame reads like "the element does not exist" and sends agents down the
+ *  wrong path — name the frame instead (live-run ask 2026-10-27). */
+function frameFor(page: Page, frame?: string): Page | Frame {
+  if (frame === undefined || frame === '') return page
+  const frames = page.frames()
+  const main = page.mainFrame()
+  const match = frames.find(f => f !== main && f.name() === frame)
+    ?? frames.find(f => f !== main && f.url().includes(frame!))
+  if (match === undefined) {
+    const listing = frames.map((f, i) => `[${i}] ${f.name() || '(unnamed)'} — ${f.url()}`).join('; ')
+    throw new Error(`no iframe matching "${frame}" — frames on this page: ${listing}. If a control is inside an iframe, pass frame: (or use browser_run_code_unsafe).`)
+  }
+  return match
+}
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}\n… [truncated ${s.length - max} chars]`
@@ -68,13 +87,13 @@ async function tabFor(session: BrowserSession, owner: string, tabIndex: number |
   return page
 }
 
-function locatorFor(page: Page, selector?: string, element?: string, name?: string, nth?: number) {
+function locatorFor(root: Page | Frame, selector?: string, element?: string, name?: string, nth?: number) {
   if (selector !== undefined && selector !== '') {
-    const loc = page.locator(selector)
+    const loc = root.locator(selector)
     return nth === undefined ? loc : loc.nth(nth)
   }
   if (element === undefined || element === '') throw new Error('provide either `selector` or `element` (ARIA role) with optional `name`')
-  const role = page.getByRole(element as never, name === undefined ? {} : { name, exact: false })
+  const role = root.getByRole(element as never, name === undefined ? {} : { name, exact: false })
   return nth === undefined ? role : role.nth(nth)
 }
 
@@ -110,6 +129,9 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
     async ({ url, owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
       const page = await tabFor(session, who, tab)
+      const meta = session.metaOf(page)
+      if (meta?.infoTab === true)
+        throw new Error('tab 0 is the ownership-label info tab — it stays on the owner label. Open your own tab first (browser_tabs new / tab_open).')
       env.scope.assert(url, who, 'browser_navigate')
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
       return textResult(await afterActionResult(page))
@@ -123,34 +145,50 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`URL: ${await pageOverview(page)}\n\n${truncate(await snapshotOf(page), 150_000)}`)
     })
 
-  t('browser_click', 'Click an element (by CSS/XPath selector, or ARIA role + accessible name). Returns the new page state.',
+  t('browser_click', 'Click an element (by CSS/XPath selector, or ARIA role + accessible name). `frame:` reaches inside cross-origin iframes; `force: true` bypasses actionability (covered/hidden elements); x/y clicks raw viewport coordinates. Returns the new page state.',
     {
       selector: z.string().optional().describe('CSS or XPath selector'),
       element: z.string().optional().describe('ARIA role, e.g. button, link, textbox'),
       name: z.string().optional().describe('Accessible name to match (substring)'),
       nth: z.number().int().optional().describe('0-based match index when several elements match'),
+      force: z.boolean().optional().describe('Skip actionability checks (element covered by an overlay)'),
+      x: z.number().optional().describe('Viewport x for a raw coordinate click'),
+      y: z.number().optional().describe('Viewport y for a raw coordinate click'),
+      ...FRAME_FIELD,
       ...OWNER_FIELD, ...TAB_FIELD,
     },
-    async ({ selector, element, name, nth, owner, tab }: any) => {
+    async ({ selector, element, name, nth, force, x, y, frame, owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
       const page = await tabFor(session, who, tab)
-      await locatorFor(page, selector, element, name, nth).click({ timeout: 10_000 })
+      if (x !== undefined && y !== undefined) {
+        await page.mouse.click(x, y)
+      } else {
+        await locatorFor(frameFor(page, frame), selector, element, name, nth).click({ timeout: 10_000, ...(force === true ? { force: true } : {}) })
+      }
       return textResult(await afterActionResult(page))
     })
 
-  t('browser_type', 'Fill a text field (by selector or role+name). Submits with Enter on request.',
+  t('browser_type', 'Fill a text field (by selector or role+name). Submits with Enter on request — with submit, the tool waits for the resulting navigation to settle and reports whether the URL changed (previously it returned before navigation started, so callers polled snapshots).',
     {
       text: z.string().describe('Text to enter'),
       selector: z.string().optional(), element: z.string().optional(), name: z.string().optional(), nth: z.number().int().optional(),
-      submit: z.boolean().optional().describe('Press Enter after filling'),
+      submit: z.boolean().optional().describe('Press Enter after filling and wait for navigation to settle'),
+      ...FRAME_FIELD,
       ...OWNER_FIELD, ...TAB_FIELD,
     },
-    async ({ text, selector, element, name, nth, submit, owner, tab }: any) => {
+    async ({ text, selector, element, name, nth, submit, frame, owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
       const page = await tabFor(session, who, tab)
-      const loc = locatorFor(page, selector, element, name, nth)
+      const loc = locatorFor(frameFor(page, frame), selector, element, name, nth)
       await loc.fill(text, { timeout: 10_000 })
-      if (submit === true) await loc.press('Enter')
+      if (submit === true) {
+        const before = page.url()
+        await loc.press('Enter')
+        await page.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => undefined)
+        await page.waitForTimeout(400)
+        const navigated = page.url() !== before
+        return textResult(`${navigated ? '(navigated)\n' : '(no navigation)\n'}${await afterActionResult(page)}`)
+      }
       return textResult(await afterActionResult(page))
     })
 
@@ -163,16 +201,17 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(await afterActionResult(page))
     })
 
-  t('browser_select_option', 'Select option(s) on a <select> element (by selector or role+name).',
+  t('browser_select_option', 'Select option(s) on a <select> element (by selector or role+name). `frame:` reaches inside cross-origin iframes.',
     {
       values: z.array(z.string()).min(1).describe('Option values or labels'),
       selector: z.string().optional(), element: z.string().optional(), name: z.string().optional(), nth: z.number().int().optional(),
+      ...FRAME_FIELD,
       ...OWNER_FIELD, ...TAB_FIELD,
     },
-    async ({ values, selector, element, name, nth, owner, tab }: any) => {
+    async ({ values, selector, element, name, nth, frame, owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
       const page = await tabFor(session, who, tab)
-      await locatorFor(page, selector, element, name, nth).selectOption(values, { timeout: 10_000 })
+      await locatorFor(frameFor(page, frame), selector, element, name, nth).selectOption(values, { timeout: 10_000 })
       return textResult(await afterActionResult(page))
     })
 
@@ -251,6 +290,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       }
       const verdict = canTouchTab(meta, who, session.owner)
       if (!verdict.ok) throw new Error(verdict.reason ?? 'tab is leased by another owner')
+      if (action === 'close' && meta.infoTab === true)
+        throw new Error('the info tab is the ownership label and cannot be closed — close the whole window (browser_close) instead; the harness re-opens the label in any new owner window')
       await page.close()
       return textResult(`Closed tab [${index}] id=${meta.id}`)
     })
@@ -302,6 +343,140 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Released lease on tab [${index}] id=${meta.id}`)
     })
 
+  t('browser_frames_list', 'List every frame on the owner\'s current tab (name, URL, index). Use the name or a URL substring as the `frame:` argument on click/type/select_option when a control lives inside a cross-origin iframe.',
+    { ...OWNER_FIELD, ...TAB_FIELD },
+    async ({ owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      const frames = page.frames()
+      return textResult(frames.map((frame, index) =>
+        `[${index}]${frame === page.mainFrame() ? ' (main)' : ''} ${frame.name() === '' ? '(unnamed)' : frame.name()} — ${frame.url()}`,
+      ).join('\n'))
+    })
+
+  t('browser_set_files', 'Upload file(s). Direct mode: set them on the matched <input type=file>. File-chooser mode (click_selector): click the button that opens the OS chooser and intercept it — the reliable path for hidden inputs (input[type=file].sr-only), where setInputFiles on the hidden input fired zero requests in the live run.',
+    {
+      files: z.array(z.string()).min(1).describe('Absolute file paths'),
+      selector: z.string().optional().describe('Selector of the file input (direct mode)'),
+      element: z.string().optional(), name: z.string().optional(), nth: z.number().int().optional(),
+      click_selector: z.string().optional().describe('Selector of the button that opens the file chooser (file-chooser mode)'),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ files, selector, element, name, nth, click_selector, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      for (const file of files) {
+        if (!fs.existsSync(file)) throw new Error(`file not found: ${file}`)
+      }
+      if (click_selector !== undefined && click_selector !== '') {
+        const [chooser] = await Promise.all([
+          page.waitForEvent('filechooser', { timeout: 10_000 }),
+          page.locator(click_selector).first().click({ timeout: 10_000 }),
+        ])
+        await chooser.setFiles(files)
+        await page.waitForTimeout(500)
+        return textResult(`Set ${files.length} file(s) via the file chooser.\nNow at: ${await pageOverview(page)}`)
+      }
+      await locatorFor(page, selector, element, name, nth).first().setInputFiles(files, { timeout: 10_000 })
+      await page.waitForTimeout(500)
+      return textResult(`Set ${files.length} file(s) on the input.\nNow at: ${await pageOverview(page)}`)
+    })
+
+  t('browser_owner_info', 'Set the job/engagement label shown on an owner\'s window: the first tab of every owner window is an ownership info tab ("[owner] — job — engagement") that agents cannot close and the harness re-opens if the human closes it. Set this right after spawn so every Chrome window answers "whose is this and what is it doing".',
+    {
+      owner: z.string().describe('Owner/teammate name whose window gets the label'),
+      job: z.string().optional().describe('One-line job, e.g. "klaviyo lane: signup + MCP surfaces"'),
+      engagement: z.string().optional().describe('Engagement/program name'),
+    },
+    async ({ owner, job, engagement }: any) => {
+      if (owner === undefined || owner.trim() === '' || owner.trim() === SHARED_OWNER)
+        throw new Error('browser_owner_info labels a specific owner window — pass the teammate name (the shared human session gets no label)')
+      const { session, owner: who } = sessionOf(env, owner)
+      const info = await session.setOwnerInfo(job, engagement)
+      return textResult(`[${who}] label set — job: ${info.job ?? '(unset)'} · engagement: ${info.engagement ?? '(unset)'}${session.context === undefined ? ' (window not launched yet; the label renders at launch)' : ' (info tab updated)'}`)
+    })
+
+  // ── Cookie handoff (DST-Comet P0, live run 2026-10-27) ────────────────────
+  // "Human logs in, agent works" needed cookies transcribed through model
+  // context (one cookies() call dumped 150+ unrelated cookies into the
+  // transcript). Values now stay server-side behind a short-lived handoff id;
+  // the transcript only ever sees the redacted preview.
+  const cookieHandoffs = new Map<string, { id: string; fromOwner: string; domain: string; expiresAt: number; cookies: Array<Record<string, unknown>> }>()
+  const HANDOFF_TTL_MS = 10 * 60_000
+  const sweepHandoffs = (): void => {
+    const now = Date.now()
+    for (const [id, handoff] of cookieHandoffs) if (handoff.expiresAt < now) cookieHandoffs.delete(id)
+  }
+  const cookiePreview = (cookies: Array<Record<string, unknown>>): string =>
+    cookies.map(c => `  ${c.name} — ${c.domain}${c.path} ${c.httpOnly === true ? 'httpOnly ' : ''}${c.secure === true ? 'secure ' : ''}${String(c.sameSite ?? '')}${typeof c.expires === 'number' && c.expires > 0 ? ` expires ${new Date(c.expires * 1000).toISOString()}` : ' session'}`).join('\n')
+
+  t('browser_cookies_export', 'Export cookies from one owner\'s browser into a server-side handoff (values NEVER enter the transcript — the preview shows name/domain/flags only). Gives a handoff_id for browser_cookies_import. The captcha-walled-login recipe: human logs in in their own Chrome (or the shared session) → export → import into the worker\'s owner browser.',
+    {
+      owner: z.string().describe('Owner whose cookies are exported'),
+      domain: z.string().optional().describe('Only cookies for this domain (hostname or host:port)'),
+      names: z.array(z.string()).optional().describe('Only these cookie names'),
+    },
+    async ({ owner, domain, names }: any) => {
+      sweepHandoffs()
+      const { session, owner: who } = sessionOf(env, owner)
+      const context = await session.ensure()
+      const urls = domain === undefined ? undefined : [/^https?:\/\//i.test(domain) ? domain : `https://${domain}/`]
+      let cookies = (await context.cookies(urls)) as unknown as Array<Record<string, unknown>>
+      if (names !== undefined && names.length > 0) cookies = cookies.filter(c => names.includes(String(c.name)))
+      if (domain !== undefined) {
+        const host = domain.replace(/^https?:\/\//i, '').split('/')[0]!
+        cookies = cookies.filter(c => String(c.domain).endsWith(host) || host.endsWith(String(c.domain).replace(/^\./, '')))
+      }
+      if (cookies.length === 0) {
+        const all = (await context.cookies()) as unknown as Array<Record<string, unknown>>
+        return textResult(`no cookies matched${domain !== undefined ? ` domain "${domain}"` : ''}${names !== undefined ? ` names [${names.join(', ')}]` : ''}. Cookie names present in this browser (values not shown): ${all.map(c => c.name).join(', ') || '(none)'}`, true)
+      }
+      const id = `ch-${randomBytes(4).toString('hex')}`
+      cookieHandoffs.set(id, { id, fromOwner: who, domain: domain ?? '(all)', expiresAt: Date.now() + HANDOFF_TTL_MS, cookies })
+      return textResult([
+        `handoff_id: ${id} — ${cookies.length} cookie(s) from "${who}", domain ${domain ?? '(all)'}`,
+        `values are held server-side for ${Math.round(HANDOFF_TTL_MS / 60_000)} minutes; import with browser_cookies_import({ owner, handoff_id: "${id}" })`,
+        'preview (no values):',
+        cookiePreview(cookies),
+      ].join('\n'))
+    })
+
+  t('browser_cookies_import', 'Import a cookie handoff into an owner\'s browser (the worker side of the human-login recipe). Scope-guarded: the handoff\'s domain must be in the importer\'s scope; every import is audited.',
+    {
+      owner: z.string().describe('Owner whose browser receives the cookies'),
+      handoff_id: z.string().describe('Handoff id from browser_cookies_export'),
+      domain_override: z.string().optional().describe('Rewrite the cookies onto a different host (e.g. staging)'),
+    },
+    async ({ owner, handoff_id, domain_override }: any) => {
+      sweepHandoffs()
+      const { session, owner: who } = sessionOf(env, owner)
+      const handoff = cookieHandoffs.get(handoff_id)
+      if (handoff === undefined) throw new Error(`unknown or expired handoff_id "${handoff_id}" (handoffs live ${Math.round(HANDOFF_TTL_MS / 60_000)} minutes)`)
+      const targetDomain = domain_override ?? handoff.domain
+      if (targetDomain !== '(all)') {
+        env.scope.assert(/^https?:\/\//i.test(targetDomain) ? targetDomain : `https://${targetDomain}/`, who, 'browser_cookies_import')
+      }
+      const context = await session.ensure()
+      const cookies = handoff.cookies.map(cookie => ({ ...cookie, ...(domain_override === undefined ? {} : { domain: domain_override }) }))
+      await context.addCookies(cookies as never)
+      env.scope.audit(`cookie-import:${targetDomain}`, who, 'browser_cookies_import', {
+        allowed: true,
+        reason: `handoff ${handoff.id}: ${cookies.length} cookie(s) from "${handoff.fromOwner}" onto ${targetDomain}`,
+      })
+      return textResult(`Imported ${cookies.length} cookie(s) from "${handoff.fromOwner}" onto ${targetDomain} in "${who}"'s browser.\nPreview (no values):\n${cookiePreview(cookies)}`)
+    })
+
+  t('browser_cookies_list', 'Redacted cookie preview for one owner\'s browser — reason about which sessions are alive without ever seeing values.',
+    { owner: z.string().describe('Owner whose cookies are listed'), domain: z.string().optional() },
+    async ({ owner, domain }: any) => {
+      const { session } = sessionOf(env, owner)
+      const context = await session.ensure()
+      const urls = domain === undefined ? undefined : [/^https?:\/\//i.test(domain) ? domain : `https://${domain}/`]
+      const cookies = (await context.cookies(urls)) as unknown as Array<Record<string, unknown>>
+      if (cookies.length === 0) return textResult('(no cookies match — the owner has no session for this domain)')
+      return textResult(cookiePreview(cookies))
+    })
+
   t('browser_map', 'Ownership map: browser sessions, window labels, tabs, leases, plus scope status. Default shows EVERY owner (the Lead\'s view); pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
     { owner: z.string().optional().describe('Your owner name: scopes the map to your session + shared') },
     async ({ owner }: any) => {
@@ -315,7 +490,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           ? `shared (human session, no label prefix) — profile: ${snap.userDir}`
           : `${snap.owner} — own window, titles prefixed "[${snap.owner}]" — profile: ${snap.userDir}`
         const tabs = snap.tabs.map(tab => {
-          const marks = [snap.selected === tab.id ? '▶' : ' ', tab.leasedBy ? `leased:${tab.leasedBy}${tab.purpose ? `(${tab.purpose})` : ''}` : '', tab.openedBy !== SHARED_OWNER && tab.openedBy !== snap.owner ? `openedBy:${tab.openedBy}` : ''].filter(Boolean).join(' ')
+          const marks = [snap.selected === tab.id ? '▶' : ' ', tab.infoTab === true ? 'ℹ' : '', tab.leasedBy ? `leased:${tab.leasedBy}${tab.purpose ? `(${tab.purpose})` : ''}` : '', tab.openedBy !== SHARED_OWNER && tab.openedBy !== snap.owner ? `openedBy:${tab.openedBy}` : ''].filter(Boolean).join(' ')
           return `   ${marks} [${tab.index}] ${tab.title} — ${tab.url}`
         })
         return [head, ...(tabs.length === 0 ? ['   (no tabs)'] : tabs)].join('\n')

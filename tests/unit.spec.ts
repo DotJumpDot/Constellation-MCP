@@ -295,6 +295,96 @@ test('http: non-http scheme rejected before any fetch; body preview capped but s
   }
 })
 
+test('http: auth basic/bearer sets the Authorization header server-side', async () => {
+  const { JarStore, performRequest } = await import('../src/tools/http.js')
+  const { ScopeGuard } = await import('../src/scope.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'httpauth-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  const seen: string[] = []
+  const server = http.createServer((req, res) => {
+    seen.push(String(req.headers.authorization ?? ''))
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('ok')
+  })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    const port = (server.address() as { port: number }).port
+    await performRequest(jars, guard, {
+      url: `http://127.0.0.1:${port}/b2_authorize_account`,
+      auth: { type: 'basic', username: 'keyId', password: 'appKey' },
+    } as never, 't', 'http_request')
+    assert.equal(seen.at(-1), `Basic ${Buffer.from('keyId:appKey').toString('base64')}`)
+    await performRequest(jars, guard, {
+      url: `http://127.0.0.1:${port}/v1/whoami`,
+      auth: { type: 'bearer', token: 'tok123' },
+    } as never, 't', 'http_request')
+    assert.equal(seen.at(-1), 'Bearer tok123')
+    await assert.rejects(
+      () => performRequest(jars, guard, { url: `http://127.0.0.1:${port}/`, auth: { type: 'basic' } } as never, 't', 'http_request'),
+      /auth\.type "basic" needs username and password/,
+    )
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('http_download: saves server-side, transcript sees metadata only, sha256_expected verifies', async () => {
+  const { JarStore, performDownload } = await import('../src/tools/http.js')
+  const { ScopeGuard } = await import('../src/scope.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'httpdl-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  const config = { rootDir: dir, outputDir: path.join(dir, 'out') } as never
+  const blob = '<html>' + 'evidence '.repeat(40_000) + '</html>'
+  const server = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end(blob) })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    const port = (server.address() as { port: number }).port
+    const crypto = (await import('node:crypto')).default
+    const sha = crypto.createHash('sha256').update(blob).digest('hex')
+    const result = await performDownload(jars, guard, config, { url: `http://127.0.0.1:${port}/page.html` } as never, 'scout', undefined, sha)
+    assert.equal(result.status, 200)
+    assert.equal(result.bytes, Buffer.byteLength(blob))
+    assert.equal(result.sha256, sha)
+    assert.ok(result.file.includes(path.join('scout', 'downloads', 'page.html')), `derived name from URL path: ${result.file}`)
+    assert.equal(fs.readFileSync(result.file, 'utf8'), blob)
+    await assert.rejects(
+      () => performDownload(jars, guard, config, { url: `http://127.0.0.1:${port}/page.html` } as never, 'scout', undefined, 'deadbeef'),
+      /sha256 mismatch/,
+    )
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('mail: config trims pasted app-password spaces; anchors pair hrefs with text', async () => {
+  const { mailConfig, extractAnchors } = await import('../src/tools/mail.js')
+  const previous = { ...process.env }
+  try {
+    process.env.CONSTELLATION_MAIL_HOST = ' imap.gmail.com '
+    process.env.CONSTELLATION_MAIL_USER = ' user@gmail.com '
+    process.env.CONSTELLATION_MAIL_PASS = 'abcd efgh ijkl mnop'  // Google renders app passwords with spaces
+    const config = mailConfig()
+    assert.ok(config !== undefined)
+    assert.equal(config.host, 'imap.gmail.com')
+    assert.equal(config.user, 'user@gmail.com')
+    assert.equal(config.pass, 'abcdefghijklmnop', 'pasted app password keeps working without hand-trimming')
+  } finally {
+    for (const key of ['CONSTELLATION_MAIL_HOST', 'CONSTELLATION_MAIL_USER', 'CONSTELLATION_MAIL_PASS'])
+      if (previous[key as keyof typeof previous] === undefined) delete process.env[key]
+      else process.env[key] = previous[key as keyof typeof previous] as string
+  }
+  const html = '<a href="https://v.example/verify?t=1&amp;x=2">Verify your email</a> <A HREF="https://u.example/unsub">unsubscribe</a>'
+  const anchors = extractAnchors(html)
+  assert.equal(anchors.length, 2)
+  assert.equal(anchors[0]!.href, 'https://v.example/verify?t=1&x=2')
+  assert.equal(anchors[0]!.text, 'Verify your email')
+  assert.equal(anchors[1]!.text, 'unsubscribe')
+})
+
 test('scope: per-owner (per-lane) rules win for that owner; others keep the global rule', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scope-owner-'))
   const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))

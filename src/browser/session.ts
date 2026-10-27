@@ -15,6 +15,8 @@ export interface TabMeta {
   leasedBy?: string
   leasedAt?: number
   openedAt: number
+  /** The ownership-label tab pinned at the head of an owner's window. */
+  infoTab?: boolean
 }
 
 export interface NetworkRecord {
@@ -33,7 +35,7 @@ export interface SessionSnapshot {
   userDir: string
   windowLabel: string
   selected: number | null
-  tabs: Array<{ index: number; id: number; title: string; url: string; openedBy: string; purpose?: string; leasedBy?: string }>
+  tabs: Array<{ index: number; id: number; title: string; url: string; openedBy: string; purpose?: string; leasedBy?: string; infoTab?: boolean }>
 }
 
 /** Decision helper — pure so tests can pin the lease rules. A session owner
@@ -56,6 +58,10 @@ export class BrowserSession {
   consoleLines: string[] = []
   network: NetworkRecord[] = []
   launching?: Promise<BrowserContext>
+  /** Job/engagement label shown on the info tab (browser_owner_info). */
+  infoJob?: string
+  infoEngagement?: string
+  private infoOpenedAt?: string
 
   constructor(readonly owner: string, readonly userDir: string, private config: ConstellationConfig) {}
 
@@ -71,7 +77,14 @@ export class BrowserSession {
 
   async ensure(): Promise<BrowserContext> {
     this.lastUsed = Date.now()
-    if (this.context) return this.context
+    if (this.context) {
+      // The human (or Chrome itself) can close the info tab from the UI; the
+      // ownership label must survive, so re-pin it whenever it is missing.
+      if (this.owner !== SHARED_OWNER && this.context !== undefined && !this.hasInfoTab()) {
+        try { await this.openInfoTab() } catch { /* never block tool calls on the label */ }
+      }
+      return this.context
+    }
     if (!this.launching) {
       this.launching = this.launch().finally(() => { this.launching = undefined })
     }
@@ -104,7 +117,68 @@ export class BrowserSession {
     })
     for (const page of context.pages()) this.registerPage(page, this.owner)
     this.context = context
+    // The very first tab of an owner window is the ownership label: which
+    // agent owns this window and what job it is running. It cannot be closed
+    // by tool calls and is re-pinned if the human closes it in Chrome.
+    if (this.owner !== SHARED_OWNER) {
+      try { await this.openInfoTab() } catch { /* never block a launch on the label */ }
+      this.selected = null
+    }
     return context
+  }
+
+  private hasInfoTab(): boolean {
+    for (const [page, meta] of this.tabs) if (meta.infoTab === true && !page.isClosed()) return true
+    return false
+  }
+
+  /** Navigate (or re-navigate) the pinned ownership-label tab. */
+  private async openInfoTab(): Promise<void> {
+    const context = this.context
+    if (context === undefined) return
+    this.infoOpenedAt ??= new Date().toISOString()
+    // Reuse the existing info tab when it is still open; otherwise open a new
+    // page and move it to the head of the tab map so indices stay stable.
+    let infoPage: Page | undefined
+    for (const [page, meta] of this.tabs) {
+      if (meta.infoTab === true && !page.isClosed()) { infoPage = page; break }
+    }
+    let reordering = false
+    if (infoPage === undefined) {
+      infoPage = await context.newPage()
+      const meta = this.metaOf(infoPage)!
+      meta.infoTab = true
+      reordering = true
+    }
+    await infoPage.goto(this.infoUrl(), { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined)
+    if (reordering) {
+      const entries = [...this.tabs.entries()]
+      this.tabs = new Map(entries.filter(([page]) => page === infoPage).concat(entries.filter(([page]) => page !== infoPage)))
+    }
+  }
+
+  private infoUrl(): string {
+    const esc = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    const html = `<!doctype html><meta charset="utf-8"><title>info — ${esc(this.infoJob ?? 'no job set')}</title>
+<body style="font:15px/1.6 system-ui,sans-serif;max-width:38em;margin:auto;padding:3em 2em;background:#101418;color:#e8e8e8">
+<h1 style="margin:0 0 .2em">[${esc(this.owner)}]</h1>
+<p style="margin:.2em 0;color:#9fd0ff">job: <b>${esc(this.infoJob ?? '(not set — the Lead can call browser_owner_info)')}</b></p>
+<p style="margin:.2em 0">engagement: <b>${esc(this.infoEngagement ?? '—')}</b></p>
+<p style="margin:.8em 0 .2em;font-size:.9em;color:#888">This Chrome window belongs to owner <b>${esc(this.owner)}</b> (Constellation per-owner browser).
+Tab 1 is the ownership label — it is restored automatically if closed; close the whole window to end the owner's session.
+Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
+</body>`
+    return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`
+  }
+
+  /** Update the ownership label (browser_owner_info); re-renders a live tab. */
+  async setOwnerInfo(job?: string, engagement?: string): Promise<{ job?: string; engagement?: string }> {
+    if (job !== undefined) this.infoJob = job
+    if (engagement !== undefined) this.infoEngagement = engagement
+    if (this.context !== undefined) {
+      try { await this.openInfoTab() } catch { /* rendered on next ensure */ }
+    }
+    return { ...(this.infoJob === undefined ? {} : { job: this.infoJob }), ...(this.infoEngagement === undefined ? {} : { engagement: this.infoEngagement }) }
   }
 
   private registerPage(page: Page, openedBy: string): void {
@@ -140,10 +214,10 @@ export class BrowserSession {
     const context = await this.ensure()
     if (this.selected !== null) {
       const { page } = this.pageById(this.selected)
-      if (page && !page.isClosed()) return page
+      if (page && !page.isClosed() && this.metaOf(page)?.infoTab !== true) return page
     }
-    const existing = this.pages().at(-1)
-    if (existing && !existing.isClosed()) {
+    const existing = [...this.tabs.keys()].reverse().find(page => !page.isClosed() && this.metaOf(page)?.infoTab !== true)
+    if (existing) {
       const meta = this.metaOf(existing)
       if (meta) this.selected = meta.id
       return existing
@@ -180,6 +254,7 @@ export class BrowserSession {
         openedBy: meta.openedBy,
         ...(meta.purpose === undefined ? {} : { purpose: meta.purpose }),
         ...(meta.leasedBy === undefined ? {} : { leasedBy: meta.leasedBy }),
+        ...(meta.infoTab === true ? { infoTab: true } : {}),
       })
     }
     return {

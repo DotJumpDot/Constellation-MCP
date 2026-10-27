@@ -106,6 +106,7 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
   const { value: bodyInterp, missing: missingBody } = interpolateDeep(spec.body)
   if (missingBody.length > 0) throw new Error(`unknown secret(s) in body: ${missingBody.join(', ')}`)
   const body = bodyInterp === undefined ? undefined : (isJsonObject(bodyInterp) ? JSON.stringify(bodyInterp) : String(bodyInterp))
+  applyAuth(headers, spec.auth)
 
   const started = Date.now()
   const response = await fetch(spec.url, {
@@ -150,6 +151,33 @@ export interface RequestSpec {
   redirect?: 'follow' | 'manual'
   timeout_ms?: number
   max_body_bytes?: number
+  auth?: AuthSpec
+}
+
+/** HTTP authorization (DST-Comet live-run ask: B2's b2_authorize_account wants
+ *  HTTP Basic; agents were base64-encoding credentials in PowerShell). */
+export interface AuthSpec {
+  type: 'basic' | 'bearer'
+  username?: string
+  password?: string
+  token?: string
+}
+
+/** Interpolate secrets and set the Authorization header. */
+function applyAuth(headers: Record<string, string>, auth: AuthSpec | undefined): void {
+  if (auth === undefined) return
+  const { value, missing } = interpolateDeep(auth)
+  if (missing.length > 0) throw new Error(`unknown secret(s) in auth: ${missing.join(', ')}`)
+  const a = value as AuthSpec
+  if (a.type === 'basic') {
+    if (a.username === undefined || a.password === undefined) throw new Error('auth.type "basic" needs username and password')
+    headers['authorization'] ??= `Basic ${Buffer.from(`${a.username}:${a.password}`).toString('base64')}`
+  } else if (a.type === 'bearer') {
+    if (a.token === undefined) throw new Error('auth.type "bearer" needs token')
+    headers['authorization'] ??= `Bearer ${a.token}`
+  } else {
+    throw new Error('auth.type must be "basic" or "bearer"')
+  }
 }
 
 function isJsonObject(v: unknown): boolean {
@@ -175,6 +203,70 @@ const REQUEST_SHAPE: z.ZodRawShape = {
   redirect: z.enum(['follow', 'manual']).optional(),
   timeout_ms: z.number().int().optional(),
   max_body_bytes: z.number().int().optional().describe('Body preview cap (default 20000; sha256 always covers the full body)'),
+  auth: z.object({
+    type: z.enum(['basic', 'bearer']),
+    username: z.string().optional(),
+    password: z.string().optional().describe('May use $secret:NAME'),
+    token: z.string().optional().describe('Bearer token; may use $secret:NAME'),
+  }).optional().describe('Authorization: basic (username+password) or bearer (token)'),
+}
+
+/** Save a URL server-side and return metadata only — reading a 338 KB rendered
+ *  page into the transcript costs ~100k tokens; evidence collection should not
+ *  (live-run ask 2026-10-27). */
+export async function performDownload(
+  jars: JarStore,
+  scope: ScopeGuard,
+  config: ConstellationConfig,
+  spec: RequestSpec,
+  owner: string,
+  destName: string | undefined,
+  sha256Expected: string | undefined,
+): Promise<{ file: string; status: number; bytes: number; sha256: string; contentType: string }> {
+  let parsedUrl: URL
+  try {
+    parsedUrl = new URL(spec.url)
+  } catch {
+    throw new Error(`unparseable URL: ${spec.url}`)
+  }
+  if (!HTTP_SCHEMES.has(parsedUrl.protocol.replace(':', '')))
+    throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — http_download supports http/https only`)
+  scope.assert(spec.url, owner, 'http_download')
+  const jar = jars.jar(spec.jar ?? 'default')
+  const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
+  if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
+  const headers: Record<string, string> = { ...(headersInterp as Record<string, string>) }
+  const cookie = jar.getCookieStringSync(spec.url)
+  if (cookie !== '') headers['cookie'] ??= cookie
+  applyAuth(headers, spec.auth)
+  const response = await fetch(spec.url, {
+    method: 'GET',
+    headers,
+    redirect: spec.redirect ?? 'follow',
+    signal: AbortSignal.timeout(spec.timeout_ms ?? 60_000),
+  })
+  const buffer = Buffer.from(await response.arrayBuffer())
+  for (const c of response.headers.getSetCookie?.() ?? []) {
+    try { jar.setCookieSync(c, response.url) } catch { /* skip malformed */ }
+  }
+  jars.persist(spec.jar ?? 'default', jar)
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex')
+  const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '') || 'download'
+  const ownerDir = path.join(config.outputDir, safe(owner), 'downloads')
+  const fromUrl = decodeURIComponent(parsedUrl.pathname.split('/').filter(Boolean).pop() ?? '')
+  const fileName = safe(destName ?? fromUrl ?? `download-${Date.now()}`)
+  fs.mkdirSync(ownerDir, { recursive: true })
+  const file = path.join(ownerDir, fileName)
+  fs.writeFileSync(file, buffer)
+  if (sha256Expected !== undefined && sha256Expected.toLowerCase() !== sha256)
+    throw new Error(`sha256 mismatch: expected ${sha256Expected}, got ${sha256} — file was still written to ${file}`)
+  return {
+    file,
+    status: response.status,
+    bytes: buffer.length,
+    sha256,
+    contentType: response.headers.get('content-type') ?? '(none)',
+  }
 }
 
 export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
@@ -236,5 +328,24 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
       }
       const list = jars.list()
       return textResult(list.length === 0 ? '(no jars yet — created on first http_request)' : list.join('\n'))
+    })
+
+  t('http_download', 'Fetch a URL server-side and save it under the owner\'s artifacts downloads/ dir — the transcript sees only status, bytes, sha256, and content-type. Optional sha256_expected verifies integrity. Use this for evidence blobs instead of reading bodies into context.',
+    {
+      url: z.string().describe('Absolute URL — scope-guarded'),
+      name: z.string().optional().describe('File name under downloads/ (default: derived from the URL path)'),
+      headers: z.record(z.string()).optional().describe('Header map; values may use $secret:NAME'),
+      auth: REQUEST_SHAPE.auth!.optional(),
+      jar: z.string().optional(),
+      redirect: z.enum(['follow', 'manual']).optional().describe('Default follow (unlike http_request)'),
+      timeout_ms: z.number().int().optional().describe('Default 60000'),
+      sha256_expected: z.string().optional().describe('Verify the downloaded bytes (mismatch still writes the file, but errors)'),
+      owner: z.string().optional().describe('Attribution for the scope audit log and the artifacts subdir'),
+    },
+    async ({ url, name, headers, auth, jar, redirect, timeout_ms, sha256_expected, owner }: any) => {
+      const result = await performDownload(jars, env.scope, env.config, {
+        url, headers, auth, jar, redirect, timeout_ms,
+      } as RequestSpec, owner ?? 'unknown', name, sha256_expected)
+      return textResult(`Saved ${result.bytes} bytes → ${result.file}\nHTTP ${result.status} · ${result.contentType} · sha256 ${result.sha256}`)
     })
 }
