@@ -34,12 +34,22 @@ export function errorResult(error: unknown): ToolResult {
 /** Walk an Error's cause chain: Node's fetch throws a bare
  *  `TypeError: fetch failed` with the real transport failure (DNS, TLS,
  *  connect ECONNREFUSED, HTTP/2 …) one level down in `cause`. The generic
- *  text alone sent an agent to PowerShell to learn why (run-4 advice §3). */
+ *  text alone sent an agent to PowerShell to learn why (run-4 advice §3).
+ *  Non-Error throwables are serialized as JSON — a Playwright timeout that
+ *  arrives as a plain object surfaced as "[object Object]" with no message
+ *  (smoke round 2, defect 3). */
 export function describeErrorChain(error: unknown): string {
   const parts: string[] = []
   let at: unknown = error
   for (let depth = 0; depth < 4 && at !== undefined && at !== null; depth++) {
-    const line = at instanceof Error ? at.message : (depth === 0 ? String(at) : '')
+    let line: string
+    if (at instanceof Error) line = at.message
+    else if (depth === 0) {
+      if (typeof at === 'string') line = at
+      else {
+        try { line = JSON.stringify(at) ?? String(at) } catch { line = String(at) }
+      }
+    } else line = ''
     if (line !== '' && !parts.includes(line)) parts.push(line)
     at = (at as { cause?: unknown }).cause
   }
@@ -143,6 +153,36 @@ async function uploadRecord(session: BrowserSession, how: string, files: string[
     `recorded: ${path.join(session.artifactDir(), 'uploads.jsonl')}`,
     `Now at: see browser_snapshot for the page state`,
   ].join('\n')
+}
+
+/** Visible button/menu-item texts through shadow roots + same-origin frames
+ *  (smoke round 2, defect 1: Gemini's upload tile was Thai-labeled inside a
+ *  CDK overlay — name the items so the next attempt targets the right one). */
+async function dumpClickableTexts(page: Page): Promise<string> {
+  try {
+    const items = await page.evaluate(() => {
+      const collect = (root: { querySelectorAll(selector: string): any[] }, into: string[]): void => {
+        for (const el of root.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"], a[href], li')) {
+          const text = (el.textContent ?? el.getAttribute?.('aria-label') ?? '').trim().replace(/\s+/g, ' ')
+          if (text !== '' && text.length <= 60 && !into.includes(text)) into.push(text)
+        }
+        for (const el of root.querySelectorAll('*')) {
+          const shadow: { querySelectorAll(selector: string): any[] } | null | undefined = el.shadowRoot
+          if (shadow != null) collect(shadow, into)
+        }
+      }
+      const into: string[] = []
+      collect(document, into)
+      for (const frame of document.querySelectorAll('iframe')) {
+        const inner: { querySelectorAll(selector: string): any[] } | null = frame.contentDocument
+        if (inner !== null) collect(inner, into)
+      }
+      return into.slice(0, 40)
+    })
+    return items.length === 0 ? '(none found)' : items.map(text => `  - ${text}`).join('\n')
+  } catch {
+    return '(page inspection failed — take a screenshot and read the menu)'
+  }
 }
 
 async function pageOverview(page: Page): Promise<string> {
@@ -564,76 +604,99 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ).join('\n'))
     })
 
-  t('browser_upload', 'Upload file(s) into DYNAMICALLY-CREATED file inputs (run-7 P1-8: Drive/Docs create their input[type=file] after the menu click, inside shadow roots). Clicks the trigger (CSS pierces open shadow roots; `deep_text` matches button text through shadow DOM + same-origin frames), intercepts the file chooser, and records the upload as an artefact row. Falls back to the first file input found by a deep DOM walk when no chooser appears.',
+  t('browser_upload', 'Upload file(s) into DYNAMICALLY-CREATED file inputs (run-7 P1-8: Drive/Docs create their input[type=file] after the menu click, inside shadow roots). Clicks the trigger — CSS (pierces open shadow roots), `deep_text` button text, or `trigger_x/trigger_y` coordinates (smoke round 2: Gemini\'s menu tile was labeled in Thai and text matching found nothing) — with the CDP file-chooser interception ARMED so no native Windows dialog can be left open blocking the desktop. On total failure it dumps the visible menu/button texts so the next attempt names the right target.',
     {
       trigger: z.string().optional().describe('CSS selector of the button/menu item that opens the upload UI (pierces open shadow roots)'),
       deep_text: z.string().optional().describe('Button text to find through shadow DOM + frames when no selector works (e.g. "Upload file")'),
+      trigger_x: z.number().optional().describe('Viewport x for a raw coordinate click on the trigger (last resort — take the x/y from a screenshot)'),
+      trigger_y: z.number().optional(),
       files: z.array(z.string()).min(1).describe('Absolute file paths'),
       ...OWNER_FIELD, ...TAB_FIELD,
     },
-    async ({ trigger, deep_text, files, owner, tab }: any) => {
+    async ({ trigger, deep_text, trigger_x, trigger_y, files, owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
       const page = await tabFor(session, who, tab)
       for (const file of files) {
         if (!fs.existsSync(file)) throw new Error(`file not found: ${file}`)
       }
-      const target = trigger !== undefined && trigger !== ''
-        ? { kind: 'selector' as const, value: trigger }
-        : deep_text !== undefined && deep_text !== ''
-          ? { kind: 'text' as const, value: deep_text }
-          : undefined
-      let how: string
-      if (target !== undefined) {
-        how = target.kind === 'selector' ? `trigger selector "${target.value}"` : `deep text "${target.value}"`
-        const locator = target.kind === 'selector'
-          ? page.locator(target.value).first()
-          : page.locator(`text=${JSON.stringify(target.value)}`).first()
-        const [chooser] = await Promise.all([
-          page.waitForEvent('filechooser', { timeout: 10_000 }).catch(() => undefined),
-          (async () => {
-            try { await locator.click({ timeout: 8_000 }) } catch { /* deep fallback below */ } })(),
-        ])
-        if (chooser !== undefined) {
-          await chooser.setFiles(files)
-          await page.waitForTimeout(500)
-          return textResult(await uploadRecord(session, how, files))
+      // Smoke round 2, defect 2: interception armed at the CDP level BEFORE
+      // any trigger click — a chooser is then cancelled by Chrome instead of
+      // opening a native Windows dialog that blocks the desktop.
+      const cdp = await page.context().newCDPSession(page)
+      await cdp.send('Page.setInterceptFileChooserDialog', { enabled: true }).catch(() => undefined)
+      try {
+        const target = trigger !== undefined && trigger !== ''
+          ? { kind: 'selector' as const, value: trigger }
+          : deep_text !== undefined && deep_text !== ''
+            ? { kind: 'text' as const, value: deep_text }
+            : trigger_x !== undefined && trigger_y !== undefined
+              ? { kind: 'coords' as const, value: `${trigger_x},${trigger_y}` }
+              : undefined
+        let how: string
+        if (target !== undefined) {
+          how = target.kind === 'selector' ? `trigger selector "${target.value}"` : target.kind === 'text' ? `deep text "${target.value}"` : `trigger coordinates (${target.value})`
+          const [chooser] = await Promise.all([
+            page.waitForEvent('filechooser', { timeout: 10_000 }).catch(() => undefined),
+            (async () => {
+              try {
+                if (target.kind === 'coords') await page.mouse.click(trigger_x!, trigger_y!)
+                else if (target.kind === 'selector') await page.locator(target.value).first().click({ timeout: 8_000 })
+                else await page.locator(`text=${JSON.stringify(target.value)}`).first().click({ timeout: 8_000 })
+              } catch { /* deep fallback below */ }
+            })(),
+          ])
+          if (chooser !== undefined) {
+            await chooser.setFiles(files)
+            await page.waitForTimeout(500)
+            return textResult(await uploadRecord(session, how, files))
+          }
         }
-      }
-      // No chooser fired (or no trigger given): find an input[type=file] by
-      // walking shadow roots + same-origin frames directly in the DOM.
-      const handle = await page.evaluateHandle(() => {
-        const walk = (root: { querySelectorAll(selector: string): any[] }): any => {
-          for (const el of root.querySelectorAll('input[type="file"]')) return el
-          for (const el of root.querySelectorAll('*')) {
-            const shadow: { querySelectorAll(selector: string): any[] } | null | undefined = el.shadowRoot
-            if (shadow != null) {
-              const found = walk(shadow)
-              if (found !== null) return found
+        // No chooser fired (or no trigger given): find an input[type=file] by
+        // walking shadow roots + same-origin frames directly in the DOM.
+        const handle = await page.evaluateHandle(() => {
+          const walk = (root: { querySelectorAll(selector: string): any[] }): any => {
+            for (const el of root.querySelectorAll('input[type="file"]')) return el
+            for (const el of root.querySelectorAll('*')) {
+              const shadow: { querySelectorAll(selector: string): any[] } | null | undefined = el.shadowRoot
+              if (shadow != null) {
+                const found = walk(shadow)
+                if (found !== null) return found
+              }
             }
+            return null
+          }
+          const docs: Array<{ querySelectorAll(selector: string): any[] }> = [document]
+          for (const frame of document.querySelectorAll('iframe')) {
+            const inner: { querySelectorAll(selector: string): any[] } | null = frame.contentDocument
+            if (inner !== null) docs.push(inner)
+          }
+          for (const doc of docs) {
+            const found = walk(doc)
+            if (found !== null) return found
           }
           return null
+        })
+        const input = handle.asElement()
+        if (input === null) {
+          handle.dispose()
+          // Smoke round 2, defect 1: a generic message sent the lane into
+          // browser_run_code_unsafe; name the actual menu items instead.
+          const items = await dumpClickableTexts(page)
+          throw new Error([
+            'no file chooser opened and no input[type=file] found (even through shadow roots and frames).',
+            'Visible buttons/menu items on the page (pass one as deep_text, or use trigger_x/trigger_y from a screenshot):',
+            items,
+          ].join('\n'))
         }
-        const docs: Array<{ querySelectorAll(selector: string): any[] }> = [document]
-        for (const frame of document.querySelectorAll('iframe')) {
-          const inner: { querySelectorAll(selector: string): any[] } | null = frame.contentDocument
-          if (inner !== null) docs.push(inner)
-        }
-        for (const doc of docs) {
-          const found = walk(doc)
-          if (found !== null) return found
-        }
-        return null
-      })
-      const input = handle.asElement()
-      if (input === null) {
-        handle.dispose()
-        throw new Error('no file chooser opened and no input[type=file] found (even through shadow roots and frames) — snapshot the page and check the trigger')
+        how = 'direct deep input[type=file]'
+        await input.setInputFiles(files)
+        await handle.dispose()
+        await page.waitForTimeout(500)
+        return textResult(await uploadRecord(session, how, files))
+      } finally {
+        await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => undefined)
+        await cdp.detach().catch(() => undefined)
       }
-      how = 'direct deep input[type=file]'
-      await input.setInputFiles(files)
-      await handle.dispose()
-      await page.waitForTimeout(500)
-      return textResult(await uploadRecord(session, how, files))
     })
 
   t('browser_set_files', 'Upload file(s). Direct mode: set them on the matched <input type=file>. File-chooser mode (click_selector): click the button that opens the OS chooser and intercept it — the reliable path for hidden inputs (input[type=file].sr-only), where setInputFiles on the hidden input fired zero requests in the live run. For inputs created AFTER the menu click or buried in shadow roots, prefer browser_upload.',
@@ -651,13 +714,22 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         if (!fs.existsSync(file)) throw new Error(`file not found: ${file}`)
       }
       if (click_selector !== undefined && click_selector !== '') {
-        const [chooser] = await Promise.all([
-          page.waitForEvent('filechooser', { timeout: 10_000 }),
-          page.locator(click_selector).first().click({ timeout: 10_000 }),
-        ])
-        await chooser.setFiles(files)
-        await page.waitForTimeout(500)
-        return textResult(`Set ${files.length} file(s) via the file chooser.\nNow at: ${await pageOverview(page)}`)
+        // Interception armed before the click: a chooser is cancelled by
+        // Chrome, never left as a native Windows dialog on the desktop.
+        const cdp = await page.context().newCDPSession(page)
+        await cdp.send('Page.setInterceptFileChooserDialog', { enabled: true }).catch(() => undefined)
+        try {
+          const [chooser] = await Promise.all([
+            page.waitForEvent('filechooser', { timeout: 10_000 }),
+            page.locator(click_selector).first().click({ timeout: 10_000 }),
+          ])
+          await chooser.setFiles(files)
+          await page.waitForTimeout(500)
+          return textResult(`Set ${files.length} file(s) via the file chooser.\nNow at: ${await pageOverview(page)}`)
+        } finally {
+          await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => undefined)
+          await cdp.detach().catch(() => undefined)
+        }
       }
       await locatorFor(page, selector, element, name, nth).first().setInputFiles(files, { timeout: 10_000 })
       await page.waitForTimeout(500)
@@ -957,7 +1029,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
     async ({ owner }: any) => {
       const { session } = sessionOf(env, owner)
       const rows = session.scopeViolations
-      if (rows.length === 0) return textResult(`No out-of-scope requests observed from "${session.owner}".`)
+      if (rows.length === 0) return textResult(`No out-of-scope TRAFFIC observed from "${session.owner}" — this lists only requests that actually left the browser (a scope-DENIED navigation never leaves, so it never appears here; denied attempts are in scope_audit).`, true)
       return textResult([
         `${rows.length} out-of-scope request(s) from "${session.owner}" (audited; STOP the lane and fix the scope):`,
         ...rows.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`),

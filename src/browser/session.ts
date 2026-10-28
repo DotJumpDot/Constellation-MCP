@@ -198,9 +198,46 @@ export class BrowserSession {
     })
   }
 
+  /** Quiet-window Preferences, written before every launch (user ask: with
+   *  10+ owner windows the "Restore pages?" bubble and Chrome's save-password
+   *  prompts pile up unusable noise):
+   *  - exit_type Normal / exited_cleanly — Chrome believes the last session
+   *    ended cleanly (belt to --hide-crash-restore-bubble's braces);
+   *  - password manager off — no "Save password?" bubble when agents drive
+   *    logins (values must NEVER be captured into profiles anyway).
+   *  Merged into an existing profile's Preferences; best-effort. */
+  private writeSuppressionPrefs(): void {
+    try {
+      const prefsDir = path.join(this.userDir, 'Default')
+      const prefsFile = path.join(prefsDir, 'Preferences')
+      let prefs: Record<string, unknown> = {}
+      try { prefs = JSON.parse(fs.readFileSync(prefsFile, 'utf8')) as Record<string, unknown> } catch { /* new profile */ }
+      prefs['credentials_enable_service'] = false
+      prefs['credentials_enable_autosignin'] = false
+      prefs['profile'] = {
+        ...(prefs['profile'] as Record<string, unknown> ?? {}),
+        password_manager_enabled: false,
+        exit_type: 'Normal',
+        exited_cleanly: true,
+      }
+      fs.mkdirSync(prefsDir, { recursive: true })
+      fs.writeFileSync(prefsFile, JSON.stringify(prefs))
+    } catch { /* a locked or exotic profile launches without the quieting */ }
+  }
+
   private async launch(): Promise<BrowserContext> {
     fs.mkdirSync(this.userDir, { recursive: true })
+    this.writeSuppressionPrefs()
     const labelScript = this.labelScript()
+    // Quiet-window defaults (user ask, 10+ windows per run): no "Restore
+    // pages?" bubble after an unclean exit, no first-run/default-browser
+    // nagging. The password-save bubble is disabled via Preferences below.
+    const args = [
+      '--hide-crash-restore-bubble',
+      '--no-first-run',
+      '--no-default-browser-check',
+      ...(this.launchExtraArgs ?? []),
+    ]
     let context: BrowserContext
     try {
       context = await chromium.launchPersistentContext(this.userDir, {
@@ -208,7 +245,7 @@ export class BrowserSession {
         headless: this.config.headless,
         viewport: null,
         acceptDownloads: true,
-        ...(this.launchExtraArgs !== undefined && this.launchExtraArgs.length > 0 ? { args: this.launchExtraArgs } : {}),
+        args,
         // browser_launch "normal window" mode: drop the automation flag so
         // sites fingerprinting it (and DBSC) see a regular Chrome.
         ...(this.launchNoAutomationFlag ? { ignoreDefaultArgs: ['--enable-automation'] } : {}),

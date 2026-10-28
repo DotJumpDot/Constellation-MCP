@@ -27,7 +27,7 @@ export interface ConstellationServer {
 export function buildServer(config: ConstellationConfig): ConstellationServer {
   const registry = new OwnerRegistry(config)
   const scope = new ScopeGuard(config.scopeFile, config.auditFile, config.requireScope)
-  const budget = new BudgetGuard()
+  const budget = new BudgetGuard(path.join(config.rootDir, 'budgets.json'))
   const env: ToolEnv = { config, registry, scope, budget }
   const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
   const jars = new JarStore(config)

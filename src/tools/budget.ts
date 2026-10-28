@@ -1,3 +1,5 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { z } from 'zod'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
 
@@ -19,12 +21,34 @@ export interface BudgetState {
 export class BudgetGuard {
   private state = new Map<string, BudgetState>()
 
+  /** Persisted to `<rootDir>/budgets.json` (smoke round 2, defect 4: budgets
+   *  died with the server while the evidence chain survived — inconsistent). */
+  constructor(private persistFile?: string) {
+    if (persistFile === undefined) return
+    try {
+      const rows = JSON.parse(fs.readFileSync(persistFile, 'utf8')) as Array<{ owner: string; max: number; used: number }>
+      for (const row of rows) {
+        if (typeof row?.owner === 'string' && Number.isInteger(row?.max) && Number.isInteger(row?.used) && row.max > 0)
+          this.state.set(row.owner, { max: row.max, used: Math.max(0, Math.min(row.used, row.max)) })
+      }
+    } catch { /* first run or unreadable file: start empty */ }
+  }
+
+  private save(): void {
+    if (this.persistFile === undefined) return
+    try {
+      fs.mkdirSync(path.dirname(this.persistFile), { recursive: true })
+      fs.writeFileSync(this.persistFile, JSON.stringify(this.list(), null, 2) + '\n')
+    } catch { /* best effort */ }
+  }
+
   set(owner: string, maxRequests: number): BudgetState {
     if (!Number.isInteger(maxRequests) || maxRequests <= 0)
       throw new Error(`max_requests must be a positive integer, got ${String(maxRequests)}`)
     const prior = this.state.get(owner)
     const state = { max: maxRequests, used: Math.min(prior?.used ?? 0, maxRequests) }
     this.state.set(owner, state)
+    this.save()
     return { ...state }
   }
 
@@ -38,6 +62,7 @@ export class BudgetGuard {
       throw new Error(`budget_raise must raise "${owner}" above its current ${prior.max} (currently used: ${prior.used}) — pass to: or add:`)
     const state = { max: next, used: prior.used }
     this.state.set(owner, state)
+    this.save()
     return { ...state }
   }
 

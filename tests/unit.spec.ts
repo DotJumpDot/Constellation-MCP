@@ -689,3 +689,34 @@ test('evidence: appendChainEntry actually writes and chains across entries (smok
   assert.equal(broken.ok, false)
   assert.equal(broken.brokenAt, 1)
 })
+
+test('budget: caps survive a server restart via budgets.json (smoke round 2, defect 4)', async () => {
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const fs = await import('node:fs')
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'budget-')), 'budgets.json')
+  const { BudgetGuard } = await import('../src/tools/budget.js')
+  const first = new BudgetGuard(file)
+  first.set('lane-a', 25)
+  first.spend('lane-a')
+  first.set('lane-b', 30)
+  // A NEW guard (the restart shape) must inherit both caps and the spend.
+  const second = new BudgetGuard(file)
+  assert.deepEqual(second.get('lane-a'), { max: 25, used: 1 })
+  assert.deepEqual(second.get('lane-b'), { max: 30, used: 0 })
+  second.spend('lane-a')
+  second.raise('lane-a', 30)
+  assert.deepEqual(new BudgetGuard(file).get('lane-a'), { max: 30, used: 2 })
+  // The enforcement path itself still refuses past the cap.
+  const tight = new BudgetGuard(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'budget-')), 'b.json'))
+  tight.set('tiny', 1)
+  tight.spend('tiny')
+  assert.throws(() => tight.spend('tiny'), /BUDGET EXCLUDED|BUDGET EXCEEDED/)
+})
+
+test('errors: non-Error throwables serialize with their message (smoke round 2, defect 3)', async () => {
+  const { describeErrorChain } = await import('../src/browser/tools.js')
+  assert.match(describeErrorChain({ code: -32000, message: 'Execution context was destroyed' }), /Execution context was destroyed/)
+  assert.doesNotMatch(describeErrorChain({ a: 1 }), /\[object Object\]/)
+  assert.equal(describeErrorChain('plain string error'), 'plain string error')
+})
