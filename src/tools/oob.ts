@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { z } from 'zod'
 import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '../browser/tools.js'
 
@@ -19,15 +20,25 @@ export interface OobToken {
   label?: string
   createdAt: number
   events: OobEvent[]
+  /** Public quick-tunnel URL fronting this token (run-7 P1-9). */
+  publicUrl?: string
+}
+
+interface OobTunnel {
+  child: ChildProcess
+  url: string
 }
 
 const MAX_EVENTS_PER_TOKEN = 100
 const MAX_BODY_CAPTURE = 4_096
+const TUNNEL_URL_TIMEOUT_MS = 45_000
 
 export class OobStore {
   private tokens = new Map<string, OobToken>()
   private server?: http.Server
   private boundPort?: number
+  /** Per-token cloudflared quick tunnels (run-7 P1-9). */
+  private tunnels = new Map<string, OobTunnel>()
 
   constructor(private port: number, private publicBase?: string, private persistFile?: string) {
     this.loadPersisted()
@@ -124,26 +135,90 @@ export class OobStore {
 
   urls(token: string): { local: string; public?: string } {
     const port = this.boundPort ?? this.port
+    const entry = this.tokens.get(token)
+    const tunnelUrl = this.tunnels.get(token)?.url
+    const publicBase = tunnelUrl ?? this.publicBase
     return {
       local: `http://127.0.0.1:${port}/oob/${token}`,
-      ...(this.publicBase === undefined ? {} : { public: `${this.publicBase.replace(/\/$/, '')}/oob/${token}` }),
+      ...(publicBase === undefined ? {} : { public: `${publicBase.replace(/\/$/, '')}/oob/${token}` }),
     }
+  }
+
+  /** Spawn a cloudflared quick tunnel to the local receiver (run-7 P1-9):
+   *  SSRF/blind-XSS proof NEEDS a public callback — a loopback URL is refused
+   *  by models and unreachable by remote fetchers. Brings the technique
+   *  INSIDE the audited surface with guaranteed teardown. */
+  async startQuickTunnel(token: string): Promise<string> {
+    if (this.tunnels.has(token)) return this.tunnels.get(token)!.url
+    const port = await this.ensureServer()
+    let child: ChildProcess
+    try {
+      child = spawn('cloudflared', ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'], {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      throw new Error(`cannot spawn cloudflared (${error instanceof Error ? error.message : String(error)}) — install it from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ and retry`)
+    }
+    const url = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`cloudflared did not report a trycloudflare.com URL within ${TUNNEL_URL_TIMEOUT_MS / 1000}s`)), TUNNEL_URL_TIMEOUT_MS)
+      let text = ''
+      const scan = (chunk: Buffer): void => {
+        text += chunk.toString('utf8')
+        const match = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i.exec(text)
+        if (match !== null) {
+          clearTimeout(timer)
+          resolve(match[0])
+        }
+      }
+      child.stdout?.on("data", scan)
+      child.stderr?.on("data", scan)
+      child.on('error', error => { clearTimeout(timer); reject(new Error(`cloudflared failed to start: ${error instanceof Error ? error.message : String(error)} — is it on PATH?`)) })
+      child.on('close', code => { clearTimeout(timer); reject(new Error(`cloudflared exited early (code ${code}) — check "cloudflared tunnel --url http://127.0.0.1:${port}" by hand`)) })
+    }).catch(error => {
+      try { child.kill() } catch { /* already gone */ }
+      throw error
+    })
+    this.tunnels.set(token, { child, url })
+    return url
+  }
+
+  /** Teardown guarantee (run-7 P1-9): closing a token kills its tunnel. */
+  closeToken(token: string): { closedToken: boolean; killedTunnel: boolean } {
+    const tunnel = this.tunnels.get(token)
+    let killedTunnel = false
+    if (tunnel !== undefined) {
+      try { tunnel.child.kill() } catch { /* already gone */ }
+      this.tunnels.delete(token)
+      killedTunnel = true
+    }
+    return { closedToken: this.tokens.delete(token), killedTunnel }
+  }
+
+  /** Live exposure view for oob_list: token → public URL while exposed. */
+  exposedTunnels(): Array<{ token: string; url: string }> {
+    return [...this.tunnels.entries()].map(([token, tunnel]) => ({ token, url: tunnel.url }))
   }
 
   events(token: string): OobEvent[] | undefined {
     return this.tokens.get(token)?.events
   }
 
-  list(): Array<{ token: string; label?: string; events: number; age_min: number }> {
+  list(): Array<{ token: string; label?: string; events: number; age_min: number; publicUrl?: string }> {
     return [...this.tokens.values()].map(t => ({
       token: t.token,
       ...(t.label === undefined ? {} : { label: t.label }),
       events: t.events.length,
       age_min: Math.round((Date.now() - t.createdAt) / 60_000),
+      ...(this.tunnels.has(t.token) ? { publicUrl: `${this.tunnels.get(t.token)!.url}/oob/${t.token}` } : {}),
     }))
   }
 
   async dispose(): Promise<void> {
+    for (const { child } of this.tunnels.values()) {
+      try { child.kill() } catch { /* already gone */ }
+    }
+    this.tunnels.clear()
     await new Promise<void>(resolve => {
       if (this.server === undefined) return resolve()
       this.server.close(() => resolve())
@@ -159,18 +234,36 @@ export function registerOobTools(server: ToolRegistrar, store: OobStore): void {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('oob_new', 'Create an out-of-band callback token for SSRF/blind-XSS proof. Local receiver on 127.0.0.1; set CONSTELLATION_OOB_PUBLIC_BASE for a public tunnel URL. Tokens and hits survive a server restart.',
-    { label: z.string().optional().describe('What this token is for, e.g. "launchdarkly-webhook"') },
-    async ({ label }: any) => {
+  t('oob_new', 'Create an out-of-band callback token for SSRF/blind-XSS proof. `public: true` spawns a cloudflared quick tunnel automatically (run-7 P1-9) — a PUBLIC https://…trycloudflare.com URL that remote fetchers can reach; oob_close tears the tunnel down. Without it: local receiver on 127.0.0.1, public URL only when CONSTELLATION_OOB_PUBLIC_BASE is set. Tokens and hits survive a server restart (tunnels do not — re-run oob_new public after a restart).',
+    { label: z.string().optional().describe('What this token is for, e.g. "launchdarkly-webhook"'), public: z.boolean().optional().describe('Spawn a cloudflared quick tunnel and return a public URL') },
+    async ({ label, public: wantsPublic }: any) => {
       const port = await store.ensureServer()
       const entry = store.newToken(label)
       const urls = store.urls(entry.token)
+      let publicLine: string
+      if (wantsPublic === true) {
+        const tunnel = await store.startQuickTunnel(entry.token)
+        publicLine = `public: ${tunnel}/oob/${entry.token} (cloudflared quick tunnel; oob_close {token} guarantees teardown)`
+      } else if (urls.public !== undefined) {
+        publicLine = `public: ${urls.public}`
+      } else {
+        publicLine = 'public: pass public: true (cloudflared quick tunnel) or set CONSTELLATION_OOB_PUBLIC_BASE — remote fetchers cannot reach a loopback URL'
+      }
       return textResult([
         `token: ${entry.token}${label === undefined ? '' : ` (${label})`}`,
         `local:  ${urls.local}`,
-        ...(urls.public !== undefined ? [`public: ${urls.public}`] : ['public: set CONSTELLATION_OOB_PUBLIC_BASE (e.g. a cloudflared/ngrok tunnel to this port) and re-run for a public URL']),
+        publicLine,
         `receiver listening on 127.0.0.1:${port} — call oob_events {token} to read hits`,
       ].join('\n'))
+    })
+
+  t('oob_close', 'Close one OOB token and KILL its cloudflared tunnel (run-7 P1-9: guaranteed teardown — a forgotten quick tunnel keeps exposing this machine).',
+    { token: z.string() },
+    async ({ token }: any) => {
+      const result = store.closeToken(token)
+      if (!result.closedToken && !result.killedTunnel)
+        return textResult(`unknown token "${token}" — nothing to close`, true)
+      return textResult(`Closed token ${token}: token removed${result.killedTunnel ? ' and cloudflared tunnel killed (no longer exposed)' : ' (no tunnel was running)'}.`)
     })
 
   t('oob_events', 'Callbacks recorded for an OOB token (method, path, query, headers, body, timestamp).',

@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -6,6 +7,7 @@ import { z } from 'zod'
 import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '../browser/tools.js'
 
 const exec = promisify(execFile)
+const joinPath = path.join
 const COMMIT_TYPES = ['Feat', 'Fix', 'Test', 'Docs', 'Chore', 'Release', 'Hunt', 'Report'] as const
 export type CommitType = (typeof COMMIT_TYPES)[number]
 
@@ -73,7 +75,7 @@ export function registerGitTools(server: ToolRegistrar): void {
       return textResult(status === '' ? '(clean)' : status.trimEnd())
     })
 
-  t('repo_commit', 'Commit with the DST-Comet message convention (Type: subject + [x] bullets + Verified line). Stages ONLY the given paths and refuses if the index already holds other changes.',
+  t('repo_commit', 'Commit with the DST-Comet message convention (Type: subject + [x] bullets + Verified line). Stages ONLY the given paths and refuses if the index already holds other changes. Paths are validated VERBATIM before staging (run-7 P1-11: the secret scrubber mangled a long repo-relative filename into "[redacted].py" inside a git pathspec error, and the agent could not tell which path was wrong) — a missing file fails with the real path.',
     {
       type: z.enum(COMMIT_TYPES),
       subject: z.string().min(1),
@@ -91,6 +93,18 @@ export function registerGitTools(server: ToolRegistrar): void {
       const extraneous = staged.filter(s => !wanted.has(s))
       if (extraneous.length > 0)
         return textResult(`Refusing: the index already holds staged changes outside your paths: ${extraneous.join(', ')}. Coordinate with their owner first.`, true)
+      // Validate paths against the worktree BEFORE git add: git's own error
+      // text round-trips through the secret scrubber, which mangles long
+      // path-shaped strings. This message names the real paths verbatim.
+      const tracked = new Set((await git(cwd, 'ls-files', '--', ...paths)).split('\n').map(s => s.trim()).filter(s => s !== ''))
+      const missing = paths.filter((p: string) => !tracked.has(p) && !fs.existsSync(joinPath(cwd, p)))
+      if (missing.length > 0) {
+        return textResult([
+          `Refusing: ${missing.length} path(s) do not exist in "${cwd}" (checked verbatim, unredacted):`,
+          ...missing.map((p: string) => `  - ${p}`),
+          'git status the repo and fix the path list; the remaining paths were not staged.',
+        ].join('\n'), true)
+      }
       await git(cwd, 'add', '--', ...paths)
       const message = renderCommitMessage({ type, subject, bullets, verification })
       const file = path.join(tmpdir(), `constellation-commit-${Date.now()}.txt`)

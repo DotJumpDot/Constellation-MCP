@@ -12,6 +12,7 @@ import { interpolateDeep } from './secrets.js'
 export interface HttpEnv {
   config: ConstellationConfig
   scope: ScopeGuard
+  budget?: import('./budget.js').BudgetGuard
 }
 
 const MAX_BODY_DEFAULT = 20_000
@@ -85,7 +86,7 @@ export interface RequestResult {
   set_cookies: number
 }
 
-export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: RequestSpec, owner: string, tool: string): Promise<RequestResult> {
+export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: RequestSpec, owner: string, tool: string, budget?: import('./budget.js').BudgetGuard): Promise<RequestResult> {
   let parsedUrl: URL
   try {
     parsedUrl = new URL(spec.url)
@@ -95,6 +96,7 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
   if (!HTTP_SCHEMES.has(parsedUrl.protocol.replace(':', '')))
     throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — http_request supports http/https only`)
   scope.assert(spec.url, owner, tool)
+  budget?.spend(owner)
   const jar = jars.jar(spec.jar ?? 'default')
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')} — set them via CONSTELLATION_SECRET_* env`)
@@ -222,6 +224,7 @@ export async function performDownload(
   owner: string,
   destName: string | undefined,
   sha256Expected: string | undefined,
+  budget?: import('./budget.js').BudgetGuard,
 ): Promise<{ file: string; status: number; bytes: number; sha256: string; contentType: string }> {
   let parsedUrl: URL
   try {
@@ -232,6 +235,7 @@ export async function performDownload(
   if (!HTTP_SCHEMES.has(parsedUrl.protocol.replace(':', '')))
     throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — http_download supports http/https only`)
   scope.assert(spec.url, owner, 'http_download')
+  budget?.spend(owner)
   const jar = jars.jar(spec.jar ?? 'default')
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
@@ -281,7 +285,7 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
     { ...REQUEST_SHAPE, owner: z.string().optional().describe('Attribution for the scope audit log') },
     async (args: any) => {
       const { owner, ...spec } = args
-      const result = await performRequest(jars, env.scope, spec as RequestSpec, owner ?? 'unknown', 'http_request')
+      const result = await performRequest(jars, env.scope, spec as RequestSpec, owner ?? 'unknown', 'http_request', env.budget)
       return textResult(formatResult(result))
     })
 
@@ -290,8 +294,8 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
     async ({ a, b, owner }: any) => {
       const who = owner ?? 'unknown'
       const [ra, rb] = await Promise.all([
-        performRequest(jars, env.scope, a as RequestSpec, who, 'http_diff'),
-        performRequest(jars, env.scope, b as RequestSpec, who, 'http_diff'),
+        performRequest(jars, env.scope, a as RequestSpec, who, 'http_diff', env.budget),
+        performRequest(jars, env.scope, b as RequestSpec, who, 'http_diff', env.budget),
       ])
       const lines: string[] = []
       lines.push(`A: HTTP ${ra.status} sha=${ra.body_sha256} (${ra.timing_ms} ms)`)
@@ -345,7 +349,7 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
     async ({ url, name, headers, auth, jar, redirect, timeout_ms, sha256_expected, owner }: any) => {
       const result = await performDownload(jars, env.scope, env.config, {
         url, headers, auth, jar, redirect, timeout_ms,
-      } as RequestSpec, owner ?? 'unknown', name, sha256_expected)
+      } as RequestSpec, owner ?? 'unknown', name, sha256_expected, env.budget)
       return textResult(`Saved ${result.bytes} bytes → ${result.file}\nHTTP ${result.status} · ${result.contentType} · sha256 ${result.sha256}`)
     })
 }

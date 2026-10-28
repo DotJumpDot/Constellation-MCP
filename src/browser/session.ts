@@ -72,6 +72,8 @@ export function saveOwnerLabel(rootDir: string, owner: string, label: OwnerLabel
 export interface SessionSnapshot {
   owner: string
   running: boolean
+  /** True when the browser was adopted over CDP instead of launched. */
+  attached: boolean
   userDir: string
   windowLabel: string
   selected: number | null
@@ -102,6 +104,14 @@ export class BrowserSession {
   infoJob?: string
   infoEngagement?: string
   private infoOpenedAt?: string
+  /** Attach mode (run-7 P0-2): adopt a running browser over CDP. */
+  attached = false
+  cdpUrl?: string
+  private attachedBrowser?: pwCore.Browser
+  /** Custom launch options (browser_launch): extra args + a normal,
+   *  non-automation-flagged window. */
+  launchExtraArgs?: string[]
+  launchNoAutomationFlag = false
 
   constructor(readonly owner: string, readonly userDir: string, private config: ConstellationConfig) {
     // Seed the info-tab label from disk so a reset/restart window still says
@@ -130,15 +140,40 @@ export class BrowserSession {
     if (this.context) {
       // The human (or Chrome itself) can close the info tab from the UI; the
       // ownership label must survive, so re-pin it whenever it is missing.
-      if (this.owner !== SHARED_OWNER && this.context !== undefined && !this.hasInfoTab()) {
+      if (this.owner !== SHARED_OWNER && !this.attached && this.context !== undefined && !this.hasInfoTab()) {
         try { await this.openInfoTab() } catch { /* never block tool calls on the label */ }
       }
       return this.context
     }
     if (!this.launching) {
-      this.launching = this.launch().finally(() => { this.launching = undefined })
+      this.launching = (this.attached ? this.connectOverCdp() : this.launch()).finally(() => { this.launching = undefined })
     }
     return this.launching
+  }
+
+  /** Adopt a browser the human is already driving (run-7 P0-2). DBSC binds
+   *  sessions to the browser instance, so launching is fatal by design for
+   *  such identities — attaching to the signed-in browser is the working
+   *  route, and doing it INSIDE the session keeps it under the scope guard,
+   *  tab leases and audit like any launched owner. */
+  private async connectOverCdp(): Promise<BrowserContext> {
+    if (this.cdpUrl === undefined) throw new Error('attach session has no cdp_url')
+    let browser: pwCore.Browser
+    try {
+      browser = await chromium.connectOverCDP(this.cdpUrl, { timeout: 15_000 })
+    } catch (error) {
+      throw new Error(`failed to attach to ${this.cdpUrl}: ${error instanceof Error ? error.message : String(error)} — the target Chrome must run with --remote-debugging-port and the port reachable from this server`)
+    }
+    const context = browser.contexts()[0]
+    if (context === undefined) throw new Error(`attached to ${this.cdpUrl} but it exposes no browser context`)
+    this.attachedBrowser = browser
+    this.attached = true
+    // Adopted pages keep their own identity: no ownership-label init script
+    // (it cannot apply retroactively anyway) and no info tab.
+    context.on('page', page => { this.registerPage(page, this.owner) })
+    for (const page of context.pages()) this.registerPage(page, this.owner)
+    this.context = context
+    return context
   }
 
   private async launch(): Promise<BrowserContext> {
@@ -151,6 +186,10 @@ export class BrowserSession {
         headless: this.config.headless,
         viewport: null,
         acceptDownloads: true,
+        ...(this.launchExtraArgs !== undefined && this.launchExtraArgs.length > 0 ? { args: this.launchExtraArgs } : {}),
+        // browser_launch "normal window" mode: drop the automation flag so
+        // sites fingerprinting it (and DBSC) see a regular Chrome.
+        ...(this.launchNoAutomationFlag ? { ignoreDefaultArgs: ['--enable-automation'] } : {}),
       })
     } catch (error) {
       throw new Error(`failed to launch ${this.config.channel} browser for "${this.owner}": ${error instanceof Error ? error.message : String(error)}`)
@@ -318,8 +357,11 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     return {
       owner: this.owner,
       running: this.context !== undefined,
+      attached: this.attached,
       userDir: this.userDir,
-      windowLabel: this.windowLabel === '' ? 'shared profile (no label prefix)' : `${this.windowLabel.trim()} window`,
+      windowLabel: this.attached
+        ? `attached over CDP (${this.cdpUrl ?? '?'}) — closing only disconnects, never closes the human's browser`
+        : this.windowLabel === '' ? 'shared profile (no label prefix)' : `${this.windowLabel.trim()} window`,
       selected: this.selected,
       tabs,
     }
@@ -336,6 +378,23 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     this.context = undefined
     this.tabs.clear()
     this.selected = null
+    if (this.attached) {
+      // An attached browser belongs to the human: closing only DISCONNECTS.
+      const browser = this.attachedBrowser
+      this.attachedBrowser = undefined
+      this.attached = false
+      if (browser) { try { await browser.close() } catch { /* already gone */ } }
+      return
+    }
     if (context) { try { await context.close() } catch { /* already gone */ } }
+  }
+
+  /** Tab leases held in this session (any holder) — reset safety (P1-6). */
+  heldLeases(): Array<{ tabId: number; leasedBy: string; purpose?: string }> {
+    const out: Array<{ tabId: number; leasedBy: string; purpose?: string }> = []
+    for (const meta of this.tabs.values()) {
+      if (meta.leasedBy !== undefined) out.push({ tabId: meta.id, leasedBy: meta.leasedBy, ...(meta.purpose === undefined ? {} : { purpose: meta.purpose }) })
+    }
+    return out
   }
 }

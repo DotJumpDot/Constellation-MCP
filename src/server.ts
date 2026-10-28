@@ -11,6 +11,7 @@ import { registerScopeTools } from './tools/scope.js'
 import { registerSecretTools } from './tools/secrets.js'
 import { OobStore, registerOobTools } from './tools/oob.js'
 import { registerGitTools } from './tools/git.js'
+import { BudgetGuard, registerBudgetTools } from './tools/budget.js'
 
 export interface ConstellationServer {
   connect(): Promise<void>
@@ -20,7 +21,8 @@ export interface ConstellationServer {
 export function buildServer(config: ConstellationConfig): ConstellationServer {
   const registry = new OwnerRegistry(config)
   const scope = new ScopeGuard(config.scopeFile, config.auditFile, config.requireScope)
-  const env: ToolEnv = { config, registry, scope }
+  const budget = new BudgetGuard()
+  const env: ToolEnv = { config, registry, scope, budget }
   const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
 
   const mcp = new McpServer({ name: 'constellation', version: '0.1.0' }, {
@@ -48,6 +50,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerMailTools(registrar)
   registerOobTools(registrar, oob)
   registerGitTools(registrar)
+  registerBudgetTools(registrar, budget)
   registry.startIdleSweeper()
 
   return {

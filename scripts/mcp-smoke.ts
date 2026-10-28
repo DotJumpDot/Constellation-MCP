@@ -18,17 +18,19 @@ async function main(): Promise<void> {
   const { tools } = await client.listTools()
   const names = tools.map(t => t.name).sort()
   const expected = [
-    'browser_click', 'browser_close', 'browser_console_messages', 'browser_cookies_export', 'browser_cookies_import',
-    'browser_cookies_list', 'browser_evaluate', 'browser_fill_otp', 'browser_focus_window', 'browser_force_action', 'browser_frames_list', 'browser_map',
-    'browser_navigate', 'browser_network_requests', 'browser_owner_info', 'browser_press_key', 'browser_reset',
-    'browser_run_code_unsafe', 'browser_select_option', 'browser_set_files', 'browser_snapshot',
-    'browser_take_screenshot', 'browser_tabs', 'browser_type', 'browser_wait_for',
+    'browser_attach', 'browser_click', 'browser_clipboard', 'browser_close', 'browser_console_messages',
+    'browser_cookies_export', 'browser_cookies_import', 'browser_cookies_list', 'browser_evaluate', 'browser_fill_otp',
+    'browser_focus_window', 'browser_force_action', 'browser_frames_list', 'browser_launch', 'browser_map',
+    'browser_navigate', 'browser_network_requests', 'browser_owner_info', 'browser_paste', 'browser_press_key',
+    'browser_reset', 'browser_run_code_unsafe', 'browser_select_option', 'browser_set_files', 'browser_snapshot',
+    'browser_take_screenshot', 'browser_tabs', 'browser_type', 'browser_upload', 'browser_wait_for',
+    'budget_raise', 'budget_set', 'evidence_capture',
     'http_diff', 'http_download', 'http_jars', 'http_request',
-    'mail_get', 'mail_latest_otp', 'mail_search', 'mail_status', 'mail_wait',
-    'oob_events', 'oob_list', 'oob_new',
+    'mail_diagnose', 'mail_get', 'mail_latest_otp', 'mail_search', 'mail_status', 'mail_wait',
+    'oob_close', 'oob_events', 'oob_list', 'oob_new',
     'repo_commit', 'repo_status',
     'scope_audit', 'scope_clear', 'scope_get', 'scope_set',
-    'secrets_get', 'secrets_list',
+    'secrets_get', 'secrets_list', 'secrets_patch',
     'tab_lease', 'tab_open', 'tab_release',
   ]
   const missing = expected.filter(n => !names.includes(n))

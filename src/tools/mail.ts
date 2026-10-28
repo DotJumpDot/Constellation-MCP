@@ -492,6 +492,44 @@ export function registerMailTools(server: ToolRegistrar): void {
       return textResult(`authenticated as ${config.user}@${config.host}\nfolder: ${folder}${exists === undefined ? '' : ` (${exists} messages)`}`)
     })
 
+  t('mail_diagnose', 'Distinguish "mail never arrived" from "forwarding is broken" from "wrong folder" (run-7 P2-15: LastPass mail never arrived at all and 0-match searches could not say which). Searches EVERY folder for messages whose To header carries the domain — ever, not time-boxed — and reports per-folder counts with a verdict. Gmail labels overlap (a message sits in INBOX and labels at once); the \\All folder is skipped as redundant.',
+    { domain: z.string().min(3).describe('Domain to look for in To headers, e.g. bugcrowd.com (substring match)') },
+    async ({ domain }: any) => {
+      const config = requireConfig()
+      const want = domain.trim().toLowerCase()
+      const { client } = await openClient(config)
+      const perFolder: Array<{ folder: string; count: number }> = []
+      try {
+        const boxes = (await client.list?.()) ?? []
+        const folders = boxes
+          .map(box => box.path)
+          .filter(path => path !== undefined && !specialUseFlags(boxes.find(box => box.path === path)!).includes('\\all'))
+          .slice(0, 60)
+        for (const folder of folders) {
+          try {
+            await client.mailboxOpen?.(folder)
+            // Substring match on the To header: plus-addressing and relay
+            // rewrites keep the domain somewhere in the recipient list.
+            const seqs = (await client.search({ header: { to: want } })) || []
+            if (seqs.length > 0) perFolder.push({ folder, count: seqs.length })
+          } catch { /* one unreadable folder must not sink the diagnosis */ }
+        }
+      } finally {
+        try { client.logout().catch(() => undefined) } catch { /* ignore */ }
+        try { client.close() } catch { /* ignore */ }
+      }
+      const total = perFolder.reduce((sum, row) => sum + row.count, 0)
+      const verdict = total > 0
+        ? `VERDICT: mail TO ${want} HAS reached this account (${total} across ${perFolder.length} folder(s)) — if a search returned 0, the problem is the query (alias/from/subject filter or time window), not delivery.`
+        : `VERDICT: zero messages to ${want} in ANY folder, EVER — the mail never arrived: sender-side failure or the forwarding/routing into this account is broken. Do not keep polling; ask the human to check the forwarding rule.`
+      return textResult([
+        `searched To-header for "${want}" across every folder of ${config.user}@${config.host}:`,
+        ...(perFolder.length === 0 ? ['  (no matches anywhere)'] : perFolder.map(row => `  ${row.folder}: ${row.count}`)),
+        '',
+        verdict,
+      ].join('\n'))
+    })
+
   t('mail_wait', 'Poll the inbox until a matching mail arrives (or timeout). Frees workers from Gmail tab-hopping.',
     {
       alias: z.string().optional(), subject_contains: z.string().optional(), from_contains: z.string().optional(),

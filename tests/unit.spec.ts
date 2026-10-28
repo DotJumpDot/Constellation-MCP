@@ -510,6 +510,16 @@ test('mask: password values are replaced, short values skipped (run-5 §6)', asy
   assert.match(masked, /- textbox: ab/, 'sub-4-char values are not replaced')
 })
 
+test('mask: a non-array probe result never takes the snapshot down (run-7 P0-3)', async () => {
+  const { maskSecrets, passwordValuesProbe } = await import('../src/redact.js')
+  const snapshot = '- textbox: correct-horse-battery\n- heading "Login"'
+  // The run-7 failure shape: page.evaluate returned the probe FUNCTION object
+  // instead of calling it, and maskSecrets threw "secrets is not iterable".
+  assert.equal(maskSecrets(snapshot, passwordValuesProbe as unknown as string[]), snapshot)
+  assert.equal(maskSecrets(snapshot, undefined as unknown as string[]), snapshot)
+  assert.equal(typeof passwordValuesProbe, 'function', 'the probe is a real function Playwright will call')
+})
+
 test('mail: fallback folders pick Spam/Junk + Trash by special-use (run-5 §9)', async () => {
   const { fallbackFoldersFrom } = await import('../src/tools/mail.js')
   const boxes = [
@@ -521,4 +531,55 @@ test('mail: fallback folders pick Spam/Junk + Trash by special-use (run-5 §9)',
   ]
   assert.deepEqual(fallbackFoldersFrom(boxes), ['[Gmail]/Spam', '[Gmail]/Trash'])
   assert.deepEqual(fallbackFoldersFrom([{ path: 'INBOX' }]), [])
+})
+
+test('cookies: domain matching includes host-only subdomain cookies both ways (run-7 P0-1)', async () => {
+  const { cookieMatchesAnyDomain, chromiumTimeToUnixSeconds, stripHostKeyBinding, cookieHost } = await import('../src/browser/cookies.js')
+  // The exact run-7 failure: exporting domain "google.com" dropped the
+  // host-only accounts.google.com cookies (LSID/__Host-GAPS/OSID).
+  assert.equal(cookieMatchesAnyDomain('accounts.google.com', ['google.com']), true, 'host-only subdomain cookie is included')
+  assert.equal(cookieMatchesAnyDomain('.google.com', ['google.com']), true, 'domain cookie matches')
+  assert.equal(cookieMatchesAnyDomain('google.com', ['accounts.google.com']), true, 'domain cookie matches a deeper request')
+  assert.equal(cookieMatchesAnyDomain('.google.com', ['accounts.google.com']), true, 'request deeper than cookie domain')
+  assert.equal(cookieMatchesAnyDomain('evil.com', ['google.com']), false, 'unrelated host stays out')
+  assert.equal(cookieMatchesAnyDomain('.google.com.br', ['google.com']), false, 'suffix trick does not match')
+  assert.equal(cookieMatchesAnyDomain('anything.com', undefined), true, 'no filter = everything')
+  assert.equal(cookieHost('.Google.COM'), 'google.com')
+  // Chromium epoch (1601, microseconds): 2021-01-07T00:00:00Z round-trips.
+  assert.equal(chromiumTimeToUnixSeconds(0), -1)
+  assert.equal(chromiumTimeToUnixSeconds(116444736000000000 + 1609992000 * 1_000_000), 1609992000)
+  // Chrome 130+ host-key binding: a 32-byte sha256(host_key) prefix strips;
+  // a plaintext without the binding passes through untouched.
+  const { createHash } = await import('node:crypto')
+  const host = 'accounts.google.com'
+  const digest = createHash('sha256').update(host, 'utf8').digest()
+  assert.equal(stripHostKeyBinding(Buffer.concat([digest, Buffer.from('SID=xyz')]), host), 'SID=xyz')
+  assert.equal(stripHostKeyBinding(Buffer.from('plain-value'), host), 'plain-value')
+})
+
+test('secrets: JSON merge patch merges, deletes with null, replaces leaves (run-7 P1-10)', async () => {
+  const { applyJsonMergePatch, jsonSecretKeys } = await import('../src/tools/secrets.js')
+  const before = { a: { x: 1, y: 2 }, b: 'keep', list: [1, 2] }
+  const after = applyJsonMergePatch(before, { a: { y: null, z: 3 }, b: null, list: null, c: 'new' })
+  assert.deepEqual(after, { a: { x: 1, z: 3 }, c: 'new' })
+  // RFC 7396: an array patch REPLACES (never merges by index).
+  assert.deepEqual(applyJsonMergePatch({ a: [1, 2, 3] }, { a: [9] }), { a: [9] })
+  assert.deepEqual(jsonSecretKeys('{"b":1,"a":2}'), ['a', 'b'])
+  assert.equal(jsonSecretKeys('not json'), undefined)
+  assert.equal(jsonSecretKeys('[1,2]'), undefined)
+})
+
+test('budget: caps refuse past the limit and only raise goes further (run-7 P2-14)', async () => {
+  const { BudgetGuard } = await import('../src/tools/budget.js')
+  const budget = new BudgetGuard()
+  assert.equal(budget.spend('lane-a'), undefined, 'no budget set = unlimited')
+  budget.set('lane-a', 2)
+  assert.deepEqual(budget.spend('lane-a'), { max: 2, used: 1 })
+  assert.deepEqual(budget.spend('lane-a'), { max: 2, used: 2 })
+  assert.throws(() => budget.spend('lane-a'), /BUDGET EXCEEDED: "lane-a" has used 2\/2/)
+  assert.deepEqual(budget.get('lane-a'), { max: 2, used: 2 }, 'refused requests are not counted')
+  budget.raise('lane-a', 3)
+  assert.deepEqual(budget.spend('lane-a'), { max: 3, used: 3 })
+  assert.throws(() => budget.raise('lane-a', 2), /must raise "lane-a" above its current 3/)
+  assert.throws(() => budget.set('lane-a', 0), /positive integer/)
 })

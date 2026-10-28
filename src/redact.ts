@@ -5,6 +5,8 @@
  * tool-result boundary (errorResult), not in each tool.
  */
 
+import './browser/page-dom.js'
+
 /** Header-ish `key: value` / `key=value` pairs whose value is a secret. The
  *  key match tolerates dotted call-log prefixes (`request.headers.authorization`);
  *  the lead char keeps a URL path like `/tokens/abc123` out of the key match. */
@@ -49,8 +51,11 @@ export function redactSecrets(text: string): string {
 /** Replace every occurrence of each known secret value (run-5 advice §6):
  *  password-field values collected from the live DOM are matched literally in
  *  snapshot text. Short values are skipped — a 2-char match would corrupt the
- *  snapshot more than it protects. */
+ *  snapshot more than it protects. A non-array secrets value is ignored, not
+ *  thrown on: one bad probe result must never take the whole snapshot down
+ *  (run-7 advice P0-3). */
 export function maskSecrets(text: string, secrets: readonly string[], replacement = '••••••'): string {
+  if (!Array.isArray(secrets)) return text
   let out = text
   for (const secret of secrets) {
     if (typeof secret !== 'string' || secret.length < 4) continue
@@ -59,12 +64,15 @@ export function maskSecrets(text: string, secrets: readonly string[], replacemen
   return out
 }
 
-/** DOM probe run inside the page: every non-empty password-field value. */
-export const PASSWORD_VALUES_SNIPPET = `() => {
-  const values = new Set()
+/** DOM probe run inside the page: every non-empty password-field value.
+ *  Expressed as a real closure-free function so Playwright always CALLS it —
+ *  the previous string form let page.evaluate return the function object
+ *  itself, and every snapshot then died on "secrets is not iterable". */
+export function passwordValuesProbe(): string[] {
+  const values = new Set<string>()
   for (const el of document.querySelectorAll('input[type="password"], input[autocomplete="current-password"], input[autocomplete="new-password"]')) {
     const value = el.value ?? ''
     if (value !== '') values.add(value)
   }
   return [...values]
-}`
+}

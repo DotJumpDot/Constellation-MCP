@@ -1,19 +1,23 @@
 import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
 import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
-import { maskSecrets, PASSWORD_VALUES_SNIPPET, redactSecrets } from '../redact.js'
+import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
 import { SHARED_OWNER, canTouchTab, loadOwnerLabels, type BrowserSession } from './session.js'
+import { cookieMatchesAnyDomain, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
+import type { BudgetGuard } from '../tools/budget.js'
 
 export interface ToolEnv {
   config: ConstellationConfig
   registry: OwnerRegistry
   scope: ScopeGuard
+  budget: BudgetGuard
 }
 
 export type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -112,6 +116,34 @@ function locatorFor(root: Page | Frame, selector?: string, element?: string, nam
   return nth === undefined ? role : role.nth(nth)
 }
 
+/** P2-12: warn at export when the session's profile is DBSC-bound. */
+function dbscWarningForProfile(userDir: string): string[] {
+  try {
+    if (detectDeviceBoundSessions(userDir, 'Default') || detectDeviceBoundSessions(path.join(userDir, 'Default'), 'Default')) {
+      return ['WARNING: this profile carries Device Bound Sessions — replayed cookies WILL be revoked server-side within minutes. Use browser_attach for this identity.']
+    }
+  } catch { /* not a profile dir / not windows-shaped: no warning */ }
+  return []
+}
+
+/** Evidence record for one upload (run-7 P1-8): filename, bytes, route. */
+async function uploadRecord(session: BrowserSession, how: string, files: string[]): Promise<string> {
+  const rows = files.map(file => {
+    const stat = fs.statSync(file)
+    return { file: path.basename(file), bytes: stat.size, path: file }
+  })
+  const record = { ts: new Date().toISOString(), owner: session.owner, route: how, files: rows }
+  try {
+    fs.appendFileSync(path.join(session.artifactDir(), 'uploads.jsonl'), JSON.stringify(record) + '\n')
+  } catch { /* best effort */ }
+  return [
+    `Uploaded ${rows.length} file(s) via ${how}.`,
+    ...rows.map(row => `  ${row.file} — ${row.bytes} bytes`),
+    `recorded: ${path.join(session.artifactDir(), 'uploads.jsonl')}`,
+    `Now at: see browser_snapshot for the page state`,
+  ].join('\n')
+}
+
 async function pageOverview(page: Page): Promise<string> {
   const [title] = await Promise.all([page.title().catch(() => '')])
   return `${page.url()}${title === '' ? '' : ` — ${title}`}`
@@ -119,21 +151,35 @@ async function pageOverview(page: Page): Promise<string> {
 
 /** Password-field values on the page, collected straight from the DOM (run-5
  *  advice §6): an aria snapshot serializes filled textboxes, so a login or
- *  master-password field would otherwise land in the transcript verbatim. */
+ *  master-password field would otherwise land in the transcript verbatim.
+ *  The probe result is validated — run-7 advice P0-3: one malformed probe
+ *  result must never take the whole snapshot down. */
 async function passwordValuesOf(page: Page): Promise<string[]> {
   try {
-    return await page.evaluate(PASSWORD_VALUES_SNIPPET) as string[]
+    const values = await page.evaluate(passwordValuesProbe)
+    if (!Array.isArray(values)) return []
+    return values.filter((value): value is string => typeof value === 'string')
   } catch {
     return []
   }
 }
 
+/** One page snapshot: aria snapshot when available, masked DOM text as the
+ *  degraded fallback (run-7 advice P0-3 — a partial snapshot is far more
+ *  useful than a hard failure). */
 async function snapshotOf(page: Page): Promise<string> {
+  const secrets = await passwordValuesOf(page)
   try {
-    const [snapshot, secrets] = await Promise.all([page.locator('html').ariaSnapshot(), passwordValuesOf(page)])
-    return maskSecrets(snapshot, secrets)
-  } catch (error) {
-    return `[aria snapshot unavailable: ${error instanceof Error ? error.message : String(error)}]\nURL: ${page.url()}`
+    return maskSecrets(await page.locator('html').ariaSnapshot(), secrets)
+  } catch (ariaError) {
+    const reason = ariaError instanceof Error ? ariaError.message : String(ariaError)
+    try {
+      const text = await page.evaluate(() => document.body?.innerText ?? '')
+      return maskSecrets(`[aria snapshot unavailable (${reason}); DOM text fallback]\n${text}`, secrets)
+    } catch (domError) {
+      const domReason = domError instanceof Error ? domError.message : String(domError)
+      return `[aria snapshot unavailable: ${reason}; DOM text fallback failed: ${domReason}]\nURL: ${page.url()}`
+    }
   }
 }
 
@@ -160,6 +206,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (meta?.infoTab === true)
         throw new Error('tab 0 is the ownership-label info tab — it stays on the owner label. Open your own tab first (browser_tabs new / tab_open).')
       env.scope.assert(url, who, 'browser_navigate')
+      env.budget.spend(who)
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
       return textResult(await afterActionResult(page))
     })
@@ -226,6 +273,56 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const page = await tabFor(session, who, tab)
       await page.keyboard.press(key)
       return textResult(await afterActionResult(page))
+    })
+
+  t('browser_clipboard', 'Write text to the browser\'s clipboard (clipboardReadWrite granted first). Pairs with browser_paste — the paste event path is accepted by editors that refuse every synthetic-typing route (Google Docs kix, run-7 P1-7). The value never echoes: the result reports only its length.',
+    {
+      text: z.string().describe('Text to place on the clipboard'),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ text, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      const context = page.context()
+      try {
+        await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+      } catch { /* older Chrome / already granted */ }
+      await page.evaluate(
+        (payload: { t: string }) => void (navigator as { clipboard?: { writeText(text: string): Promise<void> } }).clipboard?.writeText(payload.t),
+        { t: text },
+      )
+      return textResult(`Clipboard set: ${text.length} chars. Focus the target field (browser_click) and call browser_paste.`)
+    })
+
+  t('browser_paste', 'Dispatch a REAL paste into the owner\'s current tab: focuses the optional target, then sends a trusted CDP Ctrl+V so the page receives the paste event path (the one route editors like Google Docs accept — run-7 P1-7). Load the text first with browser_clipboard.',
+    {
+      selector: z.string().optional().describe('Selector to focus first (the paste lands in the focused element)'),
+      element: z.string().optional(), name: z.string().optional(),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ selector, element, name, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      if (selector !== undefined || element !== undefined) {
+        await locatorFor(page, selector, element, name).first().click({ timeout: 10_000 })
+      }
+      const cdp = await page.context().newCDPSession(page)
+      try {
+        for (const type of ['keyDown', 'keyUp'] as const) {
+          await cdp.send('Input.dispatchKeyEvent', {
+            type,
+            key: 'v',
+            code: 'KeyV',
+            windowsVirtualKeyCode: 86,
+            nativeVirtualKeyCode: 86,
+            modifiers: 2,
+          })
+        }
+      } finally {
+        await cdp.detach().catch(() => {})
+      }
+      await page.waitForTimeout(400)
+      return textResult(`Pasted (trusted Ctrl+V). Now at: ${await pageOverview(page)}\n\n${truncate(await snapshotOf(page), 60_000)}`)
     })
 
   t('browser_fill_otp', 'Distribute a verification code across a row of single-character OTP boxes in ONE call (run 4: one browser_type per box cost six calls per login, and a missed box failed silently). Fills the single autocomplete="one-time-code" input when the site uses one; otherwise fills the visible input[maxlength=1] boxes in DOM order.',
@@ -308,6 +405,53 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Saved: ${file}`)
     })
 
+  t('evidence_capture', 'Standardized finding evidence (run-7 P2-16): capture dom text / page HTML / screenshot into the owner\'s artifacts with sha256 hashes, and append a manifest.json entry. Stops every lane re-inventing body-hash + screenshot + timestamp, and keeps bodies OUT of transcripts. `har` is accepted but reported unsupported (HAR must be recorded from before the navigation — use browser_network_requests for what already happened).',
+    {
+      label: z.string().min(1).describe('Evidence label, e.g. "stored-xss payload reflected"'),
+      include: z.array(z.enum(['dom', 'html', 'png', 'har'])).optional().describe('What to capture; default ["dom","html","png"]'),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ label, include, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      const wanted = new Set<string>(include ?? ['dom', 'html', 'png'])
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const dir = path.join(session.artifactDir(), 'evidence', `${stamp}-${label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 60)}`)
+      fs.mkdirSync(dir, { recursive: true })
+      const files: Array<{ name: string; bytes: number; sha256: string }> = []
+      const write = (name: string, data: Buffer | string): void => {
+        const buffer = typeof data === 'string' ? Buffer.from(data, 'utf8') : data
+        const file = path.join(dir, name)
+        fs.writeFileSync(file, buffer)
+        files.push({ name, bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex') })
+      }
+      const notes: string[] = []
+      if (wanted.has('dom')) write('dom.txt', await page.evaluate(() => document.body?.innerText ?? ''))
+      if (wanted.has('html')) write('page.html', await page.content())
+      if (wanted.has('png')) {
+        const png = await page.screenshot({ fullPage: true })
+        write('page.png', png)
+      }
+      if (wanted.has('har')) notes.push('har: unsupported retroactively — HAR must wrap the navigation; browser_network_requests lists what was captured')
+      const manifestFile = path.join(session.artifactDir(), 'manifest.json')
+      const entry = {
+        label, ts: new Date().toISOString(), owner: who, url: page.url(),
+        files: files.map(f => ({ ...f, path: path.join(dir, f.name) })),
+      }
+      let manifest: unknown[] = [entry]
+      try {
+        const prior = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) as unknown
+        if (Array.isArray(prior)) manifest = [...prior, entry]
+      } catch { /* first entry */ }
+      fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2) + '\n')
+      return textResult([
+        `Evidence "${label}" captured in ${dir}`,
+        ...files.map(f => `  ${f.name} — ${f.bytes} bytes — sha256 ${f.sha256.slice(0, 16)}…`),
+        ...notes,
+        `manifest: ${manifestFile} (${manifest.length} entries)`,
+      ].join('\n'))
+    })
+
   t('browser_tabs', 'List, open, select, or close tabs in the owner\'s session. Selecting a tab leased by another owner is refused.',
     {
       action: z.enum(['list', 'new', 'select', 'close']),
@@ -326,6 +470,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       }
       if (action === 'new') {
         if (url !== undefined) env.scope.assert(url, who, 'browser_tabs(new)')
+        env.budget.spend(who)
         const { meta } = await session.newTab(who, url)
         const snap = await session.snapshot()
         const listed = snap.tabs.find(x => x.id === meta.id)
@@ -357,6 +502,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         throw new Error('tab_open requires an explicit owner — a lease held by "shared" protects nothing and cannot be released by you')
       const { session, owner: who } = sessionOf(env, owner)
       if (url !== undefined) env.scope.assert(url, who, 'tab_open')
+      env.budget.spend(who)
       const { meta } = await session.newTab(who, url, purpose)
       meta.leasedBy = who
       meta.leasedAt = Date.now()
@@ -408,7 +554,79 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ).join('\n'))
     })
 
-  t('browser_set_files', 'Upload file(s). Direct mode: set them on the matched <input type=file>. File-chooser mode (click_selector): click the button that opens the OS chooser and intercept it — the reliable path for hidden inputs (input[type=file].sr-only), where setInputFiles on the hidden input fired zero requests in the live run.',
+  t('browser_upload', 'Upload file(s) into DYNAMICALLY-CREATED file inputs (run-7 P1-8: Drive/Docs create their input[type=file] after the menu click, inside shadow roots). Clicks the trigger (CSS pierces open shadow roots; `deep_text` matches button text through shadow DOM + same-origin frames), intercepts the file chooser, and records the upload as an artefact row. Falls back to the first file input found by a deep DOM walk when no chooser appears.',
+    {
+      trigger: z.string().optional().describe('CSS selector of the button/menu item that opens the upload UI (pierces open shadow roots)'),
+      deep_text: z.string().optional().describe('Button text to find through shadow DOM + frames when no selector works (e.g. "Upload file")'),
+      files: z.array(z.string()).min(1).describe('Absolute file paths'),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ trigger, deep_text, files, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      for (const file of files) {
+        if (!fs.existsSync(file)) throw new Error(`file not found: ${file}`)
+      }
+      const target = trigger !== undefined && trigger !== ''
+        ? { kind: 'selector' as const, value: trigger }
+        : deep_text !== undefined && deep_text !== ''
+          ? { kind: 'text' as const, value: deep_text }
+          : undefined
+      let how: string
+      if (target !== undefined) {
+        how = target.kind === 'selector' ? `trigger selector "${target.value}"` : `deep text "${target.value}"`
+        const locator = target.kind === 'selector'
+          ? page.locator(target.value).first()
+          : page.locator(`text=${JSON.stringify(target.value)}`).first()
+        const [chooser] = await Promise.all([
+          page.waitForEvent('filechooser', { timeout: 10_000 }).catch(() => undefined),
+          (async () => {
+            try { await locator.click({ timeout: 8_000 }) } catch { /* deep fallback below */ } })(),
+        ])
+        if (chooser !== undefined) {
+          await chooser.setFiles(files)
+          await page.waitForTimeout(500)
+          return textResult(await uploadRecord(session, how, files))
+        }
+      }
+      // No chooser fired (or no trigger given): find an input[type=file] by
+      // walking shadow roots + same-origin frames directly in the DOM.
+      const handle = await page.evaluateHandle(() => {
+        const walk = (root: { querySelectorAll(selector: string): any[] }): any => {
+          for (const el of root.querySelectorAll('input[type="file"]')) return el
+          for (const el of root.querySelectorAll('*')) {
+            const shadow: { querySelectorAll(selector: string): any[] } | null | undefined = el.shadowRoot
+            if (shadow != null) {
+              const found = walk(shadow)
+              if (found !== null) return found
+            }
+          }
+          return null
+        }
+        const docs: Array<{ querySelectorAll(selector: string): any[] }> = [document]
+        for (const frame of document.querySelectorAll('iframe')) {
+          const inner: { querySelectorAll(selector: string): any[] } | null = frame.contentDocument
+          if (inner !== null) docs.push(inner)
+        }
+        for (const doc of docs) {
+          const found = walk(doc)
+          if (found !== null) return found
+        }
+        return null
+      })
+      const input = handle.asElement()
+      if (input === null) {
+        handle.dispose()
+        throw new Error('no file chooser opened and no input[type=file] found (even through shadow roots and frames) — snapshot the page and check the trigger')
+      }
+      how = 'direct deep input[type=file]'
+      await input.setInputFiles(files)
+      await handle.dispose()
+      await page.waitForTimeout(500)
+      return textResult(await uploadRecord(session, how, files))
+    })
+
+  t('browser_set_files', 'Upload file(s). Direct mode: set them on the matched <input type=file>. File-chooser mode (click_selector): click the button that opens the OS chooser and intercept it — the reliable path for hidden inputs (input[type=file].sr-only), where setInputFiles on the hidden input fired zero requests in the live run. For inputs created AFTER the menu click or buried in shadow roots, prefer browser_upload.',
     {
       files: z.array(z.string()).min(1).describe('Absolute file paths'),
       selector: z.string().optional().describe('Selector of the file input (direct mode)'),
@@ -464,60 +682,98 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
   const cookiePreview = (cookies: Array<Record<string, unknown>>): string =>
     cookies.map(c => `  ${c.name} — ${c.domain}${c.path} ${c.httpOnly === true ? 'httpOnly ' : ''}${c.secure === true ? 'secure ' : ''}${String(c.sameSite ?? '')}${typeof c.expires === 'number' && c.expires > 0 ? ` expires ${new Date(c.expires * 1000).toISOString()}` : ' session'}`).join('\n')
 
-  t('browser_cookies_export', 'Export cookies from one owner\'s browser into a server-side handoff (values NEVER enter the transcript — the preview shows name/domain/flags only). Gives a handoff_id for browser_cookies_import. The captcha-walled-login recipe: human logs in in their own Chrome (or the shared session) → export → import into the worker\'s owner browser.',
+  t('browser_cookies_export', 'Export cookies from one owner\'s browser into a server-side handoff (values NEVER enter the transcript — the preview shows name/domain/flags only). Gives a handoff_id for browser_cookies_import. `domains` accepts a LIST and includes host-only cookies from subdomains in BOTH directions (run-7: domain "google.com" silently omitted accounts.google.com LSID/__Host-GAPS/OSID and the target browser stayed signed out). The captcha-walled-login recipe: human logs in in their own Chrome (or the shared session) → export → import into the worker\'s owner browser.',
     {
       owner: z.string().describe('Owner whose cookies are exported'),
-      domain: z.string().optional().describe('Only cookies for this domain (hostname or host:port)'),
+      domains: z.array(z.string()).min(1).optional().describe('Only cookies for these domains (hostname or host:port); subdomains both ways, host-only included'),
+      domain: z.string().optional().describe('Deprecated single-domain form — prefer domains: [...]'),
       names: z.array(z.string()).optional().describe('Only these cookie names'),
     },
-    async ({ owner, domain, names }: any) => {
+    async ({ owner, domains, domain, names }: any) => {
       sweepHandoffs()
       const { session, owner: who } = sessionOf(env, owner)
       const context = await session.ensure()
-      const urls = domain === undefined ? undefined : [/^https?:\/\//i.test(domain) ? domain : `https://${domain}/`]
-      let cookies = (await context.cookies(urls)) as unknown as Array<Record<string, unknown>>
+      const wantedDomains = domains !== undefined && domains.length > 0 ? domains : domain !== undefined ? [domain] : undefined
+      // Fetch the WHOLE jar and filter in code: Playwright's context.cookies(urls)
+      // filter drops host-only cookies of subdomains — the exact run-7 gap.
+      const all = (await context.cookies()) as unknown as Array<Record<string, unknown>>
+      let cookies = wantedDomains === undefined
+        ? all
+        : all.filter(c => cookieMatchesAnyDomain(String(c.domain), wantedDomains))
       if (names !== undefined && names.length > 0) cookies = cookies.filter(c => names.includes(String(c.name)))
-      if (domain !== undefined) {
-        const host = domain.replace(/^https?:\/\//i, '').split('/')[0]!
-        cookies = cookies.filter(c => String(c.domain).endsWith(host) || host.endsWith(String(c.domain).replace(/^\./, '')))
-      }
       if (cookies.length === 0) {
-        const all = (await context.cookies()) as unknown as Array<Record<string, unknown>>
-        return textResult(`no cookies matched${domain !== undefined ? ` domain "${domain}"` : ''}${names !== undefined ? ` names [${names.join(', ')}]` : ''}. Cookie names present in this browser (values not shown): ${all.map(c => c.name).join(', ') || '(none)'}`, true)
+        return textResult(`no cookies matched${wantedDomains !== undefined ? ` domains [${wantedDomains.join(', ')}]` : ''}${names !== undefined ? ` names [${names.join(', ')}]` : ''}. Cookie names present in this browser (values not shown): ${all.map(c => c.name).join(', ') || '(none)'}`, true)
       }
+      const warned = session.userDir !== undefined && session.userDir.startsWith('(attached)')
+        ? []
+        : dbscWarningForProfile(session.userDir)
       const id = `ch-${randomBytes(4).toString('hex')}`
-      cookieHandoffs.set(id, { id, fromOwner: who, domain: domain ?? '(all)', expiresAt: Date.now() + HANDOFF_TTL_MS, cookies })
+      cookieHandoffs.set(id, { id, fromOwner: who, domain: wantedDomains?.join(',') ?? '(all)', expiresAt: Date.now() + HANDOFF_TTL_MS, cookies })
       return textResult([
-        `handoff_id: ${id} — ${cookies.length} cookie(s) from "${who}", domain ${domain ?? '(all)'}`,
+        `handoff_id: ${id} — ${cookies.length} cookie(s) from "${who}", domains ${wantedDomains?.join(', ') ?? '(all)'}`,
         `values are held server-side for ${Math.round(HANDOFF_TTL_MS / 60_000)} minutes; import with browser_cookies_import({ owner, handoff_id: "${id}" })`,
+        ...warned,
         'preview (no values):',
         cookiePreview(cookies),
       ].join('\n'))
     })
 
-  t('browser_cookies_import', 'Import a cookie handoff into an owner\'s browser (the worker side of the human-login recipe). Scope-guarded: the handoff\'s domain must be in the importer\'s scope; every import is audited.',
+  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). Scope-guarded: every imported domain must be in the importer\'s scope; the audit records the host list only.',
     {
       owner: z.string().describe('Owner whose browser receives the cookies'),
-      handoff_id: z.string().describe('Handoff id from browser_cookies_export'),
+      handoff_id: z.string().optional().describe('Handoff id from browser_cookies_export'),
+      profile_dir: z.string().optional().describe('Absolute path to an external Chrome/Edge user-data-dir or profile directory (reads its Cookies store)'),
+      domain_filter: z.array(z.string()).min(1).optional().describe('Only import cookies for these domains (both-direction subdomain match, host-only included)'),
       domain_override: z.string().optional().describe('Rewrite the cookies onto a different host (e.g. staging)'),
     },
-    async ({ owner, handoff_id, domain_override }: any) => {
+    async ({ owner, handoff_id, profile_dir, domain_filter, domain_override }: any) => {
       sweepHandoffs()
       const { session, owner: who } = sessionOf(env, owner)
-      const handoff = cookieHandoffs.get(handoff_id)
-      if (handoff === undefined) throw new Error(`unknown or expired handoff_id "${handoff_id}" (handoffs live ${Math.round(HANDOFF_TTL_MS / 60_000)} minutes)`)
-      const targetDomain = domain_override ?? handoff.domain
-      if (targetDomain !== '(all)') {
-        env.scope.assert(/^https?:\/\//i.test(targetDomain) ? targetDomain : `https://${targetDomain}/`, who, 'browser_cookies_import')
+      let cookies: Array<Record<string, unknown>>
+      let targetLabel: string
+      let extraLines: string[] = []
+      if (profile_dir !== undefined && profile_dir !== '') {
+        const report = await readProfileCookies(profile_dir, domain_filter)
+        cookies = report.cookies as unknown as Array<Record<string, unknown>>
+        targetLabel = report.hosts.join(', ')
+        extraLines = report.warnings
+        if (report.hosts.length > 0) {
+          // The audited host list — values never appear in audit or transcript.
+          env.scope.audit(`cookie-import:${targetLabel}`, who, 'browser_cookies_import', {
+            allowed: true,
+            reason: `external profile "${profile_dir}": ${cookies.length} cookie(s) across ${report.hosts.length} host(s)`,
+          })
+          for (const host of report.hosts) {
+            env.scope.assert(/^https?:\/\//i.test(host) ? `https://${host}/` : `https://${host}/`, who, 'browser_cookies_import')
+          }
+        }
+      } else {
+        if (handoff_id === undefined) throw new Error('pass either handoff_id (from browser_cookies_export) or profile_dir (an external Chrome/Edge profile)')
+        const handoff = cookieHandoffs.get(handoff_id)
+        if (handoff === undefined) throw new Error(`unknown or expired handoff_id "${handoff_id}" (handoffs live ${Math.round(HANDOFF_TTL_MS / 60_000)} minutes)`)
+        cookies = handoff.cookies
+        targetLabel = handoff.domain
+        if (targetLabel !== '(all)') {
+          for (const part of targetLabel.split(',')) {
+            env.scope.assert(/^https?:\/\//i.test(part) ? part : `https://${part}/`, who, 'browser_cookies_import')
+          }
+        }
+      }
+      if (domain_override === undefined && targetLabel !== '(all)') {
+        // The assert above already ran for every imported host; nothing more.
       }
       const context = await session.ensure()
-      const cookies = handoff.cookies.map(cookie => ({ ...cookie, ...(domain_override === undefined ? {} : { domain: domain_override }) }))
-      await context.addCookies(cookies as never)
-      env.scope.audit(`cookie-import:${targetDomain}`, who, 'browser_cookies_import', {
-        allowed: true,
-        reason: `handoff ${handoff.id}: ${cookies.length} cookie(s) from "${handoff.fromOwner}" onto ${targetDomain}`,
-      })
-      return textResult(`Imported ${cookies.length} cookie(s) from "${handoff.fromOwner}" onto ${targetDomain} in "${who}"'s browser.\nPreview (no values):\n${cookiePreview(cookies)}`)
+      const finalCookies = cookies.map(cookie => ({ ...cookie, ...(domain_override === undefined ? {} : { domain: domain_override }) }))
+      if (finalCookies.length === 0) {
+        return textResult([...(extraLines.length > 0 ? extraLines : []), 'no importable cookies matched — see the warnings above (app-bound v20 rows cannot be imported out-of-process; use browser_attach for that identity)'].join('\n'), true)
+      }
+      await context.addCookies(finalCookies as never)
+      return textResult([
+        `Imported ${finalCookies.length} cookie(s) into "${who}"'s browser.`,
+        ...extraLines,
+        'preview (no values):',
+        cookiePreview(finalCookies),
+      ].join('\n'))
     })
 
   t('browser_cookies_list', 'Redacted cookie preview for one owner\'s browser — reason about which sessions are alive without ever seeing values.',
@@ -592,7 +848,13 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       // on disk — the Lead could not see what exists for cleanup. A profile
       // dir with no live session reads as one "(closed)" line with its label
       // and the directory's last-modified time as a last-use approximation.
+      // Run-7 P2-13: the line also reads PROCESS state — a "(closed)" profile
+      // whose chrome.exe still runs (restart, crashed server) says so instead
+      // of silently disagreeing with reality.
       const live = new Set(snaps.map(snap => snap.owner))
+      const runningDirs = await env.registry.runningProfileDirs()
+      const isProfileRunning = (dir: string): boolean =>
+        runningDirs.has(dir.toLowerCase()) || [...runningDirs].some(r => dir.toLowerCase().endsWith(r) || r.endsWith(dir.toLowerCase()))
       const labels = loadOwnerLabels(env.config.rootDir)
       const retained: string[] = []
       try {
@@ -605,7 +867,11 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           const stat = fs.statSync(path.join(env.config.profilesRoot, entry.name))
           const label = labels[profileOwner]
           const described = label === undefined ? '' : ` — ${[label.job, label.engagement].filter(Boolean).join(' · ')}`
-          retained.push(`(closed) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`)
+          const dir = path.join(env.config.profilesRoot, entry.name)
+          const state = isProfileRunning(dir)
+            ? 'chrome.exe ALIVE with this profile (close it via owner re-open + browser_close, or browser_attach to adopt it)'
+            : 'closed'
+          retained.push(`(${state}) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`)
         }
       } catch { /* profiles dir absent = no retained profiles */ }
       if (retained.length > 0) lines.push(...retained)
@@ -615,11 +881,70 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult([...lines, '', scopeLine].join('\n'))
     })
 
-  t('browser_reset', 'Close all harness-owned browser sessions except the kept ones (default: keep the shared human profile). Use at lane end / wrap-up.',
-    { keep: z.array(z.string()).optional().describe('Owner names to keep; default ["shared"]') },
-    async ({ keep }: any) => {
-      const closed = await env.registry.reset(keep ?? [SHARED_OWNER])
-      return textResult(closed.length === 0 ? 'Nothing to close.' : `Closed sessions: ${closed.join(', ')}`)
+  t('browser_attach', 'Adopt a browser the human is already driving as this owner\'s session, over CDP (run-7 P0-2). THE route for Device-Bound-Session identities (Google, banking, cloud consoles): the session stays bound to the human\'s browser instance, so nothing is replayed and nothing expires. Launch the target Chrome with --remote-debugging-port=PORT --user-data-dir=<dir>, then attach. Same scope guard, tab leases and audit as a launched owner; browser_close only DISCONNECTS — the human\'s browser is never closed by the harness.',
+    {
+      owner: z.string().describe('Owner name the attached browser is adopted as'),
+      cdp_url: z.string().describe('CDP endpoint, e.g. http://127.0.0.1:9222'),
+    },
+    async ({ owner, cdp_url }: any) => {
+      const who = resolveOwner(owner)
+      if (who === SHARED_OWNER) throw new Error('browser_attach needs a named owner — the shared session is a launched profile')
+      if (!/^https?:\/\/127\.0\.0\.1:|^https?:\/\/localhost:/i.test(cdp_url))
+        throw new Error('cdp_url must be a loopback endpoint (http://127.0.0.1:PORT or http://localhost:PORT)')
+      env.scope.audit(cdp_url, who, 'browser_attach', {
+        allowed: true,
+        reason: `adopting a running browser over CDP as owner "${who}"`,
+      })
+      const session = env.registry.attachFor(who, cdp_url)
+      const context = await session.ensure()
+      const pages = context.pages()
+      return textResult([
+        `Attached "${who}" to ${cdp_url} — ${pages.length} tab(s) adopted; the existing tabs are theirs to drive (browser_tabs {action:'list', owner:"${who}"}).`,
+        'closing this session (browser_close/browser_reset) only DISCONNECTS; the human\'s browser keeps running.',
+        ...(await session.snapshot()).tabs.map(tab => `  [${tab.index}] ${tab.title} — ${tab.url}`),
+      ].join('\n'))
+    })
+
+  t('browser_launch', 'Launch this owner\'s browser on an EXPLICIT user-data-dir with extra Chrome args and NO automation flag (a normal-looking window — run-7 P0-2). Sign the human in there once, then browser_cookies_export works from it, or re-launch + attach for DBSC-bound identities.',
+    {
+      owner: z.string().describe('Owner name for the launched browser'),
+      user_data_dir: z.string().describe('Absolute user-data-dir (created if missing)'),
+      extra_args: z.array(z.string()).optional().describe('Extra Chrome args (e.g. ["--profile-directory=Profile 1"])'),
+    },
+    async ({ owner, user_data_dir, extra_args }: any) => {
+      const who = resolveOwner(owner)
+      if (who === SHARED_OWNER) throw new Error('browser_launch needs a named owner — the shared session uses its own configured profile')
+      if (!path.isAbsolute(user_data_dir)) throw new Error('user_data_dir must be an absolute path')
+      env.scope.audit(`launch:${user_data_dir}`, who, 'browser_launch', {
+        allowed: true,
+        reason: `persistent launch on explicit user-data-dir${extra_args !== undefined ? ` with ${extra_args.length} extra arg(s)` : ''}`,
+      })
+      const session = env.registry.launchFor(who, user_data_dir, extra_args)
+      await session.ensure()
+      return textResult(`Launched "${who}" on ${user_data_dir} (automation flag suppressed${extra_args !== undefined && extra_args.length > 0 ? `, args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.`)
+    })
+
+  t('browser_reset', 'Close ONE owner\'s browser session — by default ONLY the caller named in `owner` (run-7 P1-6: a lane\'s end-of-run reset used to close every owner window mid-block). Closing other owners\' sessions requires `all: true` and is refused while those owners hold tab leases; `keep` names owners to spare (default ["shared"]).',
+    {
+      ...OWNER_FIELD,
+      all: z.boolean().optional().describe('Close every owner session except keep (refused while others hold tab leases)'),
+      keep: z.array(z.string()).optional().describe(`Owner names to keep when all=true; default ["${SHARED_OWNER}"]`),
+    },
+    async ({ owner, all, keep }: any) => {
+      if (all === true) {
+        const { closed, refused } = await env.registry.resetAll(keep ?? [SHARED_OWNER])
+        const refusedLines = refused.map(row =>
+          `REFUSED "${row.owner}": tabs leased (${row.leases.map(l => `#${l.tabId} by ${l.leasedBy}${l.purpose ? ` (${l.purpose})` : ''}`).join(', ')}) — resolve the leases first (tab_release) or have those owners close their own sessions`)
+        return textResult([
+          ...(closed.length === 0 ? ['Nothing to close.'] : [`Closed sessions: ${closed.join(', ')}`]),
+          ...refusedLines,
+        ].join('\n'), refusedLines.length > 0)
+      }
+      if (owner === undefined || owner.trim() === '')
+        return textResult(`browser_reset closes only ONE session now — pass owner: "<your-name>" to close your own (or all: true, keep: [...] to close every lane's session). Nothing was closed.`, true)
+      const who = resolveOwner(owner)
+      const closed = await env.registry.close(who)
+      return textResult(closed ? `Closed session for "${who}" (profile preserved; attached sessions only DISCONNECT — the human's browser stays open).` : `No running session for "${who}".`)
     })
 
   t('browser_close', 'Close one owner\'s browser session (profile on disk is preserved for next time).',
