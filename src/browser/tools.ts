@@ -12,6 +12,7 @@ import { SHARED_OWNER, canTouchTab, loadOwnerLabels, type BrowserSession } from 
 import { cookieMatchesAnyDomain, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
+import { appendChainEntry } from '../tools/evidence.js'
 
 export interface ToolEnv {
   config: ConstellationConfig
@@ -875,6 +876,13 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         }
       } catch { /* profiles dir absent = no retained profiles */ }
       if (retained.length > 0) lines.push(...retained)
+      // Run-8 §5: surface attach/launch traffic violations right on the map.
+      for (const snap of snaps) {
+        const session = env.registry.sessionFor(snap.owner)
+        if (session.scopeViolations.length > 0) {
+          lines.push(`⚠ ${snap.owner}: ${session.scopeViolations.length} out-of-scope request(s) observed — browser_scope_violations {owner:"${snap.owner}"}`)
+        }
+      }
       const scopeLine = scopeRule === null
         ? `scope: UNRESTRICTED (call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
         : `scope${who === undefined ? '' : ` (${who})`}: ${scopeRule.engagement ?? '(unnamed)'} — in: ${scopeRule.in_scope.join(', ') || '∅'} — out: ${scopeRule.out_scope.join(', ') || '∅'}${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
@@ -897,6 +905,17 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       })
       const session = env.registry.attachFor(who, cdp_url)
       const context = await session.ensure()
+      // Run-8 §5: the scope guard follows the ATTACHED browser — every request
+      // is checked against the owner's scope and violations are audited, so
+      // moving to CDP attach no longer means leaving the audit behind.
+      session.networkObserver = (method, url) => {
+        const decision = env.scope.check(url, who)
+        if (!decision.allowed && !url.startsWith('chrome://') && !url.startsWith('devtools://')) {
+          session.scopeViolations.push({ ts: new Date().toISOString(), method, url, reason: decision.reason })
+          if (session.scopeViolations.length > 100) session.scopeViolations.shift()
+          env.scope.audit(url, who, 'attached-traffic', decision)
+        }
+      }
       const pages = context.pages()
       return textResult([
         `Attached "${who}" to ${cdp_url} — ${pages.length} tab(s) adopted; the existing tabs are theirs to drive (browser_tabs {action:'list', owner:"${who}"}).`,
@@ -922,6 +941,18 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const session = env.registry.launchFor(who, user_data_dir, extra_args)
       await session.ensure()
       return textResult(`Launched "${who}" on ${user_data_dir} (automation flag suppressed${extra_args !== undefined && extra_args.length > 0 ? `, args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.`)
+    })
+
+  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser (launched or CDP-attached; run-8 §5): the attach-mode audit keeps the scope guard a property of what goes out. Violations were already audited — this lists them so a lane can stop and re-scope.',
+    { ...OWNER_FIELD },
+    async ({ owner }: any) => {
+      const { session } = sessionOf(env, owner)
+      const rows = session.scopeViolations
+      if (rows.length === 0) return textResult(`No out-of-scope requests observed from "${session.owner}".`)
+      return textResult([
+        `${rows.length} out-of-scope request(s) from "${session.owner}" (audited; STOP the lane and fix the scope):`,
+        ...rows.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`),
+      ].join('\n'), true)
     })
 
   t('browser_reset', 'Close ONE owner\'s browser session — by default ONLY the caller named in `owner` (run-7 P1-6: a lane\'s end-of-run reset used to close every owner window mid-block). Closing other owners\' sessions requires `all: true` and is refused while those owners hold tab leases; `keep` names owners to spare (default ["shared"]).',

@@ -112,6 +112,12 @@ export class BrowserSession {
    *  non-automation-flagged window. */
   launchExtraArgs?: string[]
   launchNoAutomationFlag = false
+  /** Attach-mode traffic audit (run-8 §5): set by the attach tool so every
+   *  request an adopted browser makes is scope-checked — the guard becomes a
+   *  property of what goes out, not how the browser was launched. */
+  networkObserver?: (method: string, url: string) => void
+  /** Out-of-scope requests observed from this session (audit lines). */
+  scopeViolations: Array<{ ts: string; method: string; url: string; reason: string }> = []
 
   constructor(readonly owner: string, readonly userDir: string, private config: ConstellationConfig) {
     // Seed the info-tab label from disk so a reset/restart window still says
@@ -171,9 +177,25 @@ export class BrowserSession {
     // Adopted pages keep their own identity: no ownership-label init script
     // (it cannot apply retroactively anyway) and no info tab.
     context.on('page', page => { this.registerPage(page, this.owner) })
+    // Run-8 §5: an attached browser's traffic is audited exactly like a
+    // launched one — lanes used to hand-log requests to compensate.
+    this.wireNetwork(context)
     for (const page of context.pages()) this.registerPage(page, this.owner)
     this.context = context
     return context
+  }
+
+  /** Request/response ring + the scope observer, shared by launch and attach. */
+  private wireNetwork(context: BrowserContext): void {
+    context.on('request', request => {
+      this.network.push({ method: request.method(), url: request.url(), resourceType: request.resourceType() })
+      if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
+      try { this.networkObserver?.(request.method(), request.url()) } catch { /* audit never breaks traffic */ }
+    })
+    context.on('response', response => {
+      this.network.push({ method: response.request().method(), url: response.url(), status: response.status() })
+      if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
+    })
   }
 
   private async launch(): Promise<BrowserContext> {
@@ -196,14 +218,7 @@ export class BrowserSession {
     }
     if (labelScript !== '') await context.addInitScript(labelScript)
     context.on('page', page => { this.registerPage(page, this.owner) })
-    context.on('request', request => {
-      this.network.push({ method: request.method(), url: request.url(), resourceType: request.resourceType() })
-      if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
-    })
-    context.on('response', response => {
-      this.network.push({ method: response.request().method(), url: response.url(), status: response.status() })
-      if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
-    })
+    this.wireNetwork(context)
     for (const page of context.pages()) this.registerPage(page, this.owner)
     this.context = context
     // The very first tab of an owner window is the ownership label: which

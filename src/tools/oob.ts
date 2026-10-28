@@ -39,9 +39,17 @@ export class OobStore {
   private boundPort?: number
   /** Per-token cloudflared quick tunnels (run-7 P1-9). */
   private tunnels = new Map<string, OobTunnel>()
+  /** Extra path handlers mounted on the same receiver (fixture content host). */
+  private routes = new Map<string, (req: http.IncomingMessage, res: http.ServerResponse, pathname: string, body: string) => void>()
 
   constructor(private port: number, private publicBase?: string, private persistFile?: string) {
     this.loadPersisted()
+  }
+
+  /** Mount a handler for URL paths starting with `prefix` (first match wins,
+   *  before OOB token handling). The handler must end the response. */
+  registerRoute(prefix: string, handler: (req: http.IncomingMessage, res: http.ServerResponse, pathname: string, body: string) => void): void {
+    this.routes.set(prefix, handler)
   }
 
   private loadPersisted(): void {
@@ -91,6 +99,14 @@ export class OobStore {
       const chunks: Buffer[] = []
       req.on('data', chunk => { if (chunks.reduce((n, c) => n + c.length, 0) < MAX_BODY_CAPTURE) chunks.push(chunk as Buffer) })
       req.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8').slice(0, MAX_BODY_CAPTURE)
+        const pathname = (req.url ?? '/').split('?')[0] ?? '/'
+        for (const [prefix, handler] of this.routes) {
+          if (pathname.startsWith(prefix)) {
+            handler(req, res, pathname, body)
+            return
+          }
+        }
         const tokenMatch = /\/oob\/([A-Za-z0-9]{6,64})(?:[/?#]|$)/.exec(req.url ?? '')
         const event: OobEvent = {
           ts: new Date().toISOString(),
@@ -99,7 +115,7 @@ export class OobStore {
           query: req.url?.includes('?') ? req.url.slice(req.url.indexOf('?') + 1) : '',
           remote: req.socket.remoteAddress ?? '',
           headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v)])),
-          body: Buffer.concat(chunks).toString('utf8').slice(0, MAX_BODY_CAPTURE),
+          body,
         }
         if (tokenMatch !== null) {
           const entry = this.tokens.get(tokenMatch[1]!)

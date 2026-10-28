@@ -273,20 +273,79 @@ export async function performDownload(
   }
 }
 
-export function registerHttpTools(server: ToolRegistrar, env: HttpEnv): void {
-  const jars = new JarStore(env.config)
+export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: JarStore = new JarStore(env.config)): void {
+  // Capture ring for http_replay (run-8 §7): the "vary exactly one field"
+  // cards were re-typed by hand all run. Last 20 requests per owner.
+  const captures = new Map<string, Array<{ id: string; ts: string; spec: RequestSpec }>>()
+  let captureSeq = 0
 
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256.',
+  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256. Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB).',
     { ...REQUEST_SHAPE, owner: z.string().optional().describe('Attribution for the scope audit log') },
     async (args: any) => {
       const { owner, ...spec } = args
-      const result = await performRequest(jars, env.scope, spec as RequestSpec, owner ?? 'unknown', 'http_request', env.budget)
-      return textResult(formatResult(result))
+      const who = owner ?? 'unknown'
+      const result = await performRequest(jars, env.scope, spec as RequestSpec, who, 'http_request', env.budget)
+      captureSeq += 1
+      const captureId = `hr-${captureSeq}`
+      const ring = captures.get(who) ?? []
+      ring.push({ id: captureId, ts: new Date().toISOString(), spec: spec as RequestSpec })
+      if (ring.length > 20) ring.shift()
+      captures.set(who, ring)
+      let stored = ''
+      if (result.body.length > 20_000) {
+        try {
+          const dir = path.join(env.config.outputDir, who, 'responses')
+          fs.mkdirSync(dir, { recursive: true })
+          const file = path.join(dir, `${result.body_sha256}.txt`)
+          if (!fs.existsSync(file)) fs.writeFileSync(file, result.body)
+          stored = `\nbody_file: ${file} (full ${result.body.length} bytes; output truncated above)`
+        } catch { /* best effort */ }
+      }
+      return textResult(`${formatResult(result)}\ncapture_id: ${captureId} (http_replay re-sends it with one field changed)${stored}`)
+    })
+
+  t('http_replay', 'Replay a captured http_request with EXACTLY the overrides you pass (run-8 §7): the correct shape for "vary one field" — url/header/body substitutions on a byte-identical template instead of re-typing the whole request and drifting.',
+    {
+      capture_id: z.string().optional().describe('capture_id from a prior http_request (or last: true)'),
+      last: z.boolean().optional().describe('Replay this owner\'s most recent capture'),
+      override: z.object({
+        url: z.string().optional().describe('Replace the URL (e.g. swap the object id)'),
+        method: z.string().optional(),
+        headers: z.record(z.string(), z.string()).optional().describe('MERGED into the captured headers'),
+        body: z.unknown().optional().describe('REPLACES the body'),
+      }).describe('Overrides applied to the captured spec'),
+      owner: z.string().optional().describe('Same owner as the capture (jars + captures are per-owner)'),
+    },
+    async ({ capture_id, last, override, owner }: any) => {
+      const who = owner ?? 'unknown'
+      const ring = captures.get(who)
+      if (ring === undefined || ring.length === 0) return textResult(`no captures for "${who}" — http_request records them`, true)
+      const captured = last === true
+        ? ring[ring.length - 1]!
+        : ring.find(row => row.id === capture_id)
+      if (captured === undefined) {
+        return textResult(`unknown capture_id "${capture_id}" for "${who}" — recent: ${ring.map(row => row.id).join(', ')}`, true)
+      }
+      const spec: RequestSpec = {
+        ...captured.spec,
+        ...(override?.url !== undefined ? { url: override.url } : {}),
+        ...(override?.method !== undefined ? { method: override.method } : {}),
+        ...(override?.headers !== undefined ? { headers: { ...captured.spec.headers, ...override.headers } } : {}),
+        ...(override?.body !== undefined ? { body: override.body } : {}),
+      }
+      const result = await performRequest(jars, env.scope, spec, who, 'http_replay', env.budget)
+      const changed = [
+        override?.url !== undefined ? 'url' : null,
+        override?.method !== undefined ? 'method' : null,
+        override?.headers !== undefined ? 'headers' : null,
+        override?.body !== undefined ? 'body' : null,
+      ].filter(Boolean).join('+') || 'nothing (verbatim replay)'
+      return textResult(`Replayed ${captured.id} (changed: ${changed}) from ${captured.ts}\n${formatResult(result)}`)
     })
 
   t('http_diff', 'Send two requests and diff them (status, body sha, first diverging body line). IDOR/BOLA A/B pairs.',

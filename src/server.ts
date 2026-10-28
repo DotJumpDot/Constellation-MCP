@@ -5,13 +5,19 @@ import type { ConstellationConfig } from './config.js'
 import { ScopeGuard } from './scope.js'
 import { OwnerRegistry } from './browser/registry.js'
 import { registerBrowserTools, type ToolEnv, type ToolRegistrar } from './browser/tools.js'
-import { registerHttpTools } from './tools/http.js'
+import { JarStore, registerHttpTools } from './tools/http.js'
 import { registerMailTools } from './tools/mail.js'
 import { registerScopeTools } from './tools/scope.js'
 import { registerSecretTools } from './tools/secrets.js'
 import { OobStore, registerOobTools } from './tools/oob.js'
 import { registerGitTools } from './tools/git.js'
 import { BudgetGuard, registerBudgetTools } from './tools/budget.js'
+import { FixtureStore, registerFixtureTools } from './tools/fixture.js'
+import { registerDiffTools } from './tools/diff.js'
+import { SessionWatchRegistry, registerSessionTools } from './tools/session.js'
+import { registerEvidenceTools } from './tools/evidence.js'
+import { registerDupeTools } from './tools/dupcheck.js'
+import { InjectStore, registerInjectTools } from './tools/injectlab.js'
 
 export interface ConstellationServer {
   connect(): Promise<void>
@@ -24,6 +30,10 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   const budget = new BudgetGuard()
   const env: ToolEnv = { config, registry, scope, budget }
   const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
+  const jars = new JarStore(config)
+  const fixtures = new FixtureStore(oob, config)
+  const injects = new InjectStore()
+  const watches = new SessionWatchRegistry()
 
   const mcp = new McpServer({ name: 'constellation', version: '0.1.0' }, {
     instructions: [
@@ -34,6 +44,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
       'Secrets: reference $secret:NAME inside http_request instead of pasting values.',
       'browser_run_code_unsafe is the escape hatch (full Page API + Node require, NOT scope-guarded inside) — use it only when guarded tools cannot express the step.',
       'human_task_* / lane_freeze / team_snapshot are NATIVE team tools with no mcp__ prefix — do not add a server prefix to them.',
+      'Manufacture fixtures, do not hand-build them: fixture_publish (public URL + canary; fixture_hits answers canary_seen), fixture_forge (real .docx/.pdf for browser_upload), dupe_check before deep work, diff_pair for the authorization verdict, session_verify/session_watch with per-site proof rules, http_replay to vary exactly one field, evidence_capture/evidence_verify for the tamper-evident chain.',
     ].join('\n'),
   })
 
@@ -44,7 +55,13 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   }
 
   registerBrowserTools(registrar, env)
-  registerHttpTools(registrar, env)
+  registerHttpTools(registrar, env, jars)
+  registerFixtureTools(registrar, fixtures)
+  registerDiffTools(registrar, { jars, scope })
+  registerSessionTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner) }, watches)
+  registerEvidenceTools(registrar, config)
+  registerDupeTools(registrar)
+  registerInjectTools(registrar, injects, { fixtures, budget, sessionFor: owner => registry.sessionFor(owner) }, config.outputDir)
   registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)
   registerMailTools(registrar)
@@ -59,6 +76,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
       await mcp.connect(transport)
     },
     async dispose(): Promise<void> {
+      watches.stopAll()
       await registry.disposeAll()
       await oob.dispose()
     },
