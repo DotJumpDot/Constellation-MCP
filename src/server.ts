@@ -18,6 +18,7 @@ import { SessionWatchRegistry, registerSessionTools } from './tools/session.js'
 import { registerEvidenceTools } from './tools/evidence.js'
 import { registerDupeTools } from './tools/dupcheck.js'
 import { InjectStore, registerInjectTools } from './tools/injectlab.js'
+import { registerRecipeTools } from './tools/recipe.js'
 
 export interface ConstellationServer {
   connect(): Promise<void>
@@ -62,6 +63,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerEvidenceTools(registrar, config)
   registerDupeTools(registrar)
   registerInjectTools(registrar, injects, { config, fixtures, budget, sessionFor: owner => registry.sessionFor(owner) }, config.outputDir)
+  registerRecipeTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner) })
   registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)
   registerMailTools(registrar)

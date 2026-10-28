@@ -28,6 +28,7 @@ async function main(): Promise<void> {
     'budget_raise', 'budget_set', 'diff_pair', 'dupe_check',
     'evidence_capture', 'evidence_log', 'evidence_verify',
     'fixture_forge', 'fixture_hits', 'fixture_list', 'fixture_publish',
+    'fixture_recipe_list', 'fixture_recipe_run', 'fixture_recipe_set',
     'http_diff', 'http_download', 'http_jars', 'http_replay', 'http_request',
     'inject_create', 'inject_run', 'inject_score',
     'mail_diagnose', 'mail_get', 'mail_latest_otp', 'mail_search', 'mail_status', 'mail_wait',

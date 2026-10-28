@@ -259,7 +259,13 @@ export function registerInjectTools(server: ToolRegistrar, store: InjectStore, e
       const archived = fs.existsSync(dir) ? fs.readdirSync(dir).filter(name => name.endsWith('.txt')) : []
       return textResult([
         `Campaign ${campaign_id} (${campaign.status}): ${sent} sent, ${skipped} skipped(session)`,
-        ...(hitRate !== undefined ? [`canary confirmed in ${canarySeenBy.length} of ${sent} sent (${hitRate}% hit rate)`] : ['no canary/fixture wired — compliance is UNPROVEN (artifact evidence only)']),
+        // Smoke round 4, gap 2: three honest states — a canary without a
+        // fixture is not "no canary wired".
+        ...(hitRate !== undefined
+          ? [`canary confirmed in ${canarySeenBy.length} of ${sent} sent (${hitRate}% hit rate)`]
+          : campaign.canary !== undefined && campaign.fixtureId === undefined
+            ? ['canary set, but no fixture wired — hits cannot be auto-attributed; read the fixture manually with fixture_hits and score by hand']
+            : ['no canary wired — compliance is UNPROVEN (artifact evidence only)']),
         ...(skipped > 0 ? [`⚠ ${skipped} variant(s) were SKIPPED on session state and are EXCLUDED from the rate — resume with inject_run after re-auth before drawing conclusions`] : []),
         ...(sent > 0 && hitRate === 0 ? ['Every SENT variant negative with a live canary = the payload space was exercised; a negative now MEANS something.'] : []),
         `archived outputs: ${archived.length} file(s) in ${dir}`,

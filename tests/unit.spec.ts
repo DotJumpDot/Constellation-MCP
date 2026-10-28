@@ -755,3 +755,11 @@ test('injectlab: campaigns persist to disk and score EXCLUDES skipped(session) r
   assert.equal(score.skipped, 1)
   assert.equal(score.hitRate, 0, '0 canary hits over 1 SENT variant = 0% (a real negative)')
 })
+
+test('recipes: validation, var interpolation, and capture extraction (run-8 §1c)', async () => {
+  const { interpolateVars, captureFromText } = await import('../src/tools/recipe.js')
+  assert.equal(interpolateVars('open $var:orgId and $var:missing', { orgId: 'org-9' }), 'open org-9 and $var:missing')
+  assert.equal(captureFromText('Workspace URL: https://x/org/abc-123/settings', '/org/([a-z0-9-]+)'), 'abc-123')
+  assert.equal(captureFromText('no ids here', '/org/([a-z0-9-]+)'), undefined)
+  assert.equal(captureFromText('plain', '('), undefined, 'an invalid regex yields undefined, not a throw')
+})

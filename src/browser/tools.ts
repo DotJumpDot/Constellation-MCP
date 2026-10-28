@@ -243,13 +243,29 @@ async function passwordValuesOf(page: Page): Promise<string[]> {
   }
 }
 
+/** Pure triviality check (smoke round 4, gap 3): an SPA frame that has not
+ *  hydrated yet serializes as just "- document" / "- document:" — a lane that
+ *  trusted it would conclude the page is blank. */
+export function isTrivialSnapshot(snapshot: string): boolean {
+  const trimmed = snapshot.trim()
+  if (trimmed.length <= 20) return true
+  return !trimmed.includes('\n') && /^-\s*document\b/i.test(trimmed)
+}
+
 /** One page snapshot: aria snapshot when available, masked DOM text as the
  *  degraded fallback (run-7 advice P0-3 — a partial snapshot is far more
- *  useful than a hard failure). */
+ *  useful than a hard failure). A TRIVIAL snapshot (unhydrated SPA) gets one
+ *  settle wait (up to 6 s for real body text) and a retry before returning —
+ *  Gemini returned "- document:" and then a full tree seconds later. */
 async function snapshotOf(page: Page): Promise<string> {
   const secrets = await passwordValuesOf(page)
   try {
-    return maskSecrets(await page.locator('html').ariaSnapshot(), secrets)
+    let snapshot = await page.locator('html').ariaSnapshot()
+    if (isTrivialSnapshot(snapshot)) {
+      await page.waitForFunction(() => (document.body?.innerText ?? '').trim().length > 200, undefined, { timeout: 6_000 }).catch(() => undefined)
+      snapshot = await page.locator('html').ariaSnapshot()
+    }
+    return maskSecrets(snapshot, secrets)
   } catch (ariaError) {
     const reason = ariaError instanceof Error ? ariaError.message : String(ariaError)
     try {
@@ -719,10 +735,17 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           // Smoke round 2, defect 1: a generic message sent the lane into
           // browser_run_code_unsafe; name the actual menu items instead.
           const items = await dumpClickableTexts(page)
+          // Smoke round 4, gap 1: interpret the dump — a Sign in control on
+          // the page means the product is signed out and has not rendered an
+          // upload input, so chasing selectors there is wasted work.
+          const signedOutNote = /sign in/i.test(items)
+            ? 'INTERPRETATION: the page shows a Sign in control — the product is SIGNED OUT and has not rendered an upload input. Re-authenticate (browser_attach / cookie import / human sign-in) and re-run; do not chase selectors on a logged-out page.'
+            : 'No sign-in control visible — the trigger target is probably wrong: pick an item above (deep_text), or click the real menu by coordinates.'
           throw new Error([
             'no file chooser opened and no input[type=file] found (even through shadow roots and frames).',
             'Visible buttons/menu items on the page (pass one as deep_text, or use trigger_x/trigger_y from a screenshot):',
             items,
+            signedOutNote,
           ].join('\n'))
         }
         how = 'direct deep input[type=file]'
