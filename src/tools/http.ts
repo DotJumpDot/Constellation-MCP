@@ -325,6 +325,10 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       const who = owner ?? 'unknown'
       const ring = captures.get(who)
       if (ring === undefined || ring.length === 0) return textResult(`no captures for "${who}" — http_request records them`, true)
+      if (capture_id === undefined && last !== true) {
+        const recent = ring[ring.length - 1]!
+        return textResult(`pass capture_id: "${recent.id}" (this owner's latest) — or last: true. Recent captures for "${who}": ${ring.map(row => row.id).join(', ')}`, true)
+      }
       const captured = last === true
         ? ring[ring.length - 1]!
         : ring.find(row => row.id === capture_id)

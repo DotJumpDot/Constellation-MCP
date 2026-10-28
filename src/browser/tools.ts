@@ -445,11 +445,18 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         if (Array.isArray(prior)) manifest = [...prior, entry]
       } catch { /* first entry */ }
       fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2) + '\n')
+      // Hash-chained record (run-8 §6): the report cites a verifiable chain,
+      // not a directory of loose files.
+      const chained = appendChainEntry(env.config, {
+        owner: who, label,
+        files: files.map(f => ({ name: f.name, sha256: f.sha256 })),
+      })
       return textResult([
         `Evidence "${label}" captured in ${dir}`,
         ...files.map(f => `  ${f.name} — ${f.bytes} bytes — sha256 ${f.sha256.slice(0, 16)}…`),
         ...notes,
         `manifest: ${manifestFile} (${manifest.length} entries)`,
+        `chain entry #${chained.seq} — hash ${chained.entry_hash.slice(0, 12)}… (evidence_verify checks the whole chain)`,
       ].join('\n'))
     })
 
@@ -475,7 +482,9 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         const { meta } = await session.newTab(who, url)
         const snap = await session.snapshot()
         const listed = snap.tabs.find(x => x.id === meta.id)
-        return textResult(`Opened tab [${listed?.index}] id=${meta.id} — ${url ?? 'about:blank'}${meta.purpose ? ` (purpose: ${meta.purpose})` : ''}`)
+        // `tab:` arguments are the INDEX, not the id — the smoke run passed
+        // the id and hit a confusing error, so the pass-it form is spelled out.
+        return textResult(`Opened tab [${listed?.index}] id=${meta.id} — ${url ?? 'about:blank'}${meta.purpose ? ` (purpose: ${meta.purpose})` : ''}\n→ pass tab: ${listed?.index} (the INDEX — not the id) to tab-scoped tools`)
       }
       if (index === undefined) throw new Error(`action '${action}' requires an index`)
       const pages = session.pages()
@@ -509,7 +518,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       meta.leasedAt = Date.now()
       const snap = await session.snapshot()
       const listed = snap.tabs.find(x => x.id === meta.id)
-      return textResult(`Opened + leased tab [${listed?.index}] id=${meta.id} for "${who}"${purpose ? ` (${purpose})` : ''} — ${url ?? 'about:blank'}`)
+      return textResult(`Opened + leased tab [${listed?.index}] id=${meta.id} for "${who}"${purpose ? ` (${purpose})` : ''} — ${url ?? 'about:blank'}\n→ pass tab: ${listed?.index} (the INDEX — not the id) to tab-scoped tools`)
     })
 
   t('tab_lease', 'Lease an existing tab: other owners can no longer select or close it.',

@@ -321,9 +321,11 @@ export function registerFixtureTools(server: ToolRegistrar, store: FixtureStore)
       filename: z.string().optional().describe('Output file name (default: forged-<ts>.<ext> in the shared artifacts dir)'),
     },
     async ({ kind, title, body_markdown, filename }: any) => {
-      const dir = path.join(store['config'].outputDir, 'forge')
+      const dir = path.join(store.config.outputDir, 'forge')
       fs.mkdirSync(dir, { recursive: true })
-      const safe = (filename ?? `forged-${Date.now()}`).replace(/[^A-Za-z0-9._-]/g, '_')
+      // Strip an extension the caller already included — "notes.docx" must
+      // not become notes.docx.docx (smoke-run bug 3).
+      const safe = (filename ?? `forged-${Date.now()}`).replace(/[^A-Za-z0-9._-]/g, '_').replace(new RegExp(`\\.${kind}$`, 'i'), '')
       const file = path.join(dir, `${safe}.${kind}`)
       if (kind === 'docx') fs.writeFileSync(file, markdownToDocx(title, body_markdown))
       else if (kind === 'pdf') fs.writeFileSync(file, markdownToPdf(title, body_markdown))

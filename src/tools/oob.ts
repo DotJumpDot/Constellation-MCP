@@ -167,14 +167,17 @@ export class OobStore {
   async startQuickTunnel(token: string): Promise<string> {
     if (this.tunnels.has(token)) return this.tunnels.get(token)!.url
     const port = await this.ensureServer()
+    // CONSTELLATION_CLOUDFLARED: explicit binary path (a fresh install has
+    // cloudflared NOWHERE on PATH — the smoke run hit spawn ENOENT).
+    const command = process.env.CONSTELLATION_CLOUDFLARED?.trim() || 'cloudflared'
     let child: ChildProcess
     try {
-      child = spawn('cloudflared', ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'], {
+      child = spawn(command, ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'], {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     } catch (error) {
-      throw new Error(`cannot spawn cloudflared (${error instanceof Error ? error.message : String(error)}) — install it from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ and retry`)
+      throw new Error(`cannot spawn ${command} (${error instanceof Error ? error.message : String(error)}) — install cloudflared from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ and either put it on PATH or set CONSTELLATION_CLOUDFLARED to the full binary path`)
     }
     const url = await new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`cloudflared did not report a trycloudflare.com URL within ${TUNNEL_URL_TIMEOUT_MS / 1000}s`)), TUNNEL_URL_TIMEOUT_MS)
@@ -189,7 +192,7 @@ export class OobStore {
       }
       child.stdout?.on("data", scan)
       child.stderr?.on("data", scan)
-      child.on('error', error => { clearTimeout(timer); reject(new Error(`cloudflared failed to start: ${error instanceof Error ? error.message : String(error)} — is it on PATH?`)) })
+      child.on('error', error => { clearTimeout(timer); reject(new Error(`${command} failed to start: ${error instanceof Error ? error.message : String(error)} — put it on PATH or set CONSTELLATION_CLOUDFLARED to the full binary path (download: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)`)) })
       child.on('close', code => { clearTimeout(timer); reject(new Error(`cloudflared exited early (code ${code}) — check "cloudflared tunnel --url http://127.0.0.1:${port}" by hand`)) })
     }).catch(error => {
       try { child.kill() } catch { /* already gone */ }

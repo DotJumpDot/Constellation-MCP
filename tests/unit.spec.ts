@@ -668,3 +668,24 @@ test('dupe_check: NVD responses parse; advisory ids come out of known-issues pag
   assert.deepEqual(ids.cves, ['CVE-2024-9999'])
   assert.deepEqual(ids.ghsas, ['GHSA-cccc-ffff-jjjj'])
 })
+
+test('evidence: appendChainEntry actually writes and chains across entries (smoke-run bug 1)', async () => {
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const fs = await import('node:fs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chain-'))
+  const config = { rootDir: root } as import('../src/config.js').ConstellationConfig
+  const { appendChainEntry, readChain, verifyChain } = await import('../src/tools/evidence.js')
+  const first = appendChainEntry(config, { owner: 'lead', label: 'a', files: [{ name: 'x.png', sha256: 'f'.repeat(64) }] })
+  const second = appendChainEntry(config, { owner: 'shared', label: 'b' })
+  const chain = readChain(config)
+  assert.equal(chain.length, 2, 'BOTH captures land in the chain (the smoke run saw 0)')
+  assert.equal(second.prev_hash, first.entry_hash, 'the second entry links to the first')
+  assert.deepEqual(verifyChain(config), { ok: true, entries: 2 })
+  // Tamper: edit the stored file → verify must fail.
+  const file = path.join(root, 'evidence-chain.jsonl')
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('"a"', '"a-EDITED"'))
+  const broken = verifyChain(config)
+  assert.equal(broken.ok, false)
+  assert.equal(broken.brokenAt, 1)
+})
