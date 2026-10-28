@@ -135,6 +135,38 @@ export interface SessionEnv {
   sessionFor: (owner: string) => BrowserSession
 }
 
+/** One verification pass against a live owner session, shared by
+ *  session_verify AND inject_run's per-variant session gate (smoke round 3:
+ *  Google test accounts die in ~20 minutes — a sweep must check before each
+ *  variant or a session expiry silently deflates the hit-rate). Opens and
+ *  closes its own tab, so leases on the caller's tabs are untouched. */
+export async function verifySessionOnce(
+  config: ConstellationConfig,
+  sessionFor: (owner: string) => BrowserSession,
+  ownerRaw: string | undefined,
+  site: string,
+): Promise<{ ok: boolean; reason: string; rule: SessionProofRule; owner: string }> {
+  const rules = loadProofRules(config)
+  const rule = rules[site]
+  if (rule === undefined) {
+    const known = Object.keys(rules).join(', ')
+    throw new Error(`no proof rule for site "${site}" — add one with session_proof_set (known: ${known}). Verification without a site-specific proof is what produced the run-7 false green`)
+  }
+  const who = ownerRaw === undefined || ownerRaw.trim() === '' ? SHARED_OWNER : ownerRaw.trim()
+  const session = sessionFor(who)
+  const context = await session.ensure()
+  const page = await context.newPage()
+  try {
+    await page.goto(rule.url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await page.waitForTimeout(1200)
+    const text = await page.evaluate(() => document.body?.innerText ?? '')
+    const verdict = evaluateProof(rule, text)
+    return { ...verdict, rule, owner: who }
+  } finally {
+    await page.close().catch(() => undefined)
+  }
+}
+
 export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, watches: SessionWatchRegistry): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
@@ -143,27 +175,8 @@ export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, wat
 
   /** One verification pass against a live owner session (opens + closes its
    *  own tab, so leases on the caller's tabs are untouched). */
-  const verifyOnce = async (ownerRaw: string | undefined, site: string): Promise<{ ok: boolean; reason: string; rule: SessionProofRule; owner: string }> => {
-    const rules = loadProofRules(env.config)
-    const rule = rules[site]
-    if (rule === undefined) {
-      const known = Object.keys(rules).join(', ')
-      throw new Error(`no proof rule for site "${site}" — add one with session_proof_set (known: ${known}). Verification without a site-specific proof is what produced the run-7 false green`)
-    }
-    const who = ownerRaw === undefined || ownerRaw.trim() === '' ? SHARED_OWNER : ownerRaw.trim()
-    const session = env.sessionFor(who)
-    const context = await session.ensure()
-    const page = await context.newPage()
-    try {
-      await page.goto(rule.url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-      await page.waitForTimeout(1200)
-      const text = await page.evaluate(() => document.body?.innerText ?? '')
-      const verdict = evaluateProof(rule, text)
-      return { ...verdict, rule, owner: who }
-    } finally {
-      await page.close().catch(() => undefined)
-    }
-  }
+  const verifyOnce = (ownerRaw: string | undefined, site: string) =>
+    verifySessionOnce(env.config, env.sessionFor, ownerRaw, site)
 
   t('session_verify', 'Verify one owner\'s session against a PER-SITE PROOF RULE (run-8 §3): renders the site\'s account-owned surface in its own throwaway tab and asserts must_contain/must_not_contain. `myaccount.google.com` accepting a session is NOT proof that Gemini accepts it — that false green cost two run-7 lanes two hours; each site needs its own rule.',
     { owner: z.string().describe('Owner whose session to verify'), site: z.string().describe('Proof-rule key, e.g. "google-gemini" (session_proof_set adds rules)') },

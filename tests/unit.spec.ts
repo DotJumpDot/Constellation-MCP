@@ -720,3 +720,38 @@ test('errors: non-Error throwables serialize with their message (smoke round 2, 
   assert.doesNotMatch(describeErrorChain({ a: 1 }), /\[object Object\]/)
   assert.equal(describeErrorChain('plain string error'), 'plain string error')
 })
+
+test('upload: acceptance is judged by the PRODUCT showing the filename, not the DOM write (smoke round 3)', async () => {
+  const { assessUploadText } = await import('../src/browser/tools.js')
+  // The smoke run's exact trap: file set into the DOM while the page shows Sign in.
+  const signedOut = assessUploadText('Sign in\nChoose an account\ngmail.com', ['/tmp/ext-check.docx'])
+  assert.equal(signedOut.accepted, false, 'no filename on the page = not accepted')
+  assert.equal(signedOut.signedOut, true, 'the signed-out surface is flagged')
+  const ok = assessUploadText('Garden Notes\next-check.docx 2.1 KB\nRemove file', ['/tmp/ext-check.docx'])
+  assert.equal(ok.accepted, true, 'the attachment chip text proves acceptance')
+  assert.equal(ok.signedOut, false)
+  // A stem-only rendering (apps often drop the extension) also counts.
+  assert.equal(assessUploadText('garden-notes attached', ['/tmp/garden-notes.docx']).accepted, true)
+})
+
+test('injectlab: campaigns persist to disk and score EXCLUDES skipped(session) runs (smoke round 3)', async () => {
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const fs = await import('node:fs')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inject-'))
+  const { InjectStore, scoreOf } = await import('../src/tools/injectlab.js')
+  const first = new InjectStore(dir)
+  const campaign = first.create({ directive: 'do x', canary: 'c1' })
+  first.record(campaign.id, { variant: 'plain', framing: 'verbatim', status: 'sent', sentAt: 't', excerpt: 'e' })
+  first.record(campaign.id, { variant: 'authority', framing: 'authority', status: 'skipped_session', note: 'Sign in visible' }, 'paused_session')
+  // The restart shape: a NEW store reads the same dir.
+  const second = new InjectStore(dir)
+  const loaded = second.get(campaign.id)
+  assert.ok(loaded !== undefined, 'campaign survives the restart')
+  assert.equal(loaded!.status, 'paused_session')
+  assert.equal(loaded!.runs.length, 2)
+  const score = scoreOf(loaded!, 0)
+  assert.equal(score.sent, 1, 'the skipped variant is EXCLUDED from the denominator')
+  assert.equal(score.skipped, 1)
+  assert.equal(score.hitRate, 0, '0 canary hits over 1 SENT variant = 0% (a real negative)')
+})

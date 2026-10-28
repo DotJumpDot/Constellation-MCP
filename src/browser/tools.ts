@@ -137,19 +137,57 @@ function dbscWarningForProfile(userDir: string): string[] {
   return []
 }
 
-/** Evidence record for one upload (run-7 P1-8): filename, bytes, route. */
-async function uploadRecord(session: BrowserSession, how: string, files: string[]): Promise<string> {
+/** Pure acceptance assessment from page text (lead smoke round 3): setting a
+ *  file into the DOM is a TOOL fact; the app showing the filename is the TASK
+ *  fact. A lane must never record "fixture uploaded" when the product never
+ *  saw it — e.g. the page was actually signed out. */
+export function assessUploadText(pageText: string, files: string[]): { accepted: boolean; signedOut: boolean; evidence: string } {
+  const signedOut = /\bsign in\b/i.test(pageText)
+  const candidates = files.flatMap(file => {
+    const name = path.basename(file)
+    const stem = name.replace(/\.[^.]+$/, '')
+    return name.length > 3 ? [name, stem] : [name]
+  })
+  const hit = candidates.find(candidate => pageText.includes(candidate))
+  return {
+    accepted: hit !== undefined,
+    signedOut,
+    evidence: hit !== undefined
+      ? `"${hit}" is visible in the page (composer/attachment area)`
+      : 'filename not found in the page text — the app may still be processing, or it never accepted the file (browser_snapshot to inspect)',
+  }
+}
+
+/** Wait for the app to react, then read the page once and assess. */
+async function assessUpload(page: Page, files: string[]): Promise<{ accepted: boolean; signedOut: boolean; evidence: string }> {
+  await page.waitForTimeout(1500)
+  try {
+    const text = await page.evaluate(() => document.body?.innerText ?? '')
+    return assessUploadText(text, files)
+  } catch {
+    return { accepted: false, signedOut: false, evidence: 'page unreadable after the upload — inspect manually with browser_snapshot' }
+  }
+}
+
+/** Evidence record for one upload (run-7 P1-8): filename, bytes, route, and
+ *  whether the product ACCEPTED it (smoke round 3: the tool reported success
+ *  while the page was showing "Sign in" — a tooling true and a task false). */
+async function uploadRecord(session: BrowserSession, how: string, files: string[], verdict: { accepted: boolean; signedOut: boolean; evidence: string }): Promise<string> {
   const rows = files.map(file => {
     const stat = fs.statSync(file)
     return { file: path.basename(file), bytes: stat.size, path: file }
   })
-  const record = { ts: new Date().toISOString(), owner: session.owner, route: how, files: rows }
+  const record = { ts: new Date().toISOString(), owner: session.owner, route: how, files: rows, accepted: verdict.accepted, signedOut: verdict.signedOut }
   try {
     fs.appendFileSync(path.join(session.artifactDir(), 'uploads.jsonl'), JSON.stringify(record) + '\n')
   } catch { /* best effort */ }
   return [
     `Uploaded ${rows.length} file(s) via ${how}.`,
     ...rows.map(row => `  ${row.file} — ${row.bytes} bytes`),
+    `accepted: ${verdict.accepted ? `YES — ${verdict.evidence}` : `UNVERIFIED — ${verdict.evidence}`}`,
+    ...(verdict.signedOut
+      ? ['⚠ the page shows a "Sign in" control — the product likely NEVER saw this file; session_verify {owner, site} before trusting any fixture claim']
+      : []),
     `recorded: ${path.join(session.artifactDir(), 'uploads.jsonl')}`,
     `Now at: see browser_snapshot for the page state`,
   ].join('\n')
@@ -647,8 +685,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           ])
           if (chooser !== undefined) {
             await chooser.setFiles(files)
-            await page.waitForTimeout(500)
-            return textResult(await uploadRecord(session, how, files))
+            return textResult(await uploadRecord(session, how, files, await assessUpload(page, files)))
           }
         }
         // No chooser fired (or no trigger given): find an input[type=file] by
@@ -691,8 +728,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         how = 'direct deep input[type=file]'
         await input.setInputFiles(files)
         await handle.dispose()
-        await page.waitForTimeout(500)
-        return textResult(await uploadRecord(session, how, files))
+        return textResult(await uploadRecord(session, how, files, await assessUpload(page, files)))
       } finally {
         await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }).catch(() => undefined)
         await cdp.detach().catch(() => undefined)

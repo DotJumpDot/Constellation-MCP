@@ -32,7 +32,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
   const jars = new JarStore(config)
   const fixtures = new FixtureStore(oob, config)
-  const injects = new InjectStore()
+  const injects = new InjectStore(path.join(config.rootDir, 'injectlab'))
   const watches = new SessionWatchRegistry()
 
   const mcp = new McpServer({ name: 'constellation', version: '0.1.0' }, {
@@ -61,7 +61,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerSessionTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner) }, watches)
   registerEvidenceTools(registrar, config)
   registerDupeTools(registrar)
-  registerInjectTools(registrar, injects, { fixtures, budget, sessionFor: owner => registry.sessionFor(owner) }, config.outputDir)
+  registerInjectTools(registrar, injects, { config, fixtures, budget, sessionFor: owner => registry.sessionFor(owner) }, config.outputDir)
   registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)
   registerMailTools(registrar)
