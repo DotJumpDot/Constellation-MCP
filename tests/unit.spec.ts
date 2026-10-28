@@ -763,3 +763,24 @@ test('recipes: validation, var interpolation, and capture extraction (run-8 §1c
   assert.equal(captureFromText('no ids here', '/org/([a-z0-9-]+)'), undefined)
   assert.equal(captureFromText('plain', '('), undefined, 'an invalid regex yields undefined, not a throw')
 })
+
+test('recipes: verify accepts a bare string, is case-insensitive by default, hints case-only misses (smoke round 5)', async () => {
+  const { evaluateVerify, normalizeStringArray, expectPasses } = await import('../src/tools/recipe.js')
+  // Defect 1: a bare string is one needle — never a TypeError.
+  assert.deepEqual(normalizeStringArray('Safe harbor'), ['Safe harbor'])
+  assert.equal(evaluateVerify('page with Safe harbor text', { must_contain: 'Safe harbor' }).ok, true)
+  // Defect 2: case-insensitive by default; "Seek"/"SEEK" both match.
+  const page = 'SEEK is the app name'
+  assert.equal(evaluateVerify(page, { must_contain: 'Seek' }).ok, true)
+  assert.equal(evaluateVerify(page, { must_contain: 'Seek', case_sensitive: true }).ok, false)
+  const hinted = evaluateVerify(page, { must_contain: 'Seek', case_sensitive: true })
+  assert.match(hinted.hints.join(' '), /differs only by case/)
+  assert.equal(evaluateVerify(page, { must_not_contain: 'seek' }).ok, false, 'forbidden needles are case-insensitive too')
+  // The suggestion: expect deny/allow matches the diff_pair verdicts.
+  assert.equal(expectPasses('AUTHORIZATION_DENIAL', 'deny'), true)
+  assert.equal(expectPasses('DATA_LEAK', 'deny'), false)
+  assert.equal(expectPasses('NOT_FOUND', 'deny'), false, 'a lookup miss proves nothing and never passes')
+  assert.equal(expectPasses('DATA_LEAK', 'allow'), true)
+  assert.equal(expectPasses('SOFT_ALLOW', 'allow'), true)
+  assert.equal(expectPasses('AUTHORIZATION_DENIAL', 'allow'), false)
+})

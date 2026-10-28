@@ -21,9 +21,14 @@ import { z } from 'zod'
 import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '../browser/tools.js'
 import type { BrowserSession } from '../browser/session.js'
 import type { ConstellationConfig } from '../config.js'
+import type { JarStore } from './http.js'
+import { performRequest, type RequestSpec } from './http.js'
+import { verdictOf, type AuthzVerdict } from './diff.js'
+import type { BudgetGuard } from './budget.js'
+import type { ScopeGuard } from '../scope.js'
 
 export interface RecipeStep {
-  action: 'navigate' | 'click' | 'type' | 'capture' | 'verify' | 'wait'
+  action: 'navigate' | 'click' | 'type' | 'capture' | 'verify' | 'wait' | 'expect'
   /** Which identity's browser runs this step — the grant/revoke stages
    *  SHOULD name the granting identity (the anti-admin-bias mechanism). */
   owner?: string
@@ -35,10 +40,58 @@ export interface RecipeStep {
   /** capture: first regex match on the page text, stored as a variable. */
   label?: string
   regex?: string
-  must_contain?: string[]
-  must_not_contain?: string[]
+  must_contain?: string[] | string
+  must_not_contain?: string[] | string
+  /** Case-INsensitive by default (smoke round 5, defect 2) — text assertions
+   *  are almost always case-insensitive by intent; opt in with true. */
+  case_sensitive?: boolean
+  /** Authorization assertion (smoke round 5 suggestion): run probe vs miss
+   *  control through diff_pair semantics and require the boundary verdict. */
+  expect?: 'deny' | 'allow'
+  probe?: Record<string, unknown>
+  miss?: Record<string, unknown>
+  own?: Record<string, unknown>
   ms?: number
   note?: string
+}
+
+/** Accept the natural forms: a bare string is one needle (smoke round 5,
+ *  defect 1 — a string crashed the step with a TypeError). */
+export function normalizeStringArray(value: unknown): string[] {
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string')
+  return []
+}
+
+/** Pure authorization-assertion matcher (smoke round 5 suggestion): expect
+ *  "deny" passes on a real AUTHORIZATION_DENIAL; expect "allow" passes on
+ *  DATA_LEAK or SOFT_ALLOW. NOT_FOUND never passes either way — it means the
+ *  fixture lookup missed and the cell proves nothing. */
+export function expectPasses(verdict: AuthzVerdict, expect: 'deny' | 'allow'): boolean {
+  return expect === 'deny'
+    ? verdict === 'AUTHORIZATION_DENIAL'
+    : verdict === 'DATA_LEAK' || verdict === 'SOFT_ALLOW'
+}
+
+/** Pure case-aware contains + the verify verdict, so tests pin the semantics. */
+export function evaluateVerify(text: string, step: { must_contain?: string[] | string; must_not_contain?: string[] | string; case_sensitive?: boolean }): { ok: boolean; why: string[]; hints: string[] } {
+  const mustContain = normalizeStringArray(step.must_contain)
+  const mustNotContain = normalizeStringArray(step.must_not_contain)
+  const caseSensitive = step.case_sensitive === true
+  const contains = (needle: string): boolean =>
+    caseSensitive ? text.includes(needle) : text.toLowerCase().includes(needle.toLowerCase())
+  const missing = mustContain.filter(needle => !contains(needle))
+  const forbidden = mustNotContain.filter(needle => contains(needle))
+  // "found SEEK — differs only by case": only possible in the opt-in
+  // case-sensitive mode; the default mode already matches any case.
+  const hints = caseSensitive
+    ? [...missing.filter(needle => text.toLowerCase().includes(needle.toLowerCase())).map(needle => `found a case-only difference for "${needle}" — the page text differs only by case`)]
+    : []
+  const why = [
+    ...missing.map(needle => `expected "${needle}" — NOT on the page${caseSensitive ? ' (exact-case match)' : ''}`),
+    ...forbidden.map(needle => `"${needle}" IS visible (should not be)`),
+  ]
+  return { ok: why.length === 0, why, hints }
 }
 
 export interface Recipe {
@@ -110,10 +163,19 @@ function validateRecipe(name: string, recipe: Recipe): string | undefined {
         if (step.label === undefined || step.label === '' || step.regex === undefined) return `step ${index + 1} (capture) needs label + regex`
         try { new RegExp(step.regex) } catch (error) { return `step ${index + 1} (capture) regex invalid: ${error instanceof Error ? error.message : String(error)}` }
         break
-      case 'verify':
-        if ((step.must_contain === undefined || step.must_contain.length === 0) && (step.must_not_contain === undefined || step.must_not_contain.length === 0))
-          return `step ${index + 1} (verify) needs must_contain or must_not_contain`
+      case 'verify': {
+        const mustContain = normalizeStringArray(step.must_contain)
+        const mustNotContain = normalizeStringArray(step.must_not_contain)
+        if (mustContain.length === 0 && mustNotContain.length === 0)
+          return `step ${index + 1} (verify) needs must_contain or must_not_contain (a string or a string array)`
         break
+      }
+      case 'expect': {
+        if (step.expect !== 'deny' && step.expect !== 'allow') return `step ${index + 1} (expect) needs expect: "deny" | "allow"`
+        const isSpec = (spec: unknown): boolean => spec !== null && typeof spec === 'object' && typeof (spec as { url?: unknown }).url === 'string'
+        if (!isSpec(step.probe) || !isSpec(step.miss)) return `step ${index + 1} (expect) needs probe + miss request specs ({url, jar?, ...} — http_request shape)`
+        break
+      }
       case 'wait':
         break
     }
@@ -124,6 +186,9 @@ function validateRecipe(name: string, recipe: Recipe): string | undefined {
 export interface RecipeEnv {
   config: ConstellationConfig
   sessionFor: (owner: string) => BrowserSession
+  jars: JarStore
+  scope: ScopeGuard
+  budget?: BudgetGuard
 }
 
 export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void {
@@ -236,13 +301,33 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
             case 'verify': {
               await page.waitForTimeout(800)
               const text = await page.evaluate(() => document.body?.innerText ?? '')
-              const missing = (step.must_contain ?? []).filter(needle => !text.includes(needle))
-              const forbidden = (step.must_not_contain ?? []).filter(needle => text.includes(needle))
-              if (missing.length > 0 || forbidden.length > 0) {
-                const why = [...missing.map(needle => `expected "${needle}" — NOT on the page`), ...forbidden.map(needle => `"${needle}" IS visible (should not be)`)]
-                throw new Error(`verification FAILED at step ${index + 1}: ${why.join('; ')}. Page text head: ${text.slice(0, 600).replace(/\s+/g, ' ')}`)
+              const verdict = evaluateVerify(text, step)
+              if (!verdict.ok) {
+                const detail = [...verdict.why, ...verdict.hints].join('; ')
+                throw new Error(`verification FAILED at step ${index + 1}: ${detail}. Page text head: ${text.slice(0, 600).replace(/\s+/g, ' ')}`)
               }
-              lines.push(`[step ${index + 1}] verify OK (${[...(step.must_contain ?? []).map(needle => `"${needle}" present`), ...(step.must_not_contain ?? []).map(needle => `"${needle}" absent`)].join(', ')})`)
+              lines.push(`[step ${index + 1}] verify OK (${[...normalizeStringArray(step.must_contain).map(needle => `"${needle}" present`), ...normalizeStringArray(step.must_not_contain).map(needle => `"${needle}" absent`)].join(', ')})${step.case_sensitive === true ? ' [exact case]' : ''}`)
+              break
+            }
+            case 'expect': {
+              // Authorization assertion: probe vs miss control through
+              // diff_pair semantics (smoke round 5) — a recipe can now prove
+              // the boundary held or broke, not just that text is present.
+              const [probe, miss, own] = await Promise.all([
+                performRequest(env.jars, env.scope, step.probe as unknown as RequestSpec, stepOwner, 'fixture_recipe', env.budget),
+                performRequest(env.jars, env.scope, step.miss as unknown as RequestSpec, stepOwner, 'fixture_recipe', env.budget),
+                step.own !== undefined
+                  ? performRequest(env.jars, env.scope, step.own as unknown as RequestSpec, stepOwner, 'fixture_recipe', env.budget)
+                  : Promise.resolve(undefined),
+              ])
+              const verdict = verdictOf({ probe, miss, ...(own !== undefined ? { own } : {}) })
+              if (!expectPasses(verdict.verdict, step.expect!)) {
+                const wanted = step.expect === 'deny'
+                  ? 'the boundary to DENY the other identity'
+                  : 'the other identity to have access'
+                throw new Error(`authorization assertion FAILED at step ${index + 1}: expected ${wanted}, but diff_pair said ${verdict.verdict} (deciding: ${verdict.deciding_field}) — ${verdict.note}`)
+              }
+              lines.push(`[step ${index + 1}] expect ${step.expect} OK — ${verdict.verdict} (deciding: ${verdict.deciding_field})`)
               break
             }
             case 'wait': {

@@ -63,7 +63,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerEvidenceTools(registrar, config)
   registerDupeTools(registrar)
   registerInjectTools(registrar, injects, { config, fixtures, budget, sessionFor: owner => registry.sessionFor(owner) }, config.outputDir)
-  registerRecipeTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner) })
+  registerRecipeTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner), jars, scope, budget })
   registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)
   registerMailTools(registrar)
