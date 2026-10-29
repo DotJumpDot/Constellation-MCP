@@ -1088,6 +1088,95 @@ test('window parking: peek clamps into the clickable band (round-8 §5)', async 
   assert.equal(clampWindowPeek(44.7), 45, 'rounded to whole pixels')
 })
 
+test('http body encoding: arrays/scalars are JSON, strings verbatim — asserted on the bytes the server received (D9)', async () => {
+  const { JarStore, performRequest } = await import('../src/tools/http.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd9body-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  // Echo oracle (the advice's repro shape): record the RAW bytes + the
+  // content-type the server actually received — never the tool's formatting.
+  const received: Array<{ body: string; contentType: string | undefined }> = []
+  const server = http.createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk: Buffer) => { body += chunk.toString('latin1') })
+    req.on('end', () => {
+      received.push({ body, contentType: req.headers['content-type'] })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ body, contentType: req.headers['content-type'] ?? null }))
+    })
+  })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  process.env.CONSTELLATION_SECRET_TEST_KEY = 's3cret'
+  try {
+    const port = (server.address() as { port: number }).port
+    const url = `http://127.0.0.1:${port}/echo`
+    const send = (body: unknown) => performRequest(jars, guard, { url, method: 'POST', body } as never, 'lane', 'http_request')
+
+    // 1. Array body (batched GraphQL shape) — the D9 corruption: the server
+    //    used to receive "[object Object]" as text/plain.
+    await send([{ query: '{ viewer { id } }' }])
+    assert.equal(received.at(-1)!.body, JSON.stringify([{ query: '{ viewer { id } }' }]), 'array arrives as JSON bytes, not [object Object]')
+    assert.equal(received.at(-1)!.contentType, 'application/json')
+
+    // 2. Object body — existing behaviour must not regress.
+    await send({ query: '{ viewer { id } }' })
+    assert.equal(received.at(-1)!.body, JSON.stringify({ query: '{ viewer { id } }' }))
+    assert.equal(received.at(-1)!.contentType, 'application/json')
+
+    // 3. String body — verbatim bytes, and the tool invents NO content-type
+    //    (the text/plain;charset=UTF-8 that arrives is undici's spec default
+    //    for USVString bodies, not ours; what matters is no application/json).
+    await send('a=1&b=2')
+    assert.equal(received.at(-1)!.body, 'a=1&b=2')
+    assert.ok(!String(received.at(-1)!.contentType).includes('json'), 'a raw string body gets no application/json invented')
+
+    // 4. Scalar bodies — JSON-encoded, not stringified ("5" as text would
+    //    change the meaning of the request).
+    await send(5)
+    assert.equal(received.at(-1)!.body, '5')
+    assert.equal(received.at(-1)!.contentType, 'application/json')
+    await send(true)
+    assert.equal(received.at(-1)!.body, 'true')
+    assert.equal(received.at(-1)!.contentType, 'application/json')
+
+    // 5. Array containing $secret:NAME — interpolation still applies inside
+    //    array elements, THEN the array is JSON-encoded.
+    await send([{ token: '$secret:test_key' }])
+    assert.equal(received.at(-1)!.body, JSON.stringify([{ token: 's3cret' }]))
+    assert.equal(received.at(-1)!.contentType, 'application/json')
+  } finally {
+    delete process.env.CONSTELLATION_SECRET_TEST_KEY
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('http body encoding: the browser transport encodes bodies identically (D9)', async () => {
+  const { performBrowserRequest } = await import('../src/tools/http.js')
+  const sent: Array<{ data?: string; contentType: string | undefined }> = []
+  const client = {
+    fetch: async (_url: string, options: any) => {
+      sent.push({ data: options.data, contentType: options.headers['content-type'] })
+      return {
+        status: () => 200, statusText: () => 'OK', url: () => 'https://x.example/echo',
+        headers: () => ({ 'content-type': 'application/json' }), headersArray: () => [],
+        text: async () => 'ok', body: async () => Buffer.from('ok'),
+      }
+    },
+  }
+  const scope = { assert: () => ({ allowed: true, reason: '' }) }
+  await performBrowserRequest(client as never, scope as never, {
+    url: 'https://x.example/echo', method: 'POST', body: [{ query: '{ viewer { id } }' }],
+  } as never, 'lane', 'http_request')
+  assert.equal(sent[0]!.data, JSON.stringify([{ query: '{ viewer { id } }' }]), 'array through the live-browser transport is JSON bytes')
+  assert.equal(sent[0]!.contentType, 'application/json')
+  await performBrowserRequest(client as never, scope as never, {
+    url: 'https://x.example/echo', method: 'POST', body: 'raw-form-bytes',
+  } as never, 'lane', 'http_request')
+  assert.equal(sent[1]!.data, 'raw-form-bytes')
+  assert.equal(sent[1]!.contentType, undefined)
+})
+
 test('redirect hops: redirectHop decisions (run-9 §2)', async () => {
   const { redirectHop } = await import('../src/tools/http.js')
   assert.equal(redirectHop(200, '/next', 'https://a.example/x'), undefined, 'not a redirect')

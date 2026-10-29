@@ -175,13 +175,21 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')} — set them via CONSTELLATION_SECRET_* env`)
   const headers: Record<string, string> = { ...(headersInterp as Record<string, string>) }
-  if (spec.body !== undefined && headers['content-type'] === undefined && headers['Content-Type'] === undefined && isJsonObject(spec.body))
+  // D9 (run 10): the content-type gate must match the ENCODING gate below —
+  // any non-string body is JSON, so it also earns application/json. Arrays
+  // used to fall to String() ([object Object]) AND lose the header.
+  if (spec.body !== undefined && headers['content-type'] === undefined && headers['Content-Type'] === undefined && typeof spec.body !== 'string')
     headers['content-type'] = 'application/json'
   const cookie = jar.getCookieStringSync(spec.url)
   if (cookie !== '') headers['cookie'] = headers['cookie'] ?? cookie
   const { value: bodyInterp, missing: missingBody } = interpolateDeep(spec.body)
   if (missingBody.length > 0) throw new Error(`unknown secret(s) in body: ${missingBody.join(', ')}`)
-  const body = bodyInterp === undefined ? undefined : (isJsonObject(bodyInterp) ? JSON.stringify(bodyInterp) : String(bodyInterp))
+  // D9: encode exactly three cases — absent, raw string (caller owns the
+  // bytes), everything else (objects, ARRAYS, scalars) as JSON. The old
+  // object-only gate sent batched GraphQL arrays as "[object Object]".
+  const body = bodyInterp === undefined ? undefined
+    : typeof bodyInterp === 'string' ? bodyInterp
+      : JSON.stringify(bodyInterp)
   applyAuth(headers, spec.auth)
 
   const started = Date.now()
@@ -299,12 +307,17 @@ export async function performBrowserRequest(
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
   const headers: Record<string, string> = { ...(headersInterp as Record<string, string>) }
-  if (spec.body !== undefined && headers['content-type'] === undefined && headers['Content-Type'] === undefined && isJsonObject(spec.body))
+  // D9: same gate as the jar transport — any non-string body is JSON.
+  if (spec.body !== undefined && headers['content-type'] === undefined && headers['Content-Type'] === undefined && typeof spec.body !== 'string')
     headers['content-type'] = 'application/json'
   // No jar merge: the browser context's cookie state IS the identity here.
   const { value: bodyInterp, missing: missingBody } = interpolateDeep(spec.body)
   if (missingBody.length > 0) throw new Error(`unknown secret(s) in body: ${missingBody.join(', ')}`)
-  const body = bodyInterp === undefined ? undefined : (isJsonObject(bodyInterp) ? JSON.stringify(bodyInterp) : String(bodyInterp))
+  // D9: absent | raw string verbatim | everything else JSON — arrays used to
+  // land in String() and reach the server as "[object Object]".
+  const body = bodyInterp === undefined ? undefined
+    : typeof bodyInterp === 'string' ? bodyInterp
+      : JSON.stringify(bodyInterp)
   applyAuth(headers, spec.auth)
 
   const started = Date.now()
@@ -422,10 +435,6 @@ function applyAuth(headers: Record<string, string>, auth: AuthSpec | undefined):
   } else {
     throw new Error('auth.type must be "basic" or "bearer"')
   }
-}
-
-function isJsonObject(v: unknown): boolean {
-  return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
 /** Content types whose bytes are not human-readable in a transcript — a
