@@ -33,6 +33,11 @@ export interface ConstellationConfig {
    *  the taskbar (--start-minimized) — maximum quiet; CDP tooling still works,
    *  but prefer window-position when you need to SEE the windows. */
   startMinimized: boolean
+  /** Visible tab-strip pixels for a PARKED window (CONSTELLATION_WINDOW_PEEK_PX,
+   *  default 36; clamped to 20–60): every launched window parks at the BOTTOM
+   *  of its monitor's work area with only the tab strip peeking (round-8 §5,
+   *  the human's measured preference — top = availTop + availH − peek). */
+  windowPeekPx: number
 }
 
 function env(name: string): string | undefined {
@@ -66,6 +71,7 @@ export function defaultConfig(): ConstellationConfig {
     requireScope: env('REQUIRE_SCOPE') === '1' || env('REQUIRE_SCOPE') === 'true',
     windowPosition: env('WINDOW_POSITION'),
     startMinimized: env('START_MINIMIZED') === '1' || env('START_MINIMIZED') === 'true',
+    windowPeekPx: int('WINDOW_PEEK_PX', 36),
   }
 }
 
@@ -94,6 +100,12 @@ export function applyCliArgs(config: ConstellationConfig, argv: string[]): strin
     }
     if (arg === '--headless') { config.headless = true; continue }
     if (arg === '--start-minimized') { config.startMinimized = true; continue }
+    if ((arg === '--window-peek-px' || arg.startsWith('--window-peek-px='))) {
+      const raw = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : value()
+      const v = Number.parseInt(raw ?? '', 10)
+      if (Number.isFinite(v)) config.windowPeekPx = v
+      continue
+    }
     const key = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg
     const field = FLAG_MAP[key]
     if (field !== undefined) {

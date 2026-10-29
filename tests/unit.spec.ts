@@ -619,10 +619,14 @@ test('diff_pair: the probe-vs-miss distinction decides the verdict (run-8 §4)',
   assert.equal(verdictOf({ own: leg(200, 'cc'), probe: leg(200, 'cc'), miss: leg(404, 'bb') }).verdict, 'DATA_LEAK')
   // probe 200 but different bytes than own → SOFT_ALLOW
   assert.equal(verdictOf({ own: leg(200, 'cc'), probe: leg(200, 'dd'), miss: leg(404, 'bb') }).verdict, 'SOFT_ALLOW')
-  // same status, different body, 4xx → still a real denial via body
-  const denial = verdictOf({ probe: leg(404, 'aa'), miss: leg(404, 'bb') })
-  assert.equal(denial.verdict, 'AUTHORIZATION_DENIAL')
-  assert.equal(denial.deciding_field, 'body')
+  // Round-8 D4: same-status non-2xx with different bodies (the id-echoing
+  // 404 page) is a MISS ON BOTH SIDES — never a synthetic denial, never a
+  // NEGATIVE, never chained evidence for something untested.
+  const blind = verdictOf({ probe: leg(404, 'echo-a'), miss: leg(404, 'echo-b') })
+  assert.equal(blind.verdict, 'NOT_FOUND')
+  assert.equal(blind.deciding_field, 'none')
+  assert.match(blind.note, /MISS ON BOTH SIDES/)
+  assert.equal(verdictOf({ probe: leg(403, 'x'), miss: leg(403, 'y') }).verdict, 'NOT_FOUND', 'same-status 403/403 is conservative-blind too')
   assert.deepEqual(firstJsonDiff({ a: { b: 1 }, c: 2 }, { a: { b: 2 }, c: 2 }), '/a/b')
   assert.equal(firstJsonDiff({ a: 1 }, { a: 1, x: 9 }), '/x (added)')
 })
@@ -913,15 +917,17 @@ test('launch quiet spawn: per-owner cascade on a pinned window position (user as
   assert.equal(cascadeWindowPosition('garbage', 'scout'), 'garbage', 'invalid positions pass through untouched')
 })
 
-test('config: window-position + start-minimized env and flags (user ask: quiet spawn)', async () => {
+test('config: window-position + start-minimized + peek env and flags (quiet spawn / round-8 park)', async () => {
   const { defaultConfig, applyCliArgs } = await import('../src/config.js')
   const config = defaultConfig()
   assert.equal(config.startMinimized, false)
   assert.equal(config.windowPosition, undefined)
-  const rest = applyCliArgs(config, ['--window-position=2560,100', '--start-minimized', '--headless', 'positional'])
+  assert.equal(config.windowPeekPx, 36, 'peek defaults to the measured preference')
+  const rest = applyCliArgs(config, ['--window-position=2560,100', '--start-minimized', '--headless', '--window-peek-px=44', 'positional'])
   assert.equal(config.windowPosition, '2560,100')
   assert.equal(config.startMinimized, true)
   assert.equal(config.headless, true)
+  assert.equal(config.windowPeekPx, 44)
   assert.deepEqual(rest, ['positional'])
 })
 
@@ -1070,4 +1076,14 @@ test('keepalive registry: records ticks, measures lifetime, stops on remove (rou
   assert.equal(registry.list().length, 1)
   assert.equal(registry.remove('scout', 'google-gemini'), true)
   assert.equal(registry.list().length, 0)
+})
+
+test('window parking: peek clamps into the clickable band (round-8 §5)', async () => {
+  const { clampWindowPeek } = await import('../src/browser/session.js')
+  assert.equal(clampWindowPeek(36), 36, 'the measured preference passes through')
+  assert.equal(clampWindowPeek(0), 20, 'never below 20 — the tab strip must stay clickable')
+  assert.equal(clampWindowPeek(4), 20)
+  assert.equal(clampWindowPeek(400), 60, 'never eats half the work area')
+  assert.equal(clampWindowPeek(Number.NaN), 36, 'a bad config value falls back to the default')
+  assert.equal(clampWindowPeek(44.7), 45, 'rounded to whole pixels')
 })

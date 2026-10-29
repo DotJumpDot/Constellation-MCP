@@ -59,9 +59,20 @@ export function verdictOf(legs: DiffPairLegs): {
     }
   }
   return {
-    verdict: 'AUTHORIZATION_DENIAL',
-    deciding_field: statusDiffers ? 'status' : 'body',
-    note: `probe HTTP ${probe.status} vs miss control HTTP ${miss.status}${statusDiffers ? '' : ' (same status, different body)'} — the server makes a REAL authorization decision for the other identity; this is the deny half of a valid C1/C2 pair`,
+    // Round-8 D4: a same-status pair where BOTH legs are non-2xx is a MISS ON
+    // BOTH SIDES → NOT_FOUND regardless of body. The old rule read any body
+    // difference as a decision, and an id-echoing 4xx page ("Item X not
+    // found") makes the bodies differ BY CONSTRUCTION — a blind cell then
+    // folded to NEGATIVE with evidence chained for it, the exact false green
+    // this ledger exists to prevent. A real denial needs a STATUS difference
+    // (403-vs-404). Honest cost, kept deliberately: a server returning 403
+    // for BOTH with genuinely different denial reasons also reads NOT_FOUND
+    // — conservative; re-shape the control so the statuses diverge.
+    verdict: statusDiffers ? 'AUTHORIZATION_DENIAL' : 'NOT_FOUND',
+    deciding_field: statusDiffers ? 'status' : 'none',
+    note: statusDiffers
+      ? `probe HTTP ${probe.status} vs miss control HTTP ${miss.status} — the server makes a REAL authorization decision for the other identity; this is the deny half of a valid C1/C2 pair`
+      : `probe HTTP ${probe.status} and miss control HTTP ${miss.status} differ only in body — round-8 D4: a same-status non-2xx pair is a lookup MISS ON BOTH SIDES (error pages echo the requested id, so the bytes differ by construction); the cell proves nothing`,
   }
 }
 

@@ -505,6 +505,11 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
         return textResult([
           `RECIPE FAILED at step ${outcome.failedAtStep}/${recipe.steps.length} (${outcome.failedAction}) as "${outcome.failedOwner}":`,
           outcome.reason,
+          // Round-8 D6: the tail of the step log too — the ⚠ TRANSITION
+          // DENY→ALLOW line is pushed BEFORE a failing expect throws, and it
+          // is the one thing a lane must not miss mid-run (the opening IS the
+          // candidate even when the run then fails the assertion).
+          ...(outcome.lines.length > 0 ? ['', ...outcome.lines.slice(-6)] : []),
           '',
           `Variables captured so far: ${Object.entries(outcome.vars).map(([key, value]) => `${key}=${value}`).join(', ') || '(none)'}`,
           'Fix the step or the session and re-run — the recipe is unchanged.',

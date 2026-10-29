@@ -130,6 +130,14 @@ export function cascadeWindowPosition(position: string, owner: string): string {
   return `${x + offset},${y}`
 }
 
+/** Clamp the configured peek into the sane band (round-8 §5): the tab strip
+ *  must stay clickable — 20 px minimum — and never eat half the work area.
+ *  Pure. */
+export function clampWindowPeek(peek: number): number {
+  if (!Number.isFinite(peek)) return 36
+  return Math.min(60, Math.max(20, Math.round(peek)))
+}
+
 export class BrowserSession {
   context?: BrowserContext
   private tabs = new Map<Page, TabMeta>()
@@ -303,10 +311,12 @@ export class BrowserSession {
     this.wireNetwork(context)
     for (const page of context.pages()) this.registerPage(page, this.owner)
     this.context = context
-    // Pinned windows settle against the BOTTOM of their monitor's work area
-    // (round-7 measurement). Skipped for minimized starts (no visible bounds).
-    if (this.config.windowPosition !== undefined && !this.config.startMinimized) {
-      await this.bottomAnchorWindow(context)
+    // EVERY launched window parks at the bottom of its monitor with only the
+    // tab strip peeking (round-8 §5 — one shared placement on every launch
+    // path; a window appearing at the top of the screen is a regression of
+    // the preference). Minimized starts have no visible bounds to park.
+    if (!this.config.startMinimized) {
+      await this.parkWindow(context)
     }
     // The very first tab of an owner window is the ownership label: which
     // agent owns this window and what job it is running. It cannot be closed
@@ -323,24 +333,38 @@ export class BrowserSession {
     return false
   }
 
-  /** Bottom-anchor the freshly launched window on its pinned monitor (lead's
-   *  round-7 measurement: --window-position + x-cascade place the window
-   *  correctly in x, but stacked owner windows belong against the BOTTOM edge
-   *  of the work area; a y=1001-style reading AFTER this is the human
-   *  dragging, not the launcher). Best effort — never blocks a launch. */
-  private async bottomAnchorWindow(context: BrowserContext): Promise<void> {
+  /** PARK the freshly launched window at the bottom of its monitor's work
+   *  area with only the tab strip peeking (round-8 §5, the human's MEASURED
+   *  preference — they dragged a live window to demonstrate it: top = availTop
+   *  + availH − peekPx, peek 36, never clamped fully on-screen, windowState
+   *  normal so the strip stays clickable). The peek is FIXED, never derived
+   *  from the window's height — round-8 D5 measured the old height-derived
+   *  anchor landing on a stale 43 px box when it raced Chrome's sizing, and
+   *  one launch path skipped the anchor entirely. Bounds are read back and
+   *  the park retried ONCE so the peek is what was asked for (DPI drift,
+   *  CDP DIP-vs-physical rounding). Best effort — never blocks a launch. */
+  private async parkWindow(context: BrowserContext): Promise<void> {
     try {
       const page = context.pages()[0]
       if (page === undefined) return
       const cdp = await context.newCDPSession(page)
       try {
         const { windowId } = await cdp.send('Browser.getWindowForTarget') as { windowId: number }
-        const { bounds } = await cdp.send('Browser.getWindowBounds', { windowId }) as { bounds: { left: number; top: number; height: number } }
+        const readBounds = () => cdp.send('Browser.getWindowBounds', { windowId }) as Promise<{ bounds: { left: number; top: number } }>
+        let { bounds } = await readBounds()
         const work = await workAreaAt(bounds.left + 50, bounds.top + 50)
         if (work === undefined) return
-        const top = work.top + work.height - bounds.height
-        if (top >= work.top && Math.abs(top - bounds.top) > 2) {
-          await cdp.send('Browser.setWindowBounds', { windowId, bounds: { top } })
+        const peek = clampWindowPeek(this.config.windowPeekPx)
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { top: work.top + work.height - peek } })
+        // Read-back + one retry: Chrome applies bounds asynchronously and a
+        // first read can still show the pre-park position or a DPI-rounded
+        // strip. The spec's verification is by MEASUREMENT (visibleStrip =
+        // availTop + availH − screenY) — measure here too, not the flag.
+        await new Promise(resolve => setTimeout(resolve, 250))
+        ;({ bounds } = await readBounds())
+        const strip = work.top + work.height - bounds.top
+        if (Math.abs(strip - peek) > 8) {
+          await cdp.send('Browser.setWindowBounds', { windowId, bounds: { top: work.top + work.height - peek } })
         }
       } finally {
         await cdp.detach().catch(() => undefined)
