@@ -24,6 +24,15 @@ export interface ConstellationConfig {
   /** When true (CONSTELLATION_REQUIRE_SCOPE=1): no scope set ⇒ every
    *  non-local request is denied. Default: unrestricted until scope_set. */
   requireScope: boolean
+  /** "x,y" (CONSTELLATION_WINDOW_POSITION): every spawned Chrome window is
+   *  pinned there (--window-position) — e.g. "2560,100" for the right monitor
+   *  so spawns never cover a fullscreen game on the main screen. Per-owner
+   *  cascade keeps 10+ windows from stacking exactly. */
+  windowPosition?: string
+  /** true (CONSTELLATION_START_MINIMIZED=1): spawn windows start minimized to
+   *  the taskbar (--start-minimized) — maximum quiet; CDP tooling still works,
+   *  but prefer window-position when you need to SEE the windows. */
+  startMinimized: boolean
 }
 
 function env(name: string): string | undefined {
@@ -55,6 +64,8 @@ export function defaultConfig(): ConstellationConfig {
     scopeFile: path.join(rootDir, 'scope.json'),
     auditFile: path.join(rootDir, 'scope-audit.jsonl'),
     requireScope: env('REQUIRE_SCOPE') === '1' || env('REQUIRE_SCOPE') === 'true',
+    windowPosition: env('WINDOW_POSITION'),
+    startMinimized: env('START_MINIMIZED') === '1' || env('START_MINIMIZED') === 'true',
   }
 }
 
@@ -66,6 +77,7 @@ const FLAG_MAP: Record<string, keyof ConstellationConfig> = {
   '--oob-public-base': 'oobPublicBase',
   '--scope-file': 'scopeFile',
   '--audit-file': 'auditFile',
+  '--window-position': 'windowPosition',
 }
 
 /** Mutates config from argv; returns argv with recognized flags removed. */
@@ -81,6 +93,7 @@ export function applyCliArgs(config: ConstellationConfig, argv: string[]): strin
       return next
     }
     if (arg === '--headless') { config.headless = true; continue }
+    if (arg === '--start-minimized') { config.startMinimized = true; continue }
     const key = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg
     const field = FLAG_MAP[key]
     if (field !== undefined) {

@@ -91,6 +91,20 @@ export function canTouchTab(meta: TabMeta | undefined, owner: string, sessionOwn
   return { ok: true }
 }
 
+/** Stable per-owner cascade on a pinned window position (user ask: 10+ owner
+ *  windows pinned to one monitor must not stack exactly on top of each other).
+ * Invalid input passes through untouched — Chrome ignores a bad flag. Pure. */
+export function cascadeWindowPosition(position: string, owner: string): string {
+  const [xRaw, yRaw] = position.split(',').map(part => part.trim())
+  const x = Number.parseInt(xRaw ?? '', 10)
+  const y = Number.parseInt(yRaw ?? '', 10)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return position
+  let hash = 0
+  for (const ch of owner) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) | 0
+  const offset = (Math.abs(hash) % 10) * 30
+  return `${x + offset},${y + offset}`
+}
+
 export class BrowserSession {
   context?: BrowserContext
   private tabs = new Map<Page, TabMeta>()
@@ -232,10 +246,16 @@ export class BrowserSession {
     // Quiet-window defaults (user ask, 10+ windows per run): no "Restore
     // pages?" bubble after an unclean exit, no first-run/default-browser
     // nagging. The password-save bubble is disabled via Preferences below.
+    // Window pinning/minimized start (user ask: spawned windows must never
+    // cover a fullscreen game on the main screen or steal its focus).
     const args = [
       '--hide-crash-restore-bubble',
       '--no-first-run',
       '--no-default-browser-check',
+      ...(this.config.windowPosition !== undefined
+        ? [`--window-position=${cascadeWindowPosition(this.config.windowPosition, this.owner)}`]
+        : []),
+      ...(this.config.startMinimized ? ['--start-minimized'] : []),
       ...(this.launchExtraArgs ?? []),
     ]
     let context: BrowserContext

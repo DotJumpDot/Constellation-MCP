@@ -896,3 +896,30 @@ test('http legs: performLeg routes browser legs to the named live session, jar l
   )
 })
 
+test('launch quiet spawn: per-owner cascade on a pinned window position (user ask: game screen focus)', async () => {
+  const { cascadeWindowPosition } = await import('../src/browser/session.js')
+  const a = cascadeWindowPosition('2560,100', 'scout')
+  const b = cascadeWindowPosition('2560,100', 'mother')
+  assert.equal(a, cascadeWindowPosition('2560,100', 'scout'), 'stable per owner')
+  for (const pos of [a, b]) {
+    const x = Number.parseInt(pos.split(',')[0]!, 10)
+    assert.ok(x >= 2560 && x <= 2560 + 270, `cascade stays near the pin: ${pos}`)
+  }
+  assert.notEqual(a, b, 'different owners land at different offsets (no exact stacking)')
+  const neg = cascadeWindowPosition('-1920,0', 'scout').split(',')[0]!
+  const negX = Number.parseInt(neg, 10)
+  assert.ok(negX >= -1920 && negX <= -1920 + 270, `negative coordinates parse: ${neg}`)
+  assert.equal(cascadeWindowPosition('garbage', 'scout'), 'garbage', 'invalid positions pass through untouched')
+})
+
+test('config: window-position + start-minimized env and flags (user ask: quiet spawn)', async () => {
+  const { defaultConfig, applyCliArgs } = await import('../src/config.js')
+  const config = defaultConfig()
+  assert.equal(config.startMinimized, false)
+  assert.equal(config.windowPosition, undefined)
+  const rest = applyCliArgs(config, ['--window-position=2560,100', '--start-minimized', '--headless', 'positional'])
+  assert.equal(config.windowPosition, '2560,100')
+  assert.equal(config.startMinimized, true)
+  assert.equal(config.headless, true)
+  assert.deepEqual(rest, ['positional'])
+})
