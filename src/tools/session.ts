@@ -134,6 +134,7 @@ export interface SessionEnv {
   config: ConstellationConfig
   sessionFor: (owner: string) => BrowserSession
   budget?: import('./budget.js').BudgetGuard
+  scope?: import('../scope.js').ScopeGuard
 }
 
 /** ---------------- session_keepalive (round-7 gap list §5) ----------------
@@ -245,6 +246,11 @@ export async function verifySessionOnce(
   sessionFor: (owner: string) => BrowserSession,
   ownerRaw: string | undefined,
   site: string,
+  /** Run-9 §2 widening: the proof visit navigates an agent-set URL — it
+   *  re-enters the scope guard like every other navigation, including the
+   *  landed-URL check (a redirect chain must not cross the boundary here
+   *  either). Optional so non-tool callers keep compiling. */
+  scope?: import('../scope.js').ScopeGuard,
 ): Promise<{ ok: boolean; reason: string; rule: SessionProofRule; owner: string }> {
   const rules = loadProofRules(config)
   const rule = rules[site]
@@ -253,11 +259,18 @@ export async function verifySessionOnce(
     throw new Error(`no proof rule for site "${site}" — add one with session_proof_set (known: ${known}). Verification without a site-specific proof is what produced the run-7 false green`)
   }
   const who = ownerRaw === undefined || ownerRaw.trim() === '' ? SHARED_OWNER : ownerRaw.trim()
+  scope?.assert(rule.url, who, 'session_verify')
   const session = sessionFor(who)
   const context = await session.ensure()
   const page = await context.newPage()
   try {
     await page.goto(rule.url, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    const landed = page.url()
+    const decision = scope?.check(landed, who)
+    if (scope !== undefined && decision !== undefined && !decision.allowed) {
+      scope.audit(landed, who, 'session_verify(redirect)', decision)
+      throw new Error(`SCOPE DENIED on redirect: proof visit to ${rule.url} landed on ${landed} — ${decision.reason}`)
+    }
     await page.waitForTimeout(1200)
     const text = await page.evaluate(() => document.body?.innerText ?? '')
     const verdict = evaluateProof(rule, text)
@@ -276,7 +289,7 @@ export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, wat
   /** One verification pass against a live owner session (opens + closes its
    *  own tab, so leases on the caller's tabs are untouched). */
   const verifyOnce = (ownerRaw: string | undefined, site: string) =>
-    verifySessionOnce(env.config, env.sessionFor, ownerRaw, site)
+    verifySessionOnce(env.config, env.sessionFor, ownerRaw, site, env.scope)
 
   /** One keepalive tick. Visit mode = verifySessionOnce (a throwaway tab at
    *  the proof surface — an actual account-owned visit, budget-counted); noop

@@ -5,6 +5,7 @@ import { promisify } from 'node:util'
 import pwCore from 'playwright-core'
 import type { BrowserContext, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
+import { armFocusGuard, type FocusGuard } from './focus.js'
 
 const { chromium } = pwCore
 const exec = promisify(execFile)
@@ -155,6 +156,9 @@ export class BrowserSession {
   attached = false
   cdpUrl?: string
   private attachedBrowser?: pwCore.Browser
+  /** Live focus watchdog for the current launch (stopped on close; it also
+   *  self-expires ~10 s after arming). */
+  private focusGuard?: FocusGuard
   /** Custom launch options (browser_launch): extra args + a normal,
    *  non-automation-flagged window. */
   launchExtraArgs?: string[]
@@ -292,40 +296,62 @@ export class BrowserSession {
       ...(this.launchExtraArgs ?? []),
     ]
     let context: BrowserContext
+    // Arm the focus watchdog BEFORE the spawn (run-9 focus advice §4): the
+    // helper captures the current foreground, polls at 40 ms through the
+    // spawn + park + ownership-label steps, and hands the foreground back
+    // when OUR Chrome takes it (AttachThreadInput restore — Chrome always
+    // steals at window creation; --start-minimized does not prevent it).
+    // Headless has no window to steal; the flag is the off switch.
+    const focusGuard: FocusGuard | undefined = this.config.headless || !this.config.focusGuard
+      ? undefined
+      : await armFocusGuard({
+          userDir: this.userDir,
+          channel: this.config.channel,
+          seconds: 10,
+          logFile: path.join(this.config.rootDir, 'focus-guard.log'),
+        }).catch(() => undefined)
+    this.focusGuard = focusGuard
     try {
-      context = await chromium.launchPersistentContext(this.userDir, {
-        channel: this.config.channel,
-        headless: this.config.headless,
-        viewport: null,
-        acceptDownloads: true,
-        args,
-        // browser_launch "normal window" mode: drop the automation flag so
-        // sites fingerprinting it (and DBSC) see a regular Chrome.
-        ...(this.launchNoAutomationFlag ? { ignoreDefaultArgs: ['--enable-automation'] } : {}),
-      })
-    } catch (error) {
-      throw new Error(`failed to launch ${this.config.channel} browser for "${this.owner}": ${error instanceof Error ? error.message : String(error)}`)
+      try {
+        context = await chromium.launchPersistentContext(this.userDir, {
+          channel: this.config.channel,
+          headless: this.config.headless,
+          viewport: null,
+          acceptDownloads: true,
+          args,
+          // browser_launch "normal window" mode: drop the automation flag so
+          // sites fingerprinting it (and DBSC) see a regular Chrome.
+          ...(this.launchNoAutomationFlag ? { ignoreDefaultArgs: ['--enable-automation'] } : {}),
+        })
+      } catch (error) {
+        throw new Error(`failed to launch ${this.config.channel} browser for "${this.owner}": ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (labelScript !== '') await context.addInitScript(labelScript)
+      context.on('page', page => { this.registerPage(page, this.owner) })
+      this.wireNetwork(context)
+      for (const page of context.pages()) this.registerPage(page, this.owner)
+      this.context = context
+      // EVERY launched window parks at the bottom of its monitor with only the
+      // tab strip peeking (round-8 §5 — one shared placement on every launch
+      // path; a window appearing at the top of the screen is a regression of
+      // the preference). Minimized starts have no visible bounds to park.
+      if (!this.config.startMinimized) {
+        await this.parkWindow(context)
+      }
+      // The very first tab of an owner window is the ownership label: which
+      // agent owns this window and what job it is running. It cannot be closed
+      // by tool calls and is re-pinned if the human closes it in Chrome.
+      if (this.owner !== SHARED_OWNER) {
+        try { await this.openInfoTab() } catch { /* never block a launch on the label */ }
+        this.selected = null
+      }
+      return context
+    } finally {
+      // Deliberately NOT stopping the helper here: the FIRST navigation after
+      // launch is also an activating step (focus advice §4). The helper
+      // self-expires (~10 s) and drops out after 2 counters, so it cannot
+      // fight the human deliberately focusing the window.
     }
-    if (labelScript !== '') await context.addInitScript(labelScript)
-    context.on('page', page => { this.registerPage(page, this.owner) })
-    this.wireNetwork(context)
-    for (const page of context.pages()) this.registerPage(page, this.owner)
-    this.context = context
-    // EVERY launched window parks at the bottom of its monitor with only the
-    // tab strip peeking (round-8 §5 — one shared placement on every launch
-    // path; a window appearing at the top of the screen is a regression of
-    // the preference). Minimized starts have no visible bounds to park.
-    if (!this.config.startMinimized) {
-      await this.parkWindow(context)
-    }
-    // The very first tab of an owner window is the ownership label: which
-    // agent owns this window and what job it is running. It cannot be closed
-    // by tool calls and is re-pinned if the human closes it in Chrome.
-    if (this.owner !== SHARED_OWNER) {
-      try { await this.openInfoTab() } catch { /* never block a launch on the label */ }
-      this.selected = null
-    }
-    return context
   }
 
   private hasInfoTab(): boolean {
@@ -529,6 +555,8 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     this.context = undefined
     this.tabs.clear()
     this.selected = null
+    this.focusGuard?.stop()
+    this.focusGuard = undefined
     if (this.attached) {
       // An attached browser belongs to the human: closing only DISCONNECTS.
       const browser = this.attachedBrowser

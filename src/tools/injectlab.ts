@@ -143,6 +143,7 @@ export interface InjectEnv {
   fixtures: FixtureStore
   budget?: BudgetGuard
   sessionFor: (owner: string) => import('../browser/session.js').BrowserSession
+  scope?: import('../scope.js').ScopeGuard
 }
 
 export function registerInjectTools(server: ToolRegistrar, store: InjectStore, env: InjectEnv, artifactsDir: string): void {
@@ -194,7 +195,7 @@ export function registerInjectTools(server: ToolRegistrar, store: InjectStore, e
         // Session gate BEFORE each variant (smoke round 3: ~20-minute Google
         // windows; a dead session must never count as a refusal).
         if (gate !== undefined) {
-          const proof = await verifySessionOnce(env.config, env.sessionFor, owner, gate).catch((error: unknown) => ({ ok: false, reason: `verify failed: ${error instanceof Error ? error.message : String(error)}`, owner }))
+          const proof = await verifySessionOnce(env.config, env.sessionFor, owner, gate, env.scope).catch((error: unknown) => ({ ok: false, reason: `verify failed: ${error instanceof Error ? error.message : String(error)}`, owner }))
           if (!proof.ok) {
             store.record(campaign_id, { variant: variant.id, framing: variant.framing, status: 'skipped_session', note: proof.reason }, 'paused_session')
             return textResult([

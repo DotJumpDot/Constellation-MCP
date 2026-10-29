@@ -9,7 +9,7 @@ import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
 import { SHARED_OWNER, canTouchTab, loadOwnerLabels, type BrowserSession } from './session.js'
-import { cookieMatchesAnyDomain, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
+import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
 import { appendChainEntry } from '../tools/evidence.js'
@@ -127,12 +127,15 @@ function locatorFor(root: Page | Frame, selector?: string, element?: string, nam
   return nth === undefined ? role : role.nth(nth)
 }
 
-/** P2-12: warn at export when the session's profile is DBSC-bound. */
-function dbscWarningForProfile(userDir: string): string[] {
+/** P2-12: warn at export when the session's profile is DBSC-bound. Run-9 §4:
+ *  the warning names the exact signal and, when a domains filter was passed,
+ *  is scoped per-origin (a whole-profile marker with no matching bound origin
+ *  is a NOTE, not a doom warning — the run-9 false positive blocked a legit
+ *  platform handoff). */
+function dbscWarningForProfile(userDir: string, domains?: string[]): string[] {
   try {
-    if (detectDeviceBoundSessions(userDir, 'Default') || detectDeviceBoundSessions(path.join(userDir, 'Default'), 'Default')) {
-      return ['WARNING: this profile carries Device Bound Sessions — replayed cookies WILL be revoked server-side within minutes. Use browser_attach for this identity.']
-    }
+    if (detectDeviceBoundSessions(userDir, 'Default')) return dbscWarningLines(userDir, 'Default', domains)
+    if (detectDeviceBoundSessions(path.join(userDir, 'Default'), 'Default')) return dbscWarningLines(path.join(userDir, 'Default'), 'Default', domains)
   } catch { /* not a profile dir / not windows-shaped: no warning */ }
   return []
 }
@@ -282,6 +285,23 @@ async function afterActionResult(page: Page): Promise<string> {
   return `Now at: ${await pageOverview(page)}\n\n${truncate(await snapshotOf(page), 120_000)}`
 }
 
+/** Run-9 §2: the REQUESTED url is scope-asserted before goto, but the BROWSER
+ *  follows server redirects itself — the chain can cross into an out-of-scope
+ *  host (the live case: an in-scope /admin page 302-ing into
+ *  admin.atlassian.com). Pre-checking every hop needs request interception, so
+ *  the guard works post-hoc here: when the landed URL left the scope, record
+ *  the crossing as a DENY line in the scope audit, clear the tab to
+ *  about:blank, and fail closed so no content from the far host enters the
+ *  transcript. The lane sees exactly where the boundary was crossed. */
+async function assertLandedInScope(env: ToolEnv, page: Page, who: string, requestedUrl: string, tool: string): Promise<void> {
+  const landed = page.url()
+  const decision = env.scope.check(landed, who)
+  if (decision.allowed) return
+  env.scope.audit(landed, who, `${tool}(redirect)`, decision)
+  await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5_000 }).catch(() => undefined)
+  throw new Error(`SCOPE DENIED on redirect: ${tool} to ${requestedUrl} landed on ${landed}, which is out of scope — ${decision.reason}. The tab was cleared to about:blank; if that host is genuinely part of the engagement, ask the Lead to widen the scope (scope_set).`)
+}
+
 export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
@@ -303,6 +323,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       env.scope.assert(url, who, 'browser_navigate')
       env.budget.spend(who)
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
+      await assertLandedInScope(env, page, who, url, 'browser_navigate')
       return textResult(await afterActionResult(page))
     })
 
@@ -573,7 +594,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (action === 'new') {
         if (url !== undefined) env.scope.assert(url, who, 'browser_tabs(new)')
         env.budget.spend(who)
-        const { meta } = await session.newTab(who, url)
+        const { meta, page } = await session.newTab(who, url)
+        if (url !== undefined) await assertLandedInScope(env, page, who, url, 'browser_tabs(new)')
         const snap = await session.snapshot()
         const listed = snap.tabs.find(x => x.id === meta.id)
         // `tab:` arguments are the INDEX, not the id — the smoke run passed
@@ -607,7 +629,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const { session, owner: who } = sessionOf(env, owner)
       if (url !== undefined) env.scope.assert(url, who, 'tab_open')
       env.budget.spend(who)
-      const { meta } = await session.newTab(who, url, purpose)
+      const { meta, page } = await session.newTab(who, url, purpose)
+      if (url !== undefined) await assertLandedInScope(env, page, who, url, 'tab_open')
       meta.leasedBy = who
       meta.leasedAt = Date.now()
       const snap = await session.snapshot()
@@ -847,7 +870,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       }
       const warned = session.userDir !== undefined && session.userDir.startsWith('(attached)')
         ? []
-        : dbscWarningForProfile(session.userDir)
+        : dbscWarningForProfile(session.userDir, wantedDomains)
       const id = `ch-${randomBytes(4).toString('hex')}`
       cookieHandoffs.set(id, { id, fromOwner: who, domain: wantedDomains?.join(',') ?? '(all)', expiresAt: Date.now() + HANDOFF_TTL_MS, cookies })
       return textResult([

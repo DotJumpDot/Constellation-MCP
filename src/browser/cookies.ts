@@ -162,6 +162,51 @@ export function detectDeviceBoundSessions(stateDir: string, profileLabel: string
   return fs.existsSync(path.join(profileDir, 'Network', 'Device Bound Sessions'))
 }
 
+/** Per-origin DBSC probe (run-9 §4: the whole-profile warning fired on a plain
+ *  bugcrowd.com export and cost the lanes their platform session). Chrome's
+ *  Device Bound Sessions store is a LevelDB whose keys carry the session's
+ *  origin — a raw byte scan of the store's files for the requested domain
+ *  answers "is THIS domain bound" without a LevelDB reader. Compressed blocks
+ *  can hide a match, so a MISS is a hint, not proof; a hit is decisive.
+ *  Returns matched domains, or null when the store exists but cannot be read
+ *  (locked/empty) — the caller must word that as inconclusive. */
+export function deviceBoundSessionsFor(stateDir: string, profileLabel: string, domains: readonly string[]): string[] | null {
+  const profileDir = profileLabel === '(direct)' ? stateDir : path.join(stateDir, profileLabel)
+  const store = path.join(profileDir, 'Network', 'Device Bound Sessions')
+  try {
+    const blob = fs.readdirSync(store)
+      .filter(f => { try { return !fs.statSync(path.join(store, f)).isDirectory() } catch { return false } })
+      .map(f => fs.readFileSync(path.join(store, f)).toString('latin1'))
+      .join('\n')
+    const found = new Set<string>()
+    for (const domain of domains) {
+      const host = cookieHost(domain.toLowerCase())
+      if (host !== '' && blob.includes(host)) found.add(domain)
+    }
+    return [...found]
+  } catch {
+    return null
+  }
+}
+
+/** Warning lines for a DBSC-marked profile, naming the exact signal and
+ *  scoped to the domains the caller actually asked for (run-9 §4 — "the
+ *  warning fired" must never again read as "the handoff is doomed" when the
+ *  bound origin is unrelated to the request). */
+export function dbscWarningLines(stateDir: string, profileLabel: string, domains: readonly string[] | undefined): string[] {
+  if (domains === undefined || domains.length === 0) {
+    return ['WARNING (signal: whole-profile "Network/Device Bound Sessions" marker; no domain filter to narrow it): some session in this profile is device-bound and its replay WILL be revoked server-side (Chrome 156+) — use browser_attach for a bound identity']
+  }
+  const matched = deviceBoundSessionsFor(stateDir, profileLabel, domains)
+  if (matched === null) {
+    return [`WARNING (signal: whole-profile "Network/Device Bound Sessions" marker; per-origin scan of the store was INCONCLUSIVE — unreadable): treat [${domains.join(', ')}] as possibly bound; if an imported session dies within minutes, switch to browser_attach`]
+  }
+  if (matched.length > 0) {
+    return [`WARNING (signal: per-origin scan of the Device Bound Sessions store MATCHED [${matched.join(', ')}]): replayed cookies for ${matched.join(', ')} WILL be revoked server-side within minutes (Chrome 156+) — use browser_attach for this identity`]
+  }
+  return [`NOTE (signal: whole-profile "Network/Device Bound Sessions" marker, but the per-origin store scan found NO match for [${domains.join(', ')}]): these cookies are unlikely to be device-bound — proceed with the handoff; if the imported session still dies within minutes, treat it as DBSC and use browser_attach`]
+}
+
 function mapSameSite(samesite: number | null | undefined, secure: boolean): ImportedCookie['sameSite'] {
   if (samesite === 1) return 'Lax'
   if (samesite === 2) return 'Strict'
@@ -179,7 +224,7 @@ export async function readProfileCookies(profileDir: string, domainFilter?: stri
   const warnings: string[] = []
   const deviceBoundSessions = detectDeviceBoundSessions(layout.stateDir, layout.profileLabel)
   if (deviceBoundSessions) {
-    warnings.push('Device Bound Sessions detected in this profile: exported cookie replay WILL be revoked server-side (Chrome 156+ binds the session to the browser instance) — use browser_attach for this identity')
+    warnings.push(...dbscWarningLines(layout.stateDir, layout.profileLabel, domainFilter))
   }
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'constellation-cookies-'))
   let cookies: ImportedCookie[] = []

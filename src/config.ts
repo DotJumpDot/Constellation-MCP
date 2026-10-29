@@ -38,6 +38,11 @@ export interface ConstellationConfig {
    *  of its monitor's work area with only the tab strip peeking (round-8 §5,
    *  the human's measured preference — top = availTop + availH − peek). */
   windowPeekPx: number
+  /** true (default; CONSTELLATION_FOCUS_GUARD=0 disables): arm the post-spawn
+   *  focus watchdog on every launch — when the freshly spawned Chrome steals
+   *  the foreground (it always does, at window creation), hand it back via
+   *  AttachThreadInput (run-9 focus advice §4, verified by the human). */
+  focusGuard: boolean
 }
 
 function env(name: string): string | undefined {
@@ -72,6 +77,7 @@ export function defaultConfig(): ConstellationConfig {
     windowPosition: env('WINDOW_POSITION'),
     startMinimized: env('START_MINIMIZED') === '1' || env('START_MINIMIZED') === 'true',
     windowPeekPx: int('WINDOW_PEEK_PX', 36),
+    focusGuard: env('FOCUS_GUARD') !== '0' && env('FOCUS_GUARD') !== 'false',
   }
 }
 

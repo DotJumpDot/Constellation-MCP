@@ -1087,3 +1087,277 @@ test('window parking: peek clamps into the clickable band (round-8 §5)', async 
   assert.equal(clampWindowPeek(Number.NaN), 36, 'a bad config value falls back to the default')
   assert.equal(clampWindowPeek(44.7), 45, 'rounded to whole pixels')
 })
+
+test('redirect hops: redirectHop decisions (run-9 §2)', async () => {
+  const { redirectHop } = await import('../src/tools/http.js')
+  assert.equal(redirectHop(200, '/next', 'https://a.example/x'), undefined, 'not a redirect')
+  assert.equal(redirectHop(302, undefined, 'https://a.example/x'), undefined, 'no location header')
+  assert.deepEqual(
+    redirectHop(302, '/next', 'https://a.example/x'),
+    { url: 'https://a.example/next', get: true },
+    'relative Location resolves against the current url',
+  )
+  assert.deepEqual(
+    redirectHop(301, 'https://b.example/y', 'https://a.example/x'),
+    { url: 'https://b.example/y', get: true },
+    'absolute Location wins',
+  )
+  assert.deepEqual(
+    redirectHop(303, '/next', 'https://a.example/x'),
+    { url: 'https://a.example/next', get: true },
+    '303 always becomes GET',
+  )
+  assert.deepEqual(
+    redirectHop(307, '/next', 'https://a.example/x'),
+    { url: 'https://a.example/next', get: false },
+    '307 keeps the method and body',
+  )
+  assert.deepEqual(
+    redirectHop(308, '/next', 'https://a.example/x'),
+    { url: 'https://a.example/next', get: false },
+    '308 keeps the method and body',
+  )
+  assert.equal(redirectHop(302, 'http://[::1', 'https://a.example/x'), undefined, 'unparseable Location ends the chain')
+})
+
+test('redirect hops: an out-of-scope hop is an audited DENY, never a quiet follow (run-9 §2)', async () => {
+  const { JarStore, performRequest } = await import('../src/tools/http.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redirdeny-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  guard.set({ engagement: 'acme', in_scope: ['127.0.0.1'], out_scope: [] }, undefined)
+  const jars = new JarStore({ rootDir: dir } as never)
+  const server = http.createServer((req, res) => {
+    if (req.url === '/admin/connected-apps') {
+      res.writeHead(302, { location: 'https://admin.atlassian.com/s/site-1/apps' })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('landed on ' + req.url)
+  })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    const port = (server.address() as { port: number }).port
+    await assert.rejects(
+      () => performRequest(jars, guard, {
+        url: `http://127.0.0.1:${port}/admin/connected-apps`,
+        redirect: 'follow',
+      } as never, 'market-a', 'http_request'),
+      /SCOPE DENIED[\s\S]*admin\.atlassian\.com/,
+    )
+    const audit = guard.auditLines(10, 'market-a')
+    const deny = audit.find(l => !l.allowed)
+    assert.ok(deny !== undefined, 'the hop crossing is in the audit log')
+    assert.equal(deny.tool, 'http_request(redirect hop 1)')
+    assert.equal(deny.host, 'admin.atlassian.com')
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('redirect hops: an in-scope chain follows and reports hop count; cross-host drops Authorization (run-9 §2)', async () => {
+  const { JarStore, performRequest } = await import('../src/tools/http.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redirfollow-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  const seenAuth: Array<string | undefined> = []
+  let port = 0
+  const server = http.createServer((req, res) => {
+    if (req.url === '/start') {
+      res.writeHead(302, { location: `http://localhost:${port}/end` })
+      res.end()
+      return
+    }
+    seenAuth.push(req.headers['authorization'])
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('done')
+  })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    port = (server.address() as { port: number }).port
+    guard.set({ engagement: 'acme', in_scope: ['127.0.0.1', 'localhost'], out_scope: [] }, undefined)
+    const result = await performRequest(jars, guard, {
+      url: `http://127.0.0.1:${port}/start`,
+      redirect: 'follow',
+      auth: { type: 'bearer', token: 'tok123' },
+    } as never, 'scout', 'http_request')
+    assert.equal(result.status, 200)
+    assert.equal(result.redirect_hops, 1)
+    assert.match(result.url_final, /\/end$/)
+    assert.equal(seenAuth[0], undefined, 'the caller Authorization never rides a CROSS-HOST hop (127.0.0.1 -> localhost)')
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('redirect hops: same-host hop keeps the Authorization header (run-9 §2)', async () => {
+  const { JarStore, performRequest } = await import('../src/tools/http.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redirkeep-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  const seenAuth: Array<string | undefined> = []
+  const server = http.createServer((req, res) => {
+    if (req.url === '/start') {
+      res.writeHead(302, { location: '/end' })
+      res.end()
+      return
+    }
+    seenAuth.push(req.headers['authorization'])
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('done')
+  })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    const port = (server.address() as { port: number }).port
+    guard.set({ engagement: 'acme', in_scope: ['127.0.0.1'], out_scope: [] }, undefined)
+    const result = await performRequest(jars, guard, {
+      url: `http://127.0.0.1:${port}/start`,
+      redirect: 'follow',
+      auth: { type: 'bearer', token: 'tok123' },
+    } as never, 'scout', 'http_request')
+    assert.equal(result.redirect_hops, 1)
+    assert.equal(seenAuth[0], 'Bearer tok123', 'same-host hop keeps the credential')
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('redirect hops: browser transport guards hops the same way (run-9 §2)', async () => {
+  const { performBrowserRequest } = await import('../src/tools/http.js')
+  const asserted: Array<{ url: string; tool: string }> = []
+  const client = {
+    fetch: async () => ({
+      status: () => 302,
+      statusText: () => 'Found',
+      url: () => 'https://in-scope.example/admin',
+      headers: () => ({ location: 'https://admin.atlassian.com/s/site-1/apps' }),
+      headersArray: () => [] as Array<{ name: string; value: string }>,
+      text: async () => '',
+      body: async () => Buffer.alloc(0),
+    }),
+  }
+  const scope = {
+    assert: (url: string, _owner: string, tool: string) => {
+      asserted.push({ url, tool })
+      if (url.includes('atlassian.com')) throw new Error(`SCOPE DENIED: ${url} is not in the declared scope`)
+      return { allowed: true, reason: '' }
+    },
+  }
+  await assert.rejects(
+    () => performBrowserRequest(client as never, scope as never, {
+      url: 'https://in-scope.example/admin', redirect: 'follow',
+    } as never, 'market-a', 'http_request'),
+    /SCOPE DENIED[\s\S]*atlassian/,
+  )
+  assert.deepEqual(
+    asserted.map(a => a.tool),
+    ['http_request', 'http_request(redirect hop 1)'],
+    'the hop re-entered the guard before any follow',
+  )
+})
+
+test('http_download: follows a scoped redirect chain and names the file from the FINAL url (run-9 §2/§3)', async () => {
+  const { JarStore, performDownload } = await import('../src/tools/http.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dlredir-'))
+  const guard = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+  const jars = new JarStore({ rootDir: dir } as never)
+  const config = { rootDir: dir, outputDir: path.join(dir, 'out') } as never
+  const blob = 'PDF-BYTES-HERE'
+  const server = http.createServer((req, res) => {
+    if (req.url === '/attachments/123') {
+      res.writeHead(302, { location: '/s3-bucket/evidence-report.pdf?sig=abc' })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment' })
+    res.end(blob)
+  })
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+  try {
+    const port = (server.address() as { port: number }).port
+    const result = await performDownload(jars, guard, config, {
+      url: `http://127.0.0.1:${port}/attachments/123`,
+    } as never, 'scout', undefined, undefined)
+    assert.equal(result.status, 200)
+    assert.equal(result.redirect_hops, 1)
+    assert.match(result.url_final, /\/s3-bucket\/evidence-report\.pdf/)
+    assert.ok(result.file.includes(path.join('scout', 'downloads', 'evidence-report.pdf')), `name from the FINAL url path: ${result.file}`)
+    assert.equal(fs.readFileSync(result.file, 'utf8'), blob)
+    assert.equal(result.contentType, 'application/pdf')
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('http_request: binary bodies never preview — status/sha only (run-9 §3)', async () => {
+  const { isBinaryContentType, formatResult } = await import('../src/tools/http.js')
+  assert.equal(isBinaryContentType('application/pdf'), true)
+  assert.equal(isBinaryContentType('application/pdf; charset=binary'), true)
+  assert.equal(isBinaryContentType('image/png'), true)
+  assert.equal(isBinaryContentType('application/octet-stream'), true)
+  assert.equal(isBinaryContentType('application/zip'), true)
+  assert.equal(isBinaryContentType('text/html; charset=utf-8'), false)
+  assert.equal(isBinaryContentType('application/json'), false)
+  assert.equal(isBinaryContentType('application/xml'), false)
+  assert.equal(isBinaryContentType(undefined), false)
+  const rendered = formatResult({
+    status: 200, statusText: 'OK', url_final: 'https://x.example/file.pdf',
+    headers: { 'content-type': 'application/pdf' },
+    body: '%PDF-1.4 binary mojibake '.repeat(2000),
+    body_sha256: 'abc123', timing_ms: 12, set_cookies: 0, redirect_hops: 1,
+  })
+  assert.match(rendered, /binary application\/pdf — preview suppressed/)
+  assert.doesNotMatch(rendered, /%PDF-1\.4/, 'no binary bytes in the transcript')
+  assert.match(rendered, /1 redirect hop\(s\) followed, each scope-checked/)
+  assert.match(rendered, /http_extract for values or http_download to save the file/)
+})
+
+test('DBSC warnings: the signal is named and scoped per-domain (run-9 §4)', async () => {
+  const { dbscWarningLines, deviceBoundSessionsFor, detectDeviceBoundSessions } = await import('../src/browser/cookies.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbsc-'))
+  try {
+    const stateDir = path.join(dir, 'user-data')
+    const profile = path.join(stateDir, 'Default')
+    fs.mkdirSync(path.join(profile, 'Network', 'Device Bound Sessions'), { recursive: true })
+    fs.writeFileSync(path.join(profile, 'Network', 'Device Bound Sessions', '000003.log'),
+      Buffer.from('\x00\x01https://bound.example\x00somedevicekey', 'latin1'))
+    assert.equal(detectDeviceBoundSessions(stateDir, 'Default'), true)
+    assert.deepEqual(deviceBoundSessionsFor(stateDir, 'Default', ['bound.example', 'plain.example']), ['bound.example'])
+    const hit = dbscWarningLines(stateDir, 'Default', ['bound.example'])
+    assert.match(hit[0]!, /per-origin scan of the Device Bound Sessions store MATCHED \[bound\.example\]/)
+    const clear = dbscWarningLines(stateDir, 'Default', ['plain.example'])
+    assert.match(clear[0]!, /NO match for \[plain\.example\]/, 'a whole-profile marker without a matching bound origin is a NOTE, not doom')
+    assert.match(clear[0]!, /proceed with the handoff/)
+    const noFilter = dbscWarningLines(stateDir, 'Default', undefined)
+    assert.match(noFilter[0]!, /no domain filter to narrow it/)
+    // store unreadable (a FILE where the directory belongs) -> inconclusive
+    fs.rmSync(path.join(profile, 'Network', 'Device Bound Sessions'), { recursive: true, force: true })
+    fs.writeFileSync(path.join(profile, 'Network', 'Device Bound Sessions'), 'not a dir')
+    const inconclusive = dbscWarningLines(stateDir, 'Default', ['plain.example'])
+    assert.match(inconclusive[0]!, /INCONCLUSIVE/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('focus guard: script assembly + config switch (run-9 focus advice)', async () => {
+  const { buildFocusGuardScript, focusGuardProcessName } = await import('../src/browser/focus.js')
+  assert.equal(focusGuardProcessName('chrome'), 'chrome.exe')
+  assert.equal(focusGuardProcessName('msedge'), 'msedge.exe')
+  assert.equal(focusGuardProcessName(undefined), 'chrome.exe')
+  const userDir = 'C:\\Profiles\\own er\\data'
+  const script = buildFocusGuardScript(userDir, 'chrome', 10, 'C:\\logs\\fg.log')
+  assert.ok(script.includes("'C:\\Profiles\\own er\\data'"), 'the user-data-dir needle keeps its RAW backslashes (PS single quotes are literal)')
+  assert.ok(!script.includes('__SECS__') && !script.includes('__UDD__') && !script.includes('__PROCNAME__') && !script.includes('__LOGFILE__'))
+  assert.ok(script.includes('AttachThreadInput'), 'restore goes through thread-input attachment')
+  assert.ok(script.includes('SetForegroundWindow'))
+  assert.ok(script.includes('IndexOf($udd, [StringComparison]::OrdinalIgnoreCase)'), 'pid match is by command line, never -like')
+  assert.ok(script.includes('$counters -ge 2'), 'drops out after two counters so a deliberate human focus is never fought')
+  assert.ok(script.includes('Start-Sleep -Milliseconds 40'), 'polls at ~40ms through the spawn')
+  const config = defaultConfig()
+  assert.equal(config.focusGuard, true, 'the watchdog is armed by default')
+})

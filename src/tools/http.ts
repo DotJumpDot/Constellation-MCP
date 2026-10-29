@@ -36,6 +36,8 @@ export interface BrowserRequestClient {
     headers(): Record<string, string>
     headersArray(): Array<{ name: string; value: string }>
     text(): Promise<string>
+    /** Binary-safe body (APIResponse.body — text() would corrupt bytes). */
+    body(): Promise<Buffer>
   }>
 }
 
@@ -112,6 +114,50 @@ export interface RequestResult {
   body_sha256: string
   timing_ms: number
   set_cookies: number
+  /** Redirects followed (each hop scope-checked — run-9 §2). Absent = 0. */
+  redirect_hops?: number
+}
+
+/** Follow cap for `redirect: 'follow'` (matches the previous fetch cap). */
+export const MAX_REDIRECT_HOPS = 20
+
+/** One redirect hop decision (run-9 §2): the next absolute URL for a 3xx
+ *  response, or undefined when the response terminates the chain. Pure and
+ *  unit-tested — every transport uses it so hop semantics stay identical.
+ *  303 always becomes GET; 301/302 demote non-GET to GET (the historical
+ *  behavior fetch and Playwright implement); 307/308 keep method and body. */
+export function redirectHop(
+  status: number,
+  location: string | undefined,
+  currentUrl: string,
+): { url: string; get: boolean } | undefined {
+  if (location === undefined || location === '') return undefined
+  if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) return undefined
+  try {
+    return { url: new URL(location, currentUrl).toString(), get: status !== 307 && status !== 308 }
+  } catch {
+    return undefined
+  }
+}
+
+/** `host[:port]` of a URL for cross-host redirect checks. */
+function hostOf(raw: string): string {
+  try { return new URL(raw).host } catch { return raw }
+}
+
+/** Strip hop-sensitive headers for a CROSS-HOST redirect: a cookie or an
+ *  Authorization value named for one host must never ride into another
+ *  (run-9 §2 hardening — browsers strip Authorization cross-origin; we do
+ *  the same for every transport, jar and browser alike). */
+function crossHostHopHeaders(headers: Record<string, string>, toUrl: string, fromUrl: string): Record<string, string> {
+  const next = { ...headers }
+  delete next['cookie']
+  delete next['Cookie']
+  if (hostOf(toUrl) !== hostOf(fromUrl)) {
+    delete next['authorization']
+    delete next['Authorization']
+  }
+  return next
 }
 
 export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: RequestSpec, owner: string, tool: string, budget?: import('./budget.js').BudgetGuard): Promise<RequestResult> {
@@ -139,19 +185,54 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
   applyAuth(headers, spec.auth)
 
   const started = Date.now()
-  const response = await fetch(spec.url, {
-    method: spec.method ?? 'GET',
-    headers,
-    body,
-    redirect: spec.redirect ?? 'manual',
+  // Redirects are followed ONE hop at a time (run-9 §2): the guard used to
+  // check only the requested URL, so `redirect: 'follow'` quietly crossed
+  // into whatever host the chain led to. Each hop re-enters scope.assert —
+  // an out-of-scope target becomes an audited DENY and the request stops
+  // there, never follows. Cookies are per-host: each hop's Set-Cookie lands
+  // in the jar against the hop URL and the next hop's cookie header is
+  // rebuilt for ITS url (a caller-set cookie was meant for the URL they
+  // named, not some far host).
+  let currentUrl = spec.url
+  let currentMethod = spec.method ?? 'GET'
+  let currentBody = body
+  let currentHeaders = headers
+  let response = await fetch(currentUrl, {
+    method: currentMethod,
+    headers: currentHeaders,
+    body: currentBody,
+    redirect: 'manual',
     signal: AbortSignal.timeout(spec.timeout_ms ?? 30_000),
   })
+  let hops = 0
+  while (spec.redirect === 'follow') {
+    const hop = redirectHop(response.status, response.headers.get('location') ?? undefined, currentUrl)
+    if (hop === undefined || hops >= MAX_REDIRECT_HOPS) break
+    scope.assert(hop.url, owner, `${tool}(redirect hop ${hops + 1})`)
+    for (const c of response.headers.getSetCookie?.() ?? []) {
+      try { jar.setCookieSync(c, currentUrl) } catch { /* skip malformed */ }
+    }
+    void response.body?.cancel().catch(() => undefined)
+    hops++
+    currentUrl = hop.url
+    currentHeaders = crossHostHopHeaders(headers, currentUrl, response.url ?? spec.url)
+    if (hop.get) { currentMethod = 'GET'; currentBody = undefined }
+    const hopCookie = jar.getCookieStringSync(currentUrl)
+    if (hopCookie !== '') currentHeaders['cookie'] = hopCookie
+    response = await fetch(currentUrl, {
+      method: currentMethod,
+      headers: currentHeaders,
+      body: currentBody,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(spec.timeout_ms ?? 30_000),
+    })
+  }
   const text = await response.text()
   const timing = Date.now() - started
 
   const setCookies = response.headers.getSetCookie?.() ?? []
   for (const c of setCookies) {
-    try { jar.setCookieSync(c, response.url) } catch { /* skip malformed */ }
+    try { jar.setCookieSync(c, currentUrl) } catch { /* skip malformed */ }
   }
   jars.persist(spec.jar ?? 'default', jar)
 
@@ -170,6 +251,7 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
     body_sha256: crypto.createHash('sha256').update(text).digest('hex'),
     timing_ms: timing,
     set_cookies: setCookies.length,
+    ...(hops > 0 ? { redirect_hops: hops } : {}),
   }
 }
 
@@ -226,13 +308,36 @@ export async function performBrowserRequest(
   applyAuth(headers, spec.auth)
 
   const started = Date.now()
-  const response = await client.fetch(spec.url, {
-    method: spec.method ?? 'GET',
+  // Same per-hop guard as the jar transport (run-9 §2): maxRedirects 0 +
+  // manual hops, each one scope-asserted. Playwright's context manages the
+  // cookie state itself on every hop, so no jar work happens here.
+  let currentUrl = spec.url
+  let currentMethod = spec.method ?? 'GET'
+  let currentData = body
+  let response = await client.fetch(currentUrl, {
+    method: currentMethod,
     headers,
-    ...(body !== undefined ? { data: body } : {}),
-    maxRedirects: spec.redirect === 'follow' ? 20 : 0,
+    ...(currentData !== undefined ? { data: currentData } : {}),
+    maxRedirects: 0,
     timeout: spec.timeout_ms ?? 30_000,
   })
+  let hops = 0
+  while (spec.redirect === 'follow') {
+    const location = response.headers().location ?? response.headers().Location
+    const hop = redirectHop(response.status(), location, currentUrl)
+    if (hop === undefined || hops >= MAX_REDIRECT_HOPS) break
+    scope.assert(hop.url, owner, `${tool}(redirect hop ${hops + 1})`)
+    hops++
+    currentUrl = hop.url
+    if (hop.get) { currentMethod = 'GET'; currentData = undefined }
+    response = await client.fetch(currentUrl, {
+      method: currentMethod,
+      headers,
+      ...(currentData !== undefined ? { data: currentData } : {}),
+      maxRedirects: 0,
+      timeout: spec.timeout_ms ?? 30_000,
+    })
+  }
   const text = await response.text()
   const timing = Date.now() - started
   const setCookies = response.headersArray().filter(h => h.name.toLowerCase() === 'set-cookie').length
@@ -247,6 +352,7 @@ export async function performBrowserRequest(
     body_sha256: crypto.createHash('sha256').update(text).digest('hex'),
     timing_ms: timing,
     set_cookies: setCookies,
+    ...(hops > 0 ? { redirect_hops: hops } : {}),
   }
 }
 
@@ -322,13 +428,28 @@ function isJsonObject(v: unknown): boolean {
   return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
-function formatResult(r: RequestResult): string {
+/** Content types whose bytes are not human-readable in a transcript — a
+ *  preview of them is mojibake that floods context (run-9 §3: a 251 KB PDF
+ *  body printed through http_request {browser:...}). Text-ish types (text/*,
+ *  json, xml, js, forms, yaml) always preview. */
+export function isBinaryContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined || contentType === '') return false
+  const ct = contentType.toLowerCase().split(';')[0]!.trim()
+  if (ct.startsWith('text/')) return false
+  if (/(json|xml|javascript|ecmascript|xhtml|urlencoded|yaml|csv)/.test(ct)) return false
+  return true
+}
+
+export function formatResult(r: RequestResult): string {
   const headerLines = Object.entries(r.headers).map(([k, v]) => `  ${k}: ${v}`).join('\n')
+  const binary = isBinaryContentType(r.headers['content-type'])
   return [
-    `HTTP ${r.status} ${r.statusText} (${r.timing_ms} ms) — final URL: ${r.url_final}`,
+    `HTTP ${r.status} ${r.statusText} (${r.timing_ms} ms) — final URL: ${r.url_final}${r.redirect_hops !== undefined ? ` (${r.redirect_hops} redirect hop(s) followed, each scope-checked)` : ''}`,
     `body sha256: ${r.body_sha256}${r.set_cookies > 0 ? ` — ${r.set_cookies} Set-Cookie stored in jar` : ''}`,
     `headers:\n${headerLines}`,
-    `body:\n${r.body}`,
+    binary
+      ? `body: (binary ${r.headers['content-type']} — preview suppressed; the full bytes are in the capture ring, use http_extract for values or http_download to save the file)`
+      : `body:\n${r.body}`,
   ].join('\n\n')
 }
 
@@ -338,7 +459,7 @@ const REQUEST_SHAPE: z.ZodRawShape = {
   headers: z.record(z.string()).optional().describe('Header map; values may use $secret:NAME'),
   body: z.unknown().optional().describe('Body; object → JSON. Values may use $secret:NAME'),
   jar: z.string().optional().describe('Cookie jar id (persisted per id); default "default"'),
-  redirect: z.enum(['follow', 'manual']).optional(),
+  redirect: z.enum(['follow', 'manual']).optional().describe('follow: every redirect hop re-enters the scope guard (run-9 §2 — an out-of-scope hop is an audited DENY, never a quiet follow). manual: the 3xx comes back as-is.'),
   timeout_ms: z.number().int().optional(),
   max_body_bytes: z.number().int().optional().describe('Body preview cap (default 20000; sha256 always covers the full body)'),
   auth: z.object({
@@ -362,7 +483,12 @@ export async function performDownload(
   destName: string | undefined,
   sha256Expected: string | undefined,
   budget?: import('./budget.js').BudgetGuard,
-): Promise<{ file: string; status: number; bytes: number; sha256: string; contentType: string }> {
+  /** Live-browser transport (run-9 §3): download endpoints that need the
+   *  owner's session cookies and answer with a Content-Disposition redirect
+   *  cannot be fetched in-page (fetch blocks the cross-origin download) —
+   *  pass the owner's context.request client here instead of a jar. */
+  client?: BrowserRequestClient,
+): Promise<{ file: string; status: number; bytes: number; sha256: string; contentType: string; url_final: string; redirect_hops?: number }> {
   let parsedUrl: URL
   try {
     parsedUrl = new URL(spec.url)
@@ -377,24 +503,78 @@ export async function performDownload(
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
   const headers: Record<string, string> = { ...(headersInterp as Record<string, string>) }
-  const cookie = jar.getCookieStringSync(spec.url)
-  if (cookie !== '') headers['cookie'] ??= cookie
-  applyAuth(headers, spec.auth)
-  const response = await fetch(spec.url, {
-    method: 'GET',
-    headers,
-    redirect: spec.redirect ?? 'follow',
-    signal: AbortSignal.timeout(spec.timeout_ms ?? 60_000),
-  })
-  const buffer = Buffer.from(await response.arrayBuffer())
-  for (const c of response.headers.getSetCookie?.() ?? []) {
-    try { jar.setCookieSync(c, response.url) } catch { /* skip malformed */ }
+  if (client === undefined) {
+    const cookie = jar.getCookieStringSync(spec.url)
+    if (cookie !== '') headers['cookie'] ??= cookie
   }
-  jars.persist(spec.jar ?? 'default', jar)
+  applyAuth(headers, spec.auth)
+
+  // One manual-redirect request through whichever transport is active; the
+  // shapes differ enough that a tiny adapter keeps the hop loop below single.
+  const fetchOne = async (url: string, requestHeaders: Record<string, string>) => {
+    if (client !== undefined) {
+      const r = await client.fetch(url, { method: 'GET', headers: requestHeaders, maxRedirects: 0, timeout: spec.timeout_ms ?? 60_000 })
+      return {
+        status: r.status(),
+        url: r.url(),
+        header: (name: string) => r.headers()[name.toLowerCase()] ?? null,
+        setCookies: () => r.headersArray().filter(h => h.name.toLowerCase() === 'set-cookie').map(h => h.value),
+        arrayBuffer: () => r.body(),
+      }
+    }
+    const r = await fetch(url, { method: 'GET', headers: requestHeaders, redirect: 'manual', signal: AbortSignal.timeout(spec.timeout_ms ?? 60_000) })
+    return {
+      status: r.status,
+      url: r.url,
+      header: (name: string) => r.headers.get(name),
+      setCookies: () => r.headers.getSetCookie?.() ?? [],
+      arrayBuffer: async () => Buffer.from(await r.arrayBuffer()),
+    }
+  }
+
+  // Download default is follow — and every hop re-enters the guard (run-9 §2),
+  // so the S3/CDN leg of an attachment redirect is a scope decision, not a
+  // quiet follow. On a cross-host hop the caller's Authorization header is
+  // dropped too (a credential named for one host never rides into another).
+  let currentUrl = spec.url
+  let currentHeaders = headers
+  let response = await fetchOne(currentUrl, currentHeaders)
+  let hops = 0
+  while (spec.redirect !== 'manual') {
+    const hop = redirectHop(response.status, response.header('location') ?? response.header('Location') ?? undefined, currentUrl)
+    if (hop === undefined || hops >= MAX_REDIRECT_HOPS) break
+    scope.assert(hop.url, owner, `http_download(redirect hop ${hops + 1})`)
+    if (client === undefined) {
+      for (const c of response.setCookies()) {
+        try { jar.setCookieSync(c, currentUrl) } catch { /* skip malformed */ }
+      }
+    }
+    hops++
+    const fromUrl = currentUrl
+    currentUrl = hop.url
+    currentHeaders = crossHostHopHeaders(headers, currentUrl, fromUrl)
+    if (client === undefined) {
+      const hopCookie = jar.getCookieStringSync(currentUrl)
+      if (hopCookie !== '') currentHeaders['cookie'] = hopCookie
+    }
+    response = await fetchOne(currentUrl, currentHeaders)
+  }
+  const buffer = await response.arrayBuffer()
+  if (client === undefined) {
+    for (const c of response.setCookies()) {
+      try { jar.setCookieSync(c, response.url) } catch { /* skip malformed */ }
+    }
+    jars.persist(spec.jar ?? 'default', jar)
+  }
   const sha256 = crypto.createHash('sha256').update(buffer).digest('hex')
   const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '') || 'download'
   const ownerDir = path.join(config.outputDir, safe(owner), 'downloads')
-  const fromUrl = decodeURIComponent(parsedUrl.pathname.split('/').filter(Boolean).pop() ?? '')
+  // Name from the FINAL url (after redirects) — the S3 basename is the real
+  // artifact name; the requested path is the fallback.
+  let finalUrl = response.url
+  if (finalUrl === '' || finalUrl === undefined) finalUrl = spec.url
+  const nameSource = (() => { try { return decodeURIComponent(new URL(finalUrl).pathname.split('/').filter(Boolean).pop() ?? '') } catch { return '' } })()
+  const fromUrl = nameSource || decodeURIComponent(parsedUrl.pathname.split('/').filter(Boolean).pop() ?? '')
   const fileName = safe(destName ?? fromUrl ?? `download-${Date.now()}`)
   fs.mkdirSync(ownerDir, { recursive: true })
   const file = path.join(ownerDir, fileName)
@@ -406,7 +586,9 @@ export async function performDownload(
     status: response.status,
     bytes: buffer.length,
     sha256,
-    contentType: response.headers.get('content-type') ?? '(none)',
+    contentType: response.header('content-type') ?? '(none)',
+    url_final: finalUrl,
+    ...(hops > 0 ? { redirect_hops: hops } : {}),
   }
 }
 
@@ -639,22 +821,33 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       return textResult(list.length === 0 ? '(no jars yet — created on first http_request)' : list.join('\n'))
     })
 
-  t('http_download', 'Fetch a URL server-side and save it under the owner\'s artifacts downloads/ dir — the transcript sees only status, bytes, sha256, and content-type. Optional sha256_expected verifies integrity. Use this for evidence blobs instead of reading bodies into context.',
+  t('http_download', 'Fetch a URL server-side and save it under the owner\'s artifacts downloads/ dir — the transcript sees only status, bytes, sha256, content-type, and the final URL. Optional sha256_expected verifies integrity. Use this for evidence blobs instead of reading bodies into context. `browser: "<owner>"` (run-9 §3) sends the download through that owner\'s LIVE browser session (its cookie state) — the working path for endpoints that answer with a Content-Disposition redirect to a CDN, which in-page fetch cannot follow.',
     {
       url: z.string().describe('Absolute URL — scope-guarded'),
-      name: z.string().optional().describe('File name under downloads/ (default: derived from the URL path)'),
+      name: z.string().optional().describe('File name under downloads/ (default: derived from the FINAL url path after redirects)'),
       headers: z.record(z.string()).optional().describe('Header map; values may use $secret:NAME'),
       auth: REQUEST_SHAPE.auth!.optional(),
-      jar: z.string().optional(),
-      redirect: z.enum(['follow', 'manual']).optional().describe('Default follow (unlike http_request)'),
+      jar: z.string().optional().describe('Jar transport only — ignored with browser:'),
+      browser: REQUEST_SHAPE.browser!.optional().describe('Download through a LIVE browser session (its cookie state) — for attachment endpoints needing the owner\'s session'),
+      redirect: z.enum(['follow', 'manual']).optional().describe('Default follow; every hop is scope-checked (run-9 §2)'),
       timeout_ms: z.number().int().optional().describe('Default 60000'),
       sha256_expected: z.string().optional().describe('Verify the downloaded bytes (mismatch still writes the file, but errors)'),
       owner: z.string().optional().describe('Attribution for the scope audit log and the artifacts subdir'),
     },
-    async ({ url, name, headers, auth, jar, redirect, timeout_ms, sha256_expected, owner }: any) => {
+    async ({ url, name, headers, auth, jar, browser, redirect, timeout_ms, sha256_expected, owner }: any) => {
+      const who = owner ?? 'unknown'
+      const browserOwner = browserOwnerOf({ browser }, who)
+      let client: BrowserRequestClient | undefined
+      if (browserOwner !== undefined) {
+        if (env.sessionFor === undefined)
+          throw new Error('http_download: browser transport requested but no browser session provider is wired here')
+        client = (await env.sessionFor(browserOwner).ensure()).request
+      }
       const result = await performDownload(jars, env.scope, env.config, {
         url, headers, auth, jar, redirect, timeout_ms,
-      } as RequestSpec, owner ?? 'unknown', name, sha256_expected, env.budget)
-      return textResult(`Saved ${result.bytes} bytes → ${result.file}\nHTTP ${result.status} · ${result.contentType} · sha256 ${result.sha256}`)
+      } as RequestSpec, who, name, sha256_expected, env.budget, client)
+      const hops = result.redirect_hops !== undefined ? ` · ${result.redirect_hops} redirect hop(s), each scope-checked` : ''
+      const moved = result.url_final !== url ? ` · landed at ${result.url_final}` : ''
+      return textResult(`Saved ${result.bytes} bytes → ${result.file}\nHTTP ${result.status} · ${result.contentType} · sha256 ${result.sha256}${moved}${hops}`)
     })
 }
