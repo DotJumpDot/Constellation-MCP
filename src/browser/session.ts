@@ -1,10 +1,32 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import pwCore from 'playwright-core'
 import type { BrowserContext, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 
 const { chromium } = pwCore
+const exec = promisify(execFile)
+
+/** Work area (taskbar-excluded bounds) of the Windows screen containing a
+ *  point — the bottom-anchor input. Undefined on any failure (best effort). */
+async function workAreaAt(x: number, y: number): Promise<{ top: number; height: number } | undefined> {
+  try {
+    const script =
+      'Add-Type -AssemblyName System.Windows.Forms; ' +
+      `$s = [System.Windows.Forms.Screen]::FromPoint([System.Drawing.Point]::new(${Math.round(x)}, ${Math.round(y)})); ` +
+      '"{0} {1}" -f $s.WorkingArea.Y, $s.WorkingArea.Height'
+    const { stdout } = await exec('powershell.exe', ['-NoProfile', '-Command', script], { windowsHide: true, timeout: 10_000 })
+    const parts = stdout.trim().split(/\s+/)
+    const top = Number.parseInt(parts[0] ?? '', 10)
+    const height = Number.parseInt(parts[1] ?? '', 10)
+    if (Number.isFinite(top) && Number.isFinite(height)) return { top, height }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
 
 export const SHARED_OWNER = 'shared'
 
@@ -93,7 +115,10 @@ export function canTouchTab(meta: TabMeta | undefined, owner: string, sessionOwn
 
 /** Stable per-owner cascade on a pinned window position (user ask: 10+ owner
  *  windows pinned to one monitor must not stack exactly on top of each other).
- * Invalid input passes through untouched — Chrome ignores a bad flag. Pure. */
+ * X-ONLY (lead's round-7 measurement): a y-cascade walks windows down the
+ *  screen — the bottom edge is where stacked owner windows belong, and the
+ *  post-launch bottom-anchor moves y there. Invalid input passes through
+ *  untouched — Chrome ignores a bad flag. Pure. */
 export function cascadeWindowPosition(position: string, owner: string): string {
   const [xRaw, yRaw] = position.split(',').map(part => part.trim())
   const x = Number.parseInt(xRaw ?? '', 10)
@@ -102,7 +127,7 @@ export function cascadeWindowPosition(position: string, owner: string): string {
   let hash = 0
   for (const ch of owner) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) | 0
   const offset = (Math.abs(hash) % 10) * 30
-  return `${x + offset},${y + offset}`
+  return `${x + offset},${y}`
 }
 
 export class BrowserSession {
@@ -278,6 +303,11 @@ export class BrowserSession {
     this.wireNetwork(context)
     for (const page of context.pages()) this.registerPage(page, this.owner)
     this.context = context
+    // Pinned windows settle against the BOTTOM of their monitor's work area
+    // (round-7 measurement). Skipped for minimized starts (no visible bounds).
+    if (this.config.windowPosition !== undefined && !this.config.startMinimized) {
+      await this.bottomAnchorWindow(context)
+    }
     // The very first tab of an owner window is the ownership label: which
     // agent owns this window and what job it is running. It cannot be closed
     // by tool calls and is re-pinned if the human closes it in Chrome.
@@ -291,6 +321,31 @@ export class BrowserSession {
   private hasInfoTab(): boolean {
     for (const [page, meta] of this.tabs) if (meta.infoTab === true && !page.isClosed()) return true
     return false
+  }
+
+  /** Bottom-anchor the freshly launched window on its pinned monitor (lead's
+   *  round-7 measurement: --window-position + x-cascade place the window
+   *  correctly in x, but stacked owner windows belong against the BOTTOM edge
+   *  of the work area; a y=1001-style reading AFTER this is the human
+   *  dragging, not the launcher). Best effort — never blocks a launch. */
+  private async bottomAnchorWindow(context: BrowserContext): Promise<void> {
+    try {
+      const page = context.pages()[0]
+      if (page === undefined) return
+      const cdp = await context.newCDPSession(page)
+      try {
+        const { windowId } = await cdp.send('Browser.getWindowForTarget') as { windowId: number }
+        const { bounds } = await cdp.send('Browser.getWindowBounds', { windowId }) as { bounds: { left: number; top: number; height: number } }
+        const work = await workAreaAt(bounds.left + 50, bounds.top + 50)
+        if (work === undefined) return
+        const top = work.top + work.height - bounds.height
+        if (top >= work.top && Math.abs(top - bounds.top) > 2) {
+          await cdp.send('Browser.setWindowBounds', { windowId, bounds: { top } })
+        }
+      } finally {
+        await cdp.detach().catch(() => undefined)
+      }
+    } catch { /* placement is best effort */ }
   }
 
   /** Navigate (or re-navigate) the pinned ownership-label tab. */

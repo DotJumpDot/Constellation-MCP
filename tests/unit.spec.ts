@@ -906,6 +906,7 @@ test('launch quiet spawn: per-owner cascade on a pinned window position (user as
     assert.ok(x >= 2560 && x <= 2560 + 270, `cascade stays near the pin: ${pos}`)
   }
   assert.notEqual(a, b, 'different owners land at different offsets (no exact stacking)')
+  assert.equal(a.split(',')[1], '100', 'y is untouched — the cascade is x-only (round-7 placement note)')
   const neg = cascadeWindowPosition('-1920,0', 'scout').split(',')[0]!
   const negX = Number.parseInt(neg, 10)
   assert.ok(negX >= -1920 && negX <= -1920 + 270, `negative coordinates parse: ${neg}`)
