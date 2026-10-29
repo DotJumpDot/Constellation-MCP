@@ -32,12 +32,32 @@ function hostPatternMatches(pattern: string, host: string): boolean {
   return host === p
 }
 
-/** URL entry form: `host` or `host/path-prefix/`. */
+/** URL entry form: `host`, `host:port`, `host/path-prefix/`, `host:port/path/`.
+ *  A PORT in the entry is PORT-EXACT (round-7 D2: `127.0.0.1:8799` used to
+ *  match nothing because entries were compared against the portless hostname —
+ *  scope armed, then denied); a portless entry stays port-agnostic as before.
+ *  Scheme-default ports resolve (443 ≡ https with no explicit port). */
 export function entryMatches(entry: string, url: URL): boolean {
   const slash = entry.indexOf('/')
-  const hostPart = (slash === -1 ? entry : entry.slice(0, slash)).trim().toLowerCase()
+  const hostPort = (slash === -1 ? entry : entry.slice(0, slash)).trim().toLowerCase()
   const pathPart = slash === -1 ? '' : entry.slice(slash)
-  if (!hostPatternMatches(hostPart, url.hostname)) return false
+  let hostPattern = hostPort
+  let port: number | undefined
+  const colon = hostPort.lastIndexOf(':')
+  // A colon AFTER any ']' is a port ([::1]:8080); a colon inside brackets is
+  // part of the address. A non-numeric suffix (e.g. a bare '::1') is left whole.
+  if (colon !== -1 && hostPort.indexOf(']') < colon) {
+    const maybePort = Number.parseInt(hostPort.slice(colon + 1), 10)
+    if (Number.isFinite(maybePort)) {
+      port = maybePort
+      hostPattern = hostPort.slice(0, colon)
+    }
+  }
+  if (!hostPatternMatches(hostPattern, url.hostname)) return false
+  if (port !== undefined) {
+    const urlPort = url.port === '' ? (url.protocol === 'https:' ? 443 : 80) : Number.parseInt(url.port, 10)
+    if (urlPort !== port) return false
+  }
   if (pathPart === '') return true
   return url.pathname.startsWith(pathPart)
 }
@@ -87,7 +107,10 @@ export function evaluateScope(rule: ScopeRule | null, rawUrl: string, options: {
   }
   return {
     allowed: false,
-    reason: `${host} is not in the declared scope (${rule.in_scope.join(', ') || 'empty'}) — call scope_set first or ask the Lead`,
+    // url.host keeps a non-default port (round-7 D2): a port-mismatch denial
+    // now shows "127.0.0.1:8800 is not in the declared scope (127.0.0.1:8799)"
+    // instead of a portless host that LOOKS like it matches the entry.
+    reason: `${url.host} is not in the declared scope (${rule.in_scope.join(', ') || 'empty'}) — call scope_set first or ask the Lead`,
     engagement: rule.engagement,
   }
 }

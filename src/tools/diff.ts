@@ -49,7 +49,12 @@ export function verdictOf(legs: DiffPairLegs): {
     return {
       verdict: 'SOFT_ALLOW',
       deciding_field: 'body',
-      note: `another identity got HTTP ${probe.status} but different bytes than the owner — a soft allow: some data or a different rendering leaked; diff the bodies for the deciding field`,
+      // Round-7 D3: without an own leg there IS no owner to differ from — the
+      // honest comparison is against the miss control, and the note must say
+      // the DATA_LEAK verdict is unavailable rather than imply it ran.
+      note: legs.own !== undefined
+        ? `another identity got HTTP ${probe.status} but different bytes than the owner — a soft allow: some data or a different rendering leaked; diff the bodies for the deciding field`
+        : `another identity got HTTP ${probe.status} with different bytes than the MISS CONTROL (no owner leg was sent — the DATA_LEAK verdict is unavailable) — a soft allow: some data or a different rendering leaked; diff the probe against the miss control`,
     }
   }
   return {

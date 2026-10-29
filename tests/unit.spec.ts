@@ -923,3 +923,51 @@ test('config: window-position + start-minimized env and flags (user ask: quiet s
   assert.equal(config.headless, true)
   assert.deepEqual(rest, ['positional'])
 })
+
+test('recipes: a step without a known action is REJECTED, never silently skipped (round-7 D1)', async () => {
+  const { validateRecipe } = await import('../src/tools/recipe.js')
+  const d1 = validateRecipe('r6-browser-legs', {
+    name: 'r6-browser-legs',
+    steps: [{ expect: 'deny', probe: { url: 'https://x/o/1' }, miss: { url: 'https://x/o/0' } }],
+  })
+  assert.match(d1 ?? '', /needs a known action/, 'the missing action must be named')
+  assert.match(d1 ?? '', /undefined/)
+  const unknown = validateRecipe('r', { name: 'r', steps: [{ action: 'run', url: 'https://x' }] })
+  assert.match(unknown ?? '', /needs a known action/)
+  for (const action of ['navigate', 'click', 'type', 'capture', 'verify', 'wait', 'expect']) {
+    const result = validateRecipe('r', { name: 'r', steps: [{ action }] })
+    assert.ok(result === undefined || !/needs a known action/.test(result), `${action} passes the whitelist`)
+  }
+})
+
+test('scope: host:port entries are PORT-EXACT; portless stay port-agnostic (round-7 D2)', async () => {
+  const { entryMatches, evaluateScope } = await import('../src/scope.js')
+  const at = (entry: string, url: string) => entryMatches(entry, new URL(url))
+  assert.equal(at('127.0.0.1:8799', 'http://127.0.0.1:8799/oracle'), true, 'the exact port matches')
+  assert.equal(at('127.0.0.1:8799', 'http://127.0.0.1:8800/oracle'), false, 'a different port is denied')
+  assert.equal(at('127.0.0.1:8799', 'http://127.0.0.1/oracle'), false, 'portless URL is port 80, not 8799')
+  assert.equal(at('example.com:443', 'https://example.com/x'), true, '443 resolves as the https default')
+  assert.equal(at('example.com:443', 'https://example.com:8443/x'), false)
+  assert.equal(at('example.com', 'https://example.com:8443/x'), true, 'portless entries stay port-agnostic (unchanged semantics)')
+  assert.equal(at('127.0.0.1:8799/api/', 'http://127.0.0.1:8799/api/x'), true, 'port + path prefix compose')
+  assert.equal(at('127.0.0.1:8799/api/', 'http://127.0.0.1:8799/other'), false)
+  assert.equal(at('[::1]:9000', 'http://[::1]:9000/x'), true, 'IPv6 bracket form carries its port')
+  assert.equal(at('[::1]:9000', 'http://[::1]:9001/x'), false)
+  const rule = { engagement: 'e', in_scope: ['127.0.0.1:8799'], out_scope: [] }
+  assert.equal(evaluateScope(rule, 'http://127.0.0.1:8799/oracle').allowed, true, 'armed 127.0.0.1:8799 now ALLOWS 127.0.0.1:8799')
+  const denied = evaluateScope(rule, 'http://127.0.0.1:8800/oracle')
+  assert.equal(denied.allowed, false)
+  assert.match(denied.reason, /127\.0\.0\.1:8800 is not in the declared scope \(127\.0\.0\.1:8799\)/, 'the denial shows the requested PORT next to the entry')
+})
+
+test('diff_pair: SOFT_ALLOW names the miss control when no own leg was sent (round-7 D3)', async () => {
+  const { verdictOf } = await import('../src/tools/diff.js')
+  const leg = (sha: string) => ({ status: 200, body_sha256: sha, body: '{}', headers: {}, statusText: '', url_final: '', timing_ms: 1, set_cookies: 0 })
+  const miss = { ...leg('bbb'), status: 404 }
+  const noOwn = verdictOf({ probe: leg('aaa'), miss })
+  assert.equal(noOwn.verdict, 'SOFT_ALLOW')
+  assert.match(noOwn.note, /MISS CONTROL/)
+  assert.match(noOwn.note, /no owner leg was sent/, 'the note must admit the DATA_LEAK verdict is unavailable')
+  assert.equal(verdictOf({ probe: leg('aaa'), miss, own: leg('aaa') }).verdict, 'DATA_LEAK', 'same bytes as a PRESENT owner leg is still DATA_LEAK')
+  assert.match(verdictOf({ probe: leg('aaa'), miss, own: leg('zzz') }).note, /different bytes than the owner/, 'with an own leg the owner wording stays')
+})

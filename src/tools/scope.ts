@@ -11,7 +11,7 @@ export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, req
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('scope_set', 'Declare the engagement scope ONCE at lane start: in_scope hosts are then the ONLY hosts http_request and browser navigation may touch (out_scope always wins; every decision is audited). Entries: `example.com`, `*.example.com`, `example.com/api/`. Pass `owner` to arm a PER-LANE rule for one teammate (each lane gets its own engagement scope); omit it for the global fallback rule.',
+  t('scope_set', 'Declare the engagement scope ONCE at lane start: in_scope hosts are then the ONLY hosts http_request and browser navigation may touch (out_scope always wins; every decision is audited). Entries: `example.com`, `*.example.com`, `example.com/api/`, `example.com:8443` (a port in the entry is PORT-EXACT — `127.0.0.1:8799` allows only that port; portless entries cover any port). Pass `owner` to arm a PER-LANE rule for one teammate (each lane gets its own engagement scope); omit it for the global fallback rule.',
     {
       engagement: z.string().describe('Engagement/lane name, e.g. "klaviyo-mbb"'),
       in_scope: z.array(z.string()).min(1).describe('Allowed host entries'),

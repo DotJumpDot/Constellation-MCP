@@ -146,11 +146,18 @@ export function captureFromText(text: string, pattern: string): string | undefin
 }
 
 const MAX_STEPS = 40
+/** Every action the executor knows. Validation AND the runner's default arm
+ *  both key off this — a step that matches nothing must never pass silently
+ *  (round-7 D1: {expect, probe, miss} without action:"expect" ran NOTHING and
+ *  reported COMPLETE; a recipe that asserts nothing must not report green). */
+const STEP_ACTIONS: ReadonlySet<string> = new Set(['navigate', 'click', 'type', 'capture', 'verify', 'wait', 'expect'])
 
-function validateRecipe(name: string, recipe: Recipe): string | undefined {
+export function validateRecipe(name: string, recipe: Recipe): string | undefined {
   if (recipe.steps.length === 0) return 'recipe has no steps'
   if (recipe.steps.length > MAX_STEPS) return `recipe has ${recipe.steps.length} steps (max ${MAX_STEPS})`
   for (const [index, step] of recipe.steps.entries()) {
+    if (typeof step.action !== 'string' || !STEP_ACTIONS.has(step.action))
+      return `step ${index + 1} needs a known action (navigate|click|type|capture|verify|wait|expect) — got ${JSON.stringify(step.action) ?? 'undefined'}`
     switch (step.action) {
       case 'navigate':
         if (step.url === undefined || step.url === '') return `step ${index + 1} (navigate) needs url`
@@ -252,6 +259,11 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
         const known = Object.keys(recipes).join(', ')
         return textResult(`unknown recipe "${name}"${known !== '' ? ` (known: ${known})` : ' — none saved yet; fixture_recipe_set creates one'}`, true)
       }
+      // Re-validate at run time too: loadRecipes trusts the JSON on disk, and
+      // a hand-edited recipe must fail HERE, not mid-run or (round-7 D1)
+      // silently skip a step whose action is missing.
+      const invalid = validateRecipe(name, recipe)
+      if (invalid !== undefined) return textResult(`Refusing to run "${name}": ${invalid} — fix it with fixture_recipe_set.`, true)
       const vars: Record<string, string> = {}
       const lines: string[] = []
       let session: BrowserSession | undefined
@@ -341,6 +353,12 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
               await page.waitForTimeout(Math.min(step.ms ?? 1000, 30_000))
               lines.push(`[step ${index + 1}] wait ${Math.min(step.ms ?? 1000, 30_000)} ms`)
               break
+            }
+            default: {
+              // Round-7 D1: an unknown/missing action must FAIL the run, never
+              // skip silently — loadRecipes trusts the file on disk, and a
+              // step that matches no arm asserts nothing.
+              throw new Error(`unknown step action ${JSON.stringify(step.action) ?? '(missing)'} at step ${index + 1} — valid: navigate|click|type|capture|verify|wait|expect`)
             }
           }
         } catch (error) {
