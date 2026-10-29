@@ -784,3 +784,115 @@ test('recipes: verify accepts a bare string, is case-insensitive by default, hin
   assert.equal(expectPasses('SOFT_ALLOW', 'allow'), true)
   assert.equal(expectPasses('AUTHORIZATION_DENIAL', 'allow'), false)
 })
+
+test('http legs: browser owner resolution + spec stripping (round 6 bridge)', async () => {
+  const { browserOwnerOf, stripBrowserField } = await import('../src/tools/http.js')
+  assert.equal(browserOwnerOf({ browser: true }, 'tester'), 'tester')
+  assert.equal(browserOwnerOf({ browser: 'scout' }, 'tester'), 'scout')
+  assert.equal(browserOwnerOf({}, 'tester'), undefined)
+  assert.equal(browserOwnerOf({ browser: '' }, 'tester'), undefined)
+  const spec = stripBrowserField({ url: 'https://x', browser: 'scout' })
+  assert.equal('browser' in spec, false)
+  assert.deepEqual(spec, { url: 'https://x' })
+})
+
+test('http legs: performBrowserRequest rides the context client, never a jar (round 6)', async () => {
+  const { performBrowserRequest } = await import('../src/tools/http.js')
+  const { createHash } = await import('node:crypto')
+  const calls: Array<{ url: string; options: any }> = []
+  const asserted: Array<{ url: string; owner: string; tool: string }> = []
+  const spent: string[] = []
+  const body = JSON.stringify({ token: 'x'.repeat(80) })
+  const client = {
+    fetch: async (url: string, options: any) => {
+      calls.push({ url, options })
+      return {
+        status: () => 200,
+        statusText: () => 'OK',
+        url: () => url,
+        headers: () => ({ 'content-type': 'application/json' }),
+        headersArray: () => [
+          { name: 'Content-Type', value: 'application/json' },
+          { name: 'set-cookie', value: 'a=1' },
+          { name: 'Set-Cookie', value: 'b=2' },
+        ],
+        text: async () => body,
+      }
+    },
+  }
+  const scope = {
+    assert: (url: string, owner: string, tool: string) => {
+      asserted.push({ url, owner, tool })
+      return { allowed: true, reason: '' }
+    },
+  }
+  const result = await performBrowserRequest(
+    client as never,
+    scope as never,
+    { url: 'https://target.example/api/thing', method: 'POST', body: { a: 1 }, max_body_bytes: 10 } as never,
+    'scout', 'fixture_recipe', { spend: (owner: string) => { spent.push(owner) } } as never,
+  )
+  assert.equal(result.status, 200)
+  assert.equal(result.set_cookies, 2, 'both set-cookie headers counted')
+  assert.equal(result.body_sha256, createHash('sha256').update(body).digest('hex'), 'sha covers the FULL body')
+  assert.match(result.body, /preview of 92 bytes/)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0]!.options.method, 'POST')
+  assert.equal(calls[0]!.options.data, '{"a":1}')
+  assert.equal(calls[0]!.options.headers['content-type'], 'application/json')
+  assert.equal('cookie' in calls[0]!.options.headers, false, 'no jar cookie is merged on the browser transport')
+  assert.equal(calls[0]!.options.maxRedirects, 0, 'manual-redirect parity with performRequest')
+  assert.deepEqual(asserted, [{ url: 'https://target.example/api/thing', owner: 'scout', tool: 'fixture_recipe' }])
+  assert.deepEqual(spent, ['scout'])
+})
+
+test('http legs: performBrowserRequest rejects non-http schemes before any fetch (round 6)', async () => {
+  const { performBrowserRequest } = await import('../src/tools/http.js')
+  let fetched = 0
+  const client = { fetch: async () => { fetched += 1; throw new Error('must not be called') } }
+  await assert.rejects(
+    performBrowserRequest(client as never, { assert: () => ({ allowed: true, reason: '' }) } as never, { url: 'file:///C:/Windows/system32/config' } as never, 'x', 'fixture_recipe'),
+    /browser-authenticated requests support http\/https only/,
+  )
+  assert.equal(fetched, 0)
+})
+
+test('http legs: performLeg routes browser legs to the named live session, jar legs to performRequest (round 6)', async () => {
+  const { performLeg } = await import('../src/tools/http.js')
+  const ensured: string[] = []
+  const fetchedUrls: string[] = []
+  const client = {
+    fetch: async (url: string) => {
+      fetchedUrls.push(url)
+      return { status: () => 403, statusText: () => 'Forbidden', url: () => url, headers: () => ({}), headersArray: () => [], text: async () => 'denied' }
+    },
+  }
+  const sessionFor = (owner: string) => ({
+    ensure: async () => {
+      ensured.push(owner)
+      return { request: client }
+    },
+  })
+  const scope = { assert: () => ({ allowed: true, reason: '' }) }
+  const transports = { jars: { jar: () => { throw new Error('jar transport must not be used') } } as never, scope: scope as never, sessionFor }
+
+  const denied = await performLeg(transports as never, { url: 'https://target.example/o/1', browser: 'scout' } as never, 'tester', 'diff_pair')
+  assert.equal(denied.status, 403)
+  assert.deepEqual(ensured, ['scout'])
+  assert.deepEqual(fetchedUrls, ['https://target.example/o/1'])
+
+  await performLeg(transports as never, { url: 'https://target.example/o/2', browser: true } as never, 'tester', 'diff_pair')
+  assert.deepEqual(ensured, ['scout', 'tester'], 'browser: true = the calling owner session')
+
+  await assert.rejects(
+    performLeg(transports, { url: 'file:///x' } as never, 'tester', 'diff_pair'),
+    /http_request supports http\/https only/,
+    'no browser key falls through to the jar transport',
+  )
+
+  await assert.rejects(
+    performLeg({ jars: { jar: () => { throw new Error() } } as never, scope: scope as never }, { url: 'https://target.example/o/3', browser: 'ghost' } as never, 'tester', 'diff_pair'),
+    /no browser session provider is wired/,
+  )
+})
+

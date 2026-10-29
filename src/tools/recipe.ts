@@ -22,7 +22,7 @@ import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '..
 import type { BrowserSession } from '../browser/session.js'
 import type { ConstellationConfig } from '../config.js'
 import type { JarStore } from './http.js'
-import { performRequest, type RequestSpec } from './http.js'
+import { performLeg, type RequestResult, type RequestSpec } from './http.js'
 import { verdictOf, type AuthzVerdict } from './diff.js'
 import type { BudgetGuard } from './budget.js'
 import type { ScopeGuard } from '../scope.js'
@@ -46,7 +46,10 @@ export interface RecipeStep {
    *  are almost always case-insensitive by intent; opt in with true. */
   case_sensitive?: boolean
   /** Authorization assertion (smoke round 5 suggestion): run probe vs miss
-   *  control through diff_pair semantics and require the boundary verdict. */
+   *  control through diff_pair semantics and require the boundary verdict.
+   *  Each leg is an http_request-shaped spec; `browser: '<owner>'` (or true =
+   *  the step owner) rides that owner's LIVE browser session — its cookie
+   *  state — instead of a jar (round 6, browser-login identities). */
   expect?: 'deny' | 'allow'
   probe?: Record<string, unknown>
   miss?: Record<string, unknown>
@@ -173,7 +176,7 @@ function validateRecipe(name: string, recipe: Recipe): string | undefined {
       case 'expect': {
         if (step.expect !== 'deny' && step.expect !== 'allow') return `step ${index + 1} (expect) needs expect: "deny" | "allow"`
         const isSpec = (spec: unknown): boolean => spec !== null && typeof spec === 'object' && typeof (spec as { url?: unknown }).url === 'string'
-        if (!isSpec(step.probe) || !isSpec(step.miss)) return `step ${index + 1} (expect) needs probe + miss request specs ({url, jar?, ...} — http_request shape)`
+        if (!isSpec(step.probe) || !isSpec(step.miss)) return `step ${index + 1} (expect) needs probe + miss request specs ({url, jar? | browser?, ...} — http_request shape)`
         break
       }
       case 'wait':
@@ -197,7 +200,7 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('fixture_recipe_set', 'Save or replace a NAMED FIXTURE RECIPE (run-8 §1c, the registry): the repeatable object graph of an engagement cell — two identities → org → shared object → marker → revoke stage — as ordered browser steps. Per-step `owner` is the anti-bias mechanism: the grant/revoke stages run in the GRANTING identity\'s browser, the read stages in the tester\'s, so "tester is the admin who created the object" cannot creep back in. Steps: navigate {url}, click {selector|deep_text}, type {selector, text}, capture {label, regex}, verify {must_contain|must_not_contain}, wait {ms}. Text fields interpolate $var:NAME from captured variables. `remove: true` deletes.',
+  t('fixture_recipe_set', 'Save or replace a NAMED FIXTURE RECIPE (run-8 §1c, the registry): the repeatable object graph of an engagement cell — two identities → org → shared object → marker → revoke stage — as ordered browser steps. Per-step `owner` is the anti-bias mechanism: the grant/revoke stages run in the GRANTING identity\'s browser, the read stages in the tester\'s, so "tester is the admin who created the object" cannot creep back in. Steps: navigate {url}, click {selector|deep_text}, type {selector, text}, capture {label, regex}, verify {must_contain|must_not_contain}, expect {expect: deny|allow, probe, miss, own?}, wait {ms}. Text fields interpolate $var:NAME from captured variables. expect legs are http_request-shaped and accept `browser: "<owner>"` (or true = step owner) to ride that identity\'s LIVE browser session instead of a jar — the bridge for browser-login products. `remove: true` deletes.',
     {
       name: z.string().describe('Recipe name, e.g. "klaviyo-shared-page-revoke"'),
       description: z.string().optional(),
@@ -237,7 +240,7 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
       }).join('\n'))
     })
 
-  t('fixture_recipe_run', 'Execute a named fixture recipe (run-8 §1c): runs the steps in the target owner\'s browser with per-step evidence, captures object ids via capture steps into $var:NAME variables, and STOPS at the first failed verification with the page\'s own text as the diagnostic. Steps with their own `owner` switch browsers — the grant stage runs in the granting identity\'s session, the reads in yours (hold-then-lose by construction). Every run appends to fixture-recipe-runs.jsonl.',
+  t('fixture_recipe_run', 'Execute a named fixture recipe (run-8 §1c): runs the steps in the target owner\'s browser with per-step evidence, captures object ids via capture steps into $var:NAME variables, and STOPS at the first failed verification with the page\'s own text as the diagnostic. Steps with their own `owner` switch browsers — the grant stage runs in the granting identity\'s session, the reads in yours (hold-then-lose by construction). expect steps assert the authorization verdict; a leg with `browser: "<owner>"` (or true) sends it through that identity\'s LIVE browser session, so browser-login identities need no jar. Every run appends to fixture-recipe-runs.jsonl.',
     {
       name: z.string().describe('Recipe name from fixture_recipe_set'),
       owner: z.string().describe('Default owner for steps without one (usually YOUR lane name = the tester identity)'),
@@ -313,12 +316,16 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
               // Authorization assertion: probe vs miss control through
               // diff_pair semantics (smoke round 5) — a recipe can now prove
               // the boundary held or broke, not just that text is present.
+              // A leg with `browser: '<owner>'` (or true = the step owner)
+              // rides that owner's LIVE browser session (round 6): the same
+              // identity the grant/revoke clicks used, so browser-login
+              // products stay testable without a jar.
+              const leg = (raw: Record<string, unknown>): Promise<RequestResult> =>
+                performLeg(env, raw as unknown as RequestSpec & { browser?: unknown }, stepOwner, 'fixture_recipe')
               const [probe, miss, own] = await Promise.all([
-                performRequest(env.jars, env.scope, step.probe as unknown as RequestSpec, stepOwner, 'fixture_recipe', env.budget),
-                performRequest(env.jars, env.scope, step.miss as unknown as RequestSpec, stepOwner, 'fixture_recipe', env.budget),
-                step.own !== undefined
-                  ? performRequest(env.jars, env.scope, step.own as unknown as RequestSpec, stepOwner, 'fixture_recipe', env.budget)
-                  : Promise.resolve(undefined),
+                leg(step.probe!),
+                leg(step.miss!),
+                step.own !== undefined ? leg(step.own) : Promise.resolve(undefined),
               ])
               const verdict = verdictOf({ probe, miss, ...(own !== undefined ? { own } : {}) })
               if (!expectPasses(verdict.verdict, step.expect!)) {

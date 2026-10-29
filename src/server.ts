@@ -56,9 +56,9 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   }
 
   registerBrowserTools(registrar, env)
-  registerHttpTools(registrar, env, jars)
+  registerHttpTools(registrar, { ...env, sessionFor: owner => registry.sessionFor(owner) }, jars)
   registerFixtureTools(registrar, fixtures)
-  registerDiffTools(registrar, { jars, scope })
+  registerDiffTools(registrar, { jars, scope, budget, sessionFor: owner => registry.sessionFor(owner) })
   registerSessionTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner) }, watches)
   registerEvidenceTools(registrar, config)
   registerDupeTools(registrar)

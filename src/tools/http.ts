@@ -13,6 +13,29 @@ export interface HttpEnv {
   config: ConstellationConfig
   scope: ScopeGuard
   budget?: import('./budget.js').BudgetGuard
+  /** Live-browser bridge (round 6): resolve an owner's browser session so
+   *  request legs can ride its cookie state via context.request. */
+  sessionFor?: (owner: string) => { ensure(): Promise<{ request: BrowserRequestClient }> }
+}
+
+/** Structural slice of Playwright's APIRequestContext (browserContext.request)
+ *  — keeps this module free of a playwright-core import while letting request
+ *  specs name a live browser session as their transport. */
+export interface BrowserRequestClient {
+  fetch(url: string, options: {
+    method?: string
+    headers?: Record<string, string>
+    data?: string
+    maxRedirects?: number
+    timeout?: number
+  }): Promise<{
+    status(): number
+    statusText(): string
+    url(): string
+    headers(): Record<string, string>
+    headersArray(): Array<{ name: string; value: string }>
+    text(): Promise<string>
+  }>
 }
 
 const MAX_BODY_DEFAULT = 20_000
@@ -144,6 +167,112 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
   }
 }
 
+/** `browser: '<owner>' | true` on a request leg: which live browser session
+ *  the request should ride (true = the calling/step owner). */
+export function browserOwnerOf(spec: { browser?: unknown }, fallbackOwner: string): string | undefined {
+  if (spec.browser === true) return fallbackOwner
+  if (typeof spec.browser === 'string' && spec.browser !== '') return spec.browser
+  return undefined
+}
+
+/** Copy of a spec without the transport-only `browser` key. */
+export function stripBrowserField<T extends object>(spec: T): T {
+  const copy = { ...spec }
+  delete (copy as { browser?: unknown }).browser
+  return copy
+}
+
+/** Send one request through a live browser session's context.request — it
+ *  carries that owner's REAL cookie state (the identity the browser stages
+ *  established), which is the bridge recipe/diff legs need when login happens
+ *  in the browser and no jar can represent it. Cookies set by the response
+ *  flow back into the browser context (Playwright shares storage state), so
+ *  the identity stays live. DBSC caveat: this is still an out-of-page request
+ *  with copied cookie values — on device-bound-session products it can come
+ *  back unauthenticated (reads as NOT_FOUND); hold those cells in the page. */
+export async function performBrowserRequest(
+  client: BrowserRequestClient,
+  scope: ScopeGuard,
+  spec: RequestSpec,
+  owner: string,
+  tool: string,
+  budget?: import('./budget.js').BudgetGuard,
+): Promise<RequestResult> {
+  let parsedUrl: URL
+  try {
+    parsedUrl = new URL(spec.url)
+  } catch {
+    throw new Error(`unparseable URL: ${spec.url}`)
+  }
+  if (!HTTP_SCHEMES.has(parsedUrl.protocol.replace(':', '')))
+    throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — browser-authenticated requests support http/https only`)
+  scope.assert(spec.url, owner, tool)
+  budget?.spend(owner)
+  const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
+  if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
+  const headers: Record<string, string> = { ...(headersInterp as Record<string, string>) }
+  if (spec.body !== undefined && headers['content-type'] === undefined && headers['Content-Type'] === undefined && isJsonObject(spec.body))
+    headers['content-type'] = 'application/json'
+  // No jar merge: the browser context's cookie state IS the identity here.
+  const { value: bodyInterp, missing: missingBody } = interpolateDeep(spec.body)
+  if (missingBody.length > 0) throw new Error(`unknown secret(s) in body: ${missingBody.join(', ')}`)
+  const body = bodyInterp === undefined ? undefined : (isJsonObject(bodyInterp) ? JSON.stringify(bodyInterp) : String(bodyInterp))
+  applyAuth(headers, spec.auth)
+
+  const started = Date.now()
+  const response = await client.fetch(spec.url, {
+    method: spec.method ?? 'GET',
+    headers,
+    ...(body !== undefined ? { data: body } : {}),
+    maxRedirects: spec.redirect === 'follow' ? 20 : 0,
+    timeout: spec.timeout_ms ?? 30_000,
+  })
+  const text = await response.text()
+  const timing = Date.now() - started
+  const setCookies = response.headersArray().filter(h => h.name.toLowerCase() === 'set-cookie').length
+  const maxBody = spec.max_body_bytes ?? MAX_BODY_DEFAULT
+  return {
+    status: response.status(),
+    statusText: response.statusText(),
+    url_final: response.url(),
+    headers: response.headers(),
+    body: text.length > maxBody ? text.slice(0, maxBody) + `\n…[preview of ${text.length} bytes — sha256 covers the full body; raise max_body_bytes if you need more]` : text,
+    body_sha256: crypto.createHash('sha256').update(text).digest('hex'),
+    timing_ms: timing,
+    set_cookies: setCookies,
+  }
+}
+
+export interface LegTransports {
+  jars: JarStore
+  scope: ScopeGuard
+  budget?: import('./budget.js').BudgetGuard
+  sessionFor?: (owner: string) => { ensure(): Promise<{ request: BrowserRequestClient }> }
+}
+
+/** Run one authorization leg: jar transport by default, or through the live
+ *  browser session named by `browser: '<owner>'` (true = the calling owner).
+ *  One routing rule shared by http_request, diff_pair legs and recipe expect
+ *  legs, so all four primitives can speak the SAME identity the browser
+ *  stages established (round 6 — grant → expect allow → revoke → expect deny
+ *  on a live product). */
+export async function performLeg(
+  transports: LegTransports,
+  rawSpec: RequestSpec & { browser?: unknown },
+  fallbackOwner: string,
+  tool: string,
+): Promise<RequestResult> {
+  const browserOwner = browserOwnerOf(rawSpec, fallbackOwner)
+  const spec = stripBrowserField(rawSpec)
+  if (browserOwner !== undefined) {
+    if (transports.sessionFor === undefined)
+      throw new Error(`leg requests browser transport for "${browserOwner}" but no browser session provider is wired here`)
+    const context = await transports.sessionFor(browserOwner).ensure()
+    return performBrowserRequest(context.request, transports.scope, spec, fallbackOwner, tool, transports.budget)
+  }
+  return performRequest(transports.jars, transports.scope, spec, fallbackOwner, tool, transports.budget)
+}
+
 export interface RequestSpec {
   url: string
   method?: string
@@ -211,6 +340,7 @@ const REQUEST_SHAPE: z.ZodRawShape = {
     password: z.string().optional().describe('May use $secret:NAME'),
     token: z.string().optional().describe('Bearer token; may use $secret:NAME'),
   }).optional().describe('Authorization: basic (username+password) or bearer (token)'),
+  browser: z.union([z.boolean(), z.string()]).optional().describe('Send through a LIVE browser session (its cookie state) instead of a jar — the owner\'s name, or true = your own owner. For identities that logged in via the browser (OAuth/JS) where no jar exists. DBSC products may still deny out-of-page requests.'),
 }
 
 /** Save a URL server-side and return metadata only — reading a 338 KB rendered
@@ -275,25 +405,33 @@ export async function performDownload(
 
 export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: JarStore = new JarStore(env.config)): void {
   // Capture ring for http_replay (run-8 §7): the "vary exactly one field"
-  // cards were re-typed by hand all run. Last 20 requests per owner.
-  const captures = new Map<string, Array<{ id: string; ts: string; spec: RequestSpec }>>()
+  // cards were re-typed by hand all run. Last 20 requests per owner. The
+  // captured spec keeps its `browser` transport so a replay rides the same
+  // live session the original did.
+  const captures = new Map<string, Array<{ id: string; ts: string; spec: RequestSpec & { browser?: unknown } }>>()
   let captureSeq = 0
+  const transports: LegTransports = {
+    jars,
+    scope: env.scope,
+    ...(env.budget !== undefined ? { budget: env.budget } : {}),
+    ...(env.sessionFor !== undefined ? { sessionFor: env.sessionFor } : {}),
+  }
 
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256. Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB).',
+  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256. Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB). `browser: "<owner>"` (or true) sends the request through that owner\'s LIVE browser session — its cookie state, the identity the browser stages logged in — instead of a jar.',
     { ...REQUEST_SHAPE, owner: z.string().optional().describe('Attribution for the scope audit log') },
     async (args: any) => {
       const { owner, ...spec } = args
       const who = owner ?? 'unknown'
-      const result = await performRequest(jars, env.scope, spec as RequestSpec, who, 'http_request', env.budget)
+      const result = await performLeg(transports, spec as RequestSpec & { browser?: unknown }, who, 'http_request')
       captureSeq += 1
       const captureId = `hr-${captureSeq}`
       const ring = captures.get(who) ?? []
-      ring.push({ id: captureId, ts: new Date().toISOString(), spec: spec as RequestSpec })
+      ring.push({ id: captureId, ts: new Date().toISOString(), spec: spec as RequestSpec & { browser?: unknown } })
       if (ring.length > 20) ring.shift()
       captures.set(who, ring)
       let stored = ''
@@ -342,7 +480,7 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
         ...(override?.headers !== undefined ? { headers: { ...captured.spec.headers, ...override.headers } } : {}),
         ...(override?.body !== undefined ? { body: override.body } : {}),
       }
-      const result = await performRequest(jars, env.scope, spec, who, 'http_replay', env.budget)
+      const result = await performLeg(transports, spec as RequestSpec & { browser?: unknown }, who, 'http_replay')
       const changed = [
         override?.url !== undefined ? 'url' : null,
         override?.method !== undefined ? 'method' : null,
@@ -357,8 +495,8 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
     async ({ a, b, owner }: any) => {
       const who = owner ?? 'unknown'
       const [ra, rb] = await Promise.all([
-        performRequest(jars, env.scope, a as RequestSpec, who, 'http_diff', env.budget),
-        performRequest(jars, env.scope, b as RequestSpec, who, 'http_diff', env.budget),
+        performLeg(transports, a as RequestSpec & { browser?: unknown }, who, 'http_diff'),
+        performLeg(transports, b as RequestSpec & { browser?: unknown }, who, 'http_diff'),
       ])
       const lines: string[] = []
       lines.push(`A: HTTP ${ra.status} sha=${ra.body_sha256} (${ra.timing_ms} ms)`)

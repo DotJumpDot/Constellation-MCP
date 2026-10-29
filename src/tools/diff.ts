@@ -13,8 +13,8 @@
 import { z } from 'zod'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
 import type { ScopeGuard } from '../scope.js'
-import type { JarStore, RequestSpec, RequestResult } from './http.js'
-import { performRequest } from './http.js'
+import type { JarStore, RequestResult, RequestSpec } from './http.js'
+import { performLeg } from './http.js'
 
 export type AuthzVerdict = 'AUTHORIZATION_DENIAL' | 'NOT_FOUND' | 'SOFT_ALLOW' | 'DATA_LEAK'
 
@@ -80,6 +80,9 @@ export function firstJsonDiff(a: unknown, b: unknown, prefix = ''): string | und
 export interface DiffEnv {
   jars: JarStore
   scope: ScopeGuard
+  budget?: import('./budget.js').BudgetGuard
+  /** Live-browser bridge (round 6): lets legs carry `browser: '<owner>'`. */
+  sessionFor?: (owner: string) => { ensure(): Promise<{ request: import('./http.js').BrowserRequestClient }> }
 }
 
 export function registerDiffTools(server: ToolRegistrar, env: DiffEnv): void {
@@ -91,25 +94,26 @@ export function registerDiffTools(server: ToolRegistrar, env: DiffEnv): void {
   const REQUEST = () => z.object({
     url: z.string(), method: z.string().optional(), headers: z.record(z.string(), z.string()).optional(),
     body: z.unknown().optional(), jar: z.string().optional(), auth: z.any().optional(), timeout_ms: z.number().optional(),
-  }).describe('http_request spec (use $secret:NAME refs; jar = identity)')
+    browser: z.union([z.boolean(), z.string()]).optional().describe('Send this leg through that owner\'s LIVE browser session (its cookie state) instead of a jar — for identities that logged in via the browser'),
+  }).describe('http_request spec (use $secret:NAME refs; jar = identity; browser = live session identity)')
 
-  t('diff_pair', 'The authorization verdict primitive (run-8 §4): send the SAME object request as your identity, another identity, and a random-id MISS CONTROL, and get a verdict — AUTHORIZATION_DENIAL (real decision: status/body differs from miss), NOT_FOUND (probe ≡ miss: lookup missed, cell proves nothing), SOFT_ALLOW (2xx but different bytes), DATA_LEAK (same bytes as owner). The probe-vs-miss distinction flipped two run-7 verdicts by hand; this is that argument, mechanized.',
+  t('diff_pair', 'The authorization verdict primitive (run-8 §4): send the SAME object request as your identity, another identity, and a random-id MISS CONTROL, and get a verdict — AUTHORIZATION_DENIAL (real decision: status/body differs from miss), NOT_FOUND (probe ≡ miss: lookup missed, cell proves nothing), SOFT_ALLOW (2xx but different bytes), DATA_LEAK (same bytes as owner). The probe-vs-miss distinction flipped two run-7 verdicts by hand; this is that argument, mechanized. Legs carry `browser: "<owner>"` (or true = your own owner) to ride that identity\'s LIVE browser session — the bridge for browser-login identities no jar can represent (round 6: grant → expect allow → revoke → expect deny held by two owners).',
     {
-      probe: REQUEST().describe('Request AS THE OTHER IDENTITY against the real object (their jar)'),
+      probe: REQUEST().describe('Request AS THE OTHER IDENTITY against the real object (their jar, or browser: their lane)'),
       miss: REQUEST().describe('The same request against a RANDOM/NONEXISTENT id — the lookup-miss control'),
-      own: REQUEST().optional().describe('The same request as the object owner (your jar) — enables the DATA_LEAK verdict'),
+      own: REQUEST().optional().describe('The same request as the object owner (your jar, or browser: your lane) — enables the DATA_LEAK verdict'),
       anon: REQUEST().optional().describe('The same request UNAUTHENTICATED (no jar) — flags unauthenticated access'),
       owner: z.string().optional().describe('Attribution for the scope audit'),
     },
     async ({ probe, miss, own, anon, owner }: any) => {
       const who = owner ?? 'unknown'
-      const run = async (spec: RequestSpec, tool: string): Promise<RequestResult> =>
-        performRequest(env.jars, env.scope, spec as RequestSpec, who, tool)
+      const run = (spec: RequestSpec & { browser?: unknown }): Promise<import('./http.js').RequestResult> =>
+        performLeg(env, spec, who, 'diff_pair')
       const [probeResult, missResult, ownResult, anonResult] = await Promise.all([
-        run(probe, 'diff_pair'),
-        run(miss, 'diff_pair'),
-        own !== undefined ? run(own, 'diff_pair') : Promise.resolve(undefined),
-        anon !== undefined ? run(anon, 'diff_pair') : Promise.resolve(undefined),
+        run(probe),
+        run(miss),
+        own !== undefined ? run(own) : Promise.resolve(undefined),
+        anon !== undefined ? run(anon) : Promise.resolve(undefined),
       ])
       const legs: DiffPairLegs = { probe: probeResult, miss: missResult, ...(ownResult !== undefined ? { own: ownResult } : {}), ...(anonResult !== undefined ? { anon: anonResult } : {}) }
       const { verdict, deciding_field, note } = verdictOf(legs)
