@@ -8,6 +8,7 @@ import type { ScopeGuard } from '../scope.js'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
 import { HTTP_SCHEMES } from '../scope.js'
 import { interpolateDeep } from './secrets.js'
+import { queryJsonPath, renderStructuralDiff, structuralJsonDiff } from './structural.js'
 
 export interface HttpEnv {
   config: ConstellationConfig
@@ -104,6 +105,10 @@ export interface RequestResult {
   url_final: string
   headers: Record<string, string>
   body: string
+  /** The COMPLETE body when `body` is a capped preview (round-7 gap list §2:
+   *  body_file used to store the PREVIEW, so "saved whole to disk" was false —
+   *  http_extract reads the full bytes from here or from disk). Never shown. */
+  body_full?: string
   body_sha256: string
   timing_ms: number
   set_cookies: number
@@ -161,6 +166,7 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
     // The sha covers the FULL body (diffing stays exact); only the preview
     // shown to the caller is capped so big pages cannot flood agent context.
     body: text.length > maxBody ? text.slice(0, maxBody) + `\n…[preview of ${text.length} bytes — sha256 covers the full body; raise max_body_bytes if you need more]` : text,
+    ...(text.length > maxBody ? { body_full: text } : {}),
     body_sha256: crypto.createHash('sha256').update(text).digest('hex'),
     timing_ms: timing,
     set_cookies: setCookies.length,
@@ -237,6 +243,7 @@ export async function performBrowserRequest(
     url_final: response.url(),
     headers: response.headers(),
     body: text.length > maxBody ? text.slice(0, maxBody) + `\n…[preview of ${text.length} bytes — sha256 covers the full body; raise max_body_bytes if you need more]` : text,
+    ...(text.length > maxBody ? { body_full: text } : {}),
     body_sha256: crypto.createHash('sha256').update(text).digest('hex'),
     timing_ms: timing,
     set_cookies: setCookies,
@@ -404,11 +411,20 @@ export async function performDownload(
 }
 
 export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: JarStore = new JarStore(env.config)): void {
-  // Capture ring for http_replay (run-8 §7): the "vary exactly one field"
-  // cards were re-typed by hand all run. Last 20 requests per owner. The
-  // captured spec keeps its `browser` transport so a replay rides the same
-  // live session the original did.
-  const captures = new Map<string, Array<{ id: string; ts: string; spec: RequestSpec & { browser?: unknown } }>>()
+  // Capture ring for http_replay (run-8 §7) + http_extract (round-7 §2): the
+  // "vary exactly one field" cards were re-typed by hand all run. Last 20
+  // requests per owner. The captured spec keeps its `browser` transport so a
+  // replay rides the same live session the original did, and the entry keeps
+  // the FULL body (capped at 1 MB in memory; on-disk body_file beyond) so
+  // http_extract reads values WITHOUT re-fetching or flooding the transcript.
+  const captures = new Map<string, Array<{
+    id: string
+    ts: string
+    spec: RequestSpec & { browser?: unknown }
+    body?: string
+    bodyFile?: string
+    contentType?: string
+  }>>()
   let captureSeq = 0
   const transports: LegTransports = {
     jars,
@@ -431,19 +447,31 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       captureSeq += 1
       const captureId = `hr-${captureSeq}`
       const ring = captures.get(who) ?? []
-      ring.push({ id: captureId, ts: new Date().toISOString(), spec: spec as RequestSpec & { browser?: unknown } })
-      if (ring.length > 20) ring.shift()
-      captures.set(who, ring)
       let stored = ''
+      let bodyFile: string | undefined
       if (result.body.length > 20_000) {
         try {
           const dir = path.join(env.config.outputDir, who, 'responses')
           fs.mkdirSync(dir, { recursive: true })
           const file = path.join(dir, `${result.body_sha256}.txt`)
-          if (!fs.existsSync(file)) fs.writeFileSync(file, result.body)
-          stored = `\nbody_file: ${file} (full ${result.body.length} bytes; output truncated above)`
+          // body_full is the COMPLETE body (round-7 fix: this used to write
+          // the capped preview, so body_file lied about being whole).
+          if (!fs.existsSync(file)) fs.writeFileSync(file, result.body_full ?? result.body)
+          bodyFile = file
+          stored = `\nbody_file: ${file} (full ${result.body_full?.length ?? result.body.length} bytes; output truncated above)`
         } catch { /* best effort */ }
       }
+      ring.push({
+        id: captureId,
+        ts: new Date().toISOString(),
+        spec: spec as RequestSpec & { browser?: unknown },
+        ...(result.body_full === undefined && result.body.length <= 1_000_000 ? { body: result.body } : {}),
+        ...(result.body_full !== undefined && result.body_full.length <= 1_000_000 ? { body: result.body_full } : {}),
+        ...(bodyFile !== undefined ? { bodyFile } : {}),
+        contentType: result.headers['content-type'],
+      })
+      if (ring.length > 20) ring.shift()
+      captures.set(who, ring)
       return textResult(`${formatResult(result)}\ncapture_id: ${captureId} (http_replay re-sends it with one field changed)${stored}`)
     })
 
@@ -490,9 +518,72 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       return textResult(`Replayed ${captured.id} (changed: ${changed}) from ${captured.ts}\n${formatResult(result)}`)
     })
 
-  t('http_diff', 'Send two requests and diff them (status, body sha, first diverging body line). IDOR/BOLA A/B pairs.',
-    { a: z.object(REQUEST_SHAPE).describe('Request A (e.g. account A session)'), b: z.object(REQUEST_SHAPE).describe('Request B'), owner: z.string().optional() },
-    async ({ a, b, owner }: any) => {
+  t('http_extract', 'Pull one VALUE out of a captured response instead of the body (round-7 §2): jsonpath (`.key`, `[n]`, `[*]`, chained — e.g. "data.items[0].id") over a JSON capture, or a regex over any body. Reads the retained capture (memory, or its body_file on disk) — never re-fetches. Output is values only, each capped ~500 chars, at most 40 — this is what makes $var:NAME chaining real without bodies in the transcript.',
+    {
+      capture_id: z.string().optional().describe('capture_id from a prior http_request (or last: true)'),
+      last: z.boolean().optional().describe('Use this owner\'s most recent capture'),
+      jsonpath: z.string().optional().describe('`.key`, `[n]`, `[*]` chains over the parsed JSON body'),
+      regex: z.string().optional().describe('Regex over the raw body; first capture group if present'),
+      all: z.boolean().optional().describe('Return every match (default: first only)'),
+      owner: z.string().optional().describe('Same owner as the capture'),
+    },
+    async ({ capture_id, last, jsonpath, regex, all, owner }: any) => {
+      const who = owner ?? 'unknown'
+      const ring = captures.get(who)
+      if (ring === undefined || ring.length === 0) return textResult(`no captures for "${who}" — http_request records them`, true)
+      const captured = last === true
+        ? ring[ring.length - 1]!
+        : (capture_id !== undefined ? ring.find(row => row.id === capture_id) : ring[ring.length - 1]!)
+      if (captured === undefined) {
+        return textResult(`unknown capture_id "${capture_id}" for "${who}" — recent: ${ring.map(row => row.id).join(', ')}`, true)
+      }
+      if (jsonpath === undefined && regex === undefined) return textResult('pass jsonpath or regex (e.g. jsonpath: "data.items[0].id", regex: "org-([a-z0-9]+)")', true)
+      // Body source: the retained in-memory body, else its disk file, else refuse.
+      let body = captured.body
+      let readFrom = 'capture (in memory)'
+      if (body === undefined && captured.bodyFile !== undefined) {
+        try { body = fs.readFileSync(captured.bodyFile, 'utf8'); readFrom = `body_file ${captured.bodyFile}` } catch { /* unreadable */ }
+      }
+      if (body === undefined) return textResult(`capture ${captured.id} retained no body (>${1_000_000} bytes and no body_file) — re-send with http_replay and extract from the new capture`, true)
+      const MAX_VALUES = 40
+      const MAX_VALUE_CHARS = 500
+      const cap = (value: string): string => value.length > MAX_VALUE_CHARS ? value.slice(0, MAX_VALUE_CHARS) + `…[${value.length} chars]` : value
+      if (jsonpath !== undefined) {
+        if (captured.contentType !== undefined && !captured.contentType.includes('json')) {
+          return textResult(`capture ${captured.id} is ${captured.contentType} — jsonpath needs JSON; use regex instead`, true)
+        }
+        let parsed: unknown
+        try { parsed = JSON.parse(body) } catch { return textResult(`capture ${captured.id}'s body does not parse as JSON — use regex`, true) }
+        let matches = queryJsonPath(parsed, jsonpath)
+        const total = matches.length
+        matches = all === true ? matches.slice(0, MAX_VALUES) : matches.slice(0, 1)
+        if (matches.length === 0) return textResult(`jsonpath "${jsonpath}" matched nothing in capture ${captured.id} (read from ${readFrom})`, true)
+        const values = matches.map(match => cap(typeof match === 'string' ? match : JSON.stringify(match)))
+        return textResult([
+          values.map((value, index) => (all === true ? `[${index}] ${value}` : value)).join('\n'),
+          `(${all === true ? `${values.length} of ${total} match(es)` : 'first match'}; read_from: ${readFrom})`,
+        ].join('\n'))
+      }
+      // regex mode
+      let re: RegExp
+      try { re = new RegExp(regex!, all === true ? 'g' : '') } catch (error) { return textResult(`invalid regex: ${error instanceof Error ? error.message : String(error)}`, true) }
+      const found: string[] = []
+      let m: RegExpExecArray | null
+      while ((m = re.exec(body)) !== null && found.length < MAX_VALUES) {
+        found.push(m[1] ?? m[0])
+        if (all !== true) break
+        if (m.index === re.lastIndex) re.lastIndex++ // zero-width guard
+      }
+      if (found.length === 0) return textResult(`regex /${regex}/ matched nothing in capture ${captured.id} (read from ${readFrom})`, true)
+      return textResult([
+        found.map((value, index) => (all === true ? `[${index}] ${cap(value)}` : cap(value))).join('\n'),
+        `(${all === true ? `${found.length} match(es)` : 'first match'}; read_from: ${readFrom})`,
+      ].join('\n'))
+    })
+
+  t('http_diff', 'Send two requests and diff them. Plain mode: status, body sha, first diverging body LINE (IDOR/BOLA A/B pairs). `structural: true` (round-7 §3): when both bodies parse as JSON, walk them into per-FIELD changes (path → a → b, capped 50×200 chars) with volatile keys/values (csrf/timestamps/UUID-shapes) SUPPRESSED but listed — the deciding field is named instead of "the minified line differs". Not both JSON → falls back to the line diff.',
+    { a: z.object(REQUEST_SHAPE).describe('Request A (e.g. account A session)'), b: z.object(REQUEST_SHAPE).describe('Request B'), structural: z.boolean().optional().describe('Walk JSON bodies field-by-field (falls back to line diff)'), owner: z.string().optional() },
+    async ({ a, b, structural, owner }: any) => {
       const who = owner ?? 'unknown'
       const [ra, rb] = await Promise.all([
         performLeg(transports, a as RequestSpec & { browser?: unknown }, who, 'http_diff'),
@@ -502,6 +593,19 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       lines.push(`A: HTTP ${ra.status} sha=${ra.body_sha256} (${ra.timing_ms} ms)`)
       lines.push(`B: HTTP ${rb.status} sha=${rb.body_sha256} (${rb.timing_ms} ms)`)
       if (ra.status !== rb.status) lines.push(`STATUS DIVERGES: A=${ra.status} B=${rb.status}`)
+      if (structural === true) {
+        let parsedA: unknown
+        let parsedB: unknown
+        try {
+          parsedA = JSON.parse(ra.body_full ?? ra.body)
+          parsedB = JSON.parse(rb.body_full ?? rb.body)
+        } catch { /* fall through to the line diff */ }
+        if (parsedA !== undefined && parsedB !== undefined) {
+          lines.push(renderStructuralDiff(structuralJsonDiff(parsedA, parsedB, { suppressVolatile: true })))
+          return textResult(lines.join('\n'))
+        }
+        lines.push('(structural: bodies are not both JSON — line diff below)')
+      }
       if (ra.body_sha256 !== rb.body_sha256) {
         const la = ra.body.split('\n')
         const lb = rb.body.split('\n')

@@ -82,6 +82,42 @@ export function verifyChain(config: ConstellationConfig): { ok: boolean; brokenA
   return { ok: true, entries: chain.length }
 }
 
+/** One leg's report core: status + body sha — exactly what a report cites. */
+export interface VerdictLeg {
+  status: number
+  sha: string
+}
+
+/** Append a VERDICT-shaped chain entry (round-7 gap list, "small change"):
+ *  diff_pair's four fields ARE the report core, yet a lane had to re-run
+ *  evidence_capture to cite them. Shared by diff_pair, cell_run and recipe
+ *  drift transitions — the chain then covers the verdict itself, not a
+ *  screenshot taken minutes later. Returns the entry (for the tool output). */
+export function appendVerdictEntry(
+  config: ConstellationConfig,
+  owner: string,
+  source: string,
+  tuple: {
+    verdict: string
+    deciding_field: string
+    probe: VerdictLeg
+    miss: VerdictLeg
+    own?: VerdictLeg
+    expect?: string
+    passed?: boolean
+    object?: string
+    transition?: string
+  },
+): ChainEntry {
+  return appendChainEntry(config, {
+    owner,
+    label: `${source}: ${tuple.verdict}`
+      + (tuple.transition !== undefined ? ` (transition ${tuple.transition})` : '')
+      + (tuple.expect !== undefined ? ` — expect ${tuple.expect} ${tuple.passed === true ? 'HELD' : 'BROKE'}` : ''),
+    note: JSON.stringify(tuple),
+  })
+}
+
 export function registerEvidenceTools(server: ToolRegistrar, config: ConstellationConfig): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {

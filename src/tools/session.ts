@@ -133,6 +133,106 @@ export class SessionWatchRegistry {
 export interface SessionEnv {
   config: ConstellationConfig
   sessionFor: (owner: string) => BrowserSession
+  budget?: import('./budget.js').BudgetGuard
+}
+
+/** ---------------- session_keepalive (round-7 gap list §5) ----------------
+ *  Measured twice: Google test accounts verify SIGNED IN then are signed out
+ *  ~20 minutes later; session_watch observes, nothing acts. A keepalive tick
+ *  is an account-owned VISIT (verifySessionOnce's throwaway tab, mode
+ *  "visit") or a no-navigation state read (mode "noop" against the owner's
+ *  current page). HONESTY REQUIREMENT (from the advice, verbatim in spirit):
+ *  if the sign-out is server-side, no keepalive prevents it — the
+ *  deliverable is the MEASURED LIFETIME + the transition alert, and the tool
+ *  must not be described as keeping sessions alive when it only watches them
+ *  better. */
+
+export type KeepaliveTickState = 'SIGNED_IN' | 'SIGNED_OUT' | 'SKIPPED_BUDGET' | 'ERROR'
+
+export interface KeepaliveEntry {
+  owner: string
+  site: string
+  mode: 'visit' | 'noop'
+  everyS: number
+  startedAt: string
+  lastState?: KeepaliveTickState
+  lastSignedInAt?: string
+  lastTickAt?: string
+  ticks: number
+  timer: ReturnType<typeof setInterval>
+}
+
+export class KeepaliveRegistry {
+  private entries = new Map<string, KeepaliveEntry>()
+  /** Keys with a tick in flight — a tick must never interleave with a lane's navigation. */
+  private inFlight = new Set<string>()
+
+  static key(owner: string, site: string): string { return `${owner}::${site}` }
+
+  inFlightGuard(key: string): boolean {
+    if (this.inFlight.has(key)) return false
+    this.inFlight.add(key)
+    return true
+  }
+
+  releaseFlight(key: string): void { this.inFlight.delete(key) }
+
+  add(entry: Omit<KeepaliveEntry, 'ticks'>): KeepaliveEntry {
+    this.remove(entry.owner, entry.site)
+    const full: KeepaliveEntry = { ...entry, ticks: 0 }
+    this.entries.set(KeepaliveRegistry.key(entry.owner, entry.site), full)
+    return full
+  }
+
+  get(owner: string, site: string): KeepaliveEntry | undefined {
+    return this.entries.get(KeepaliveRegistry.key(owner, site))
+  }
+
+  record(owner: string, site: string, state: KeepaliveTickState): 'STOP' | 'CONTINUE' {
+    const entry = this.get(owner, site)
+    if (entry === undefined) return 'STOP'
+    entry.ticks += 1
+    entry.lastTickAt = new Date().toISOString()
+    entry.lastState = state
+    if (state === 'SIGNED_IN') entry.lastSignedInAt = entry.lastTickAt
+    return 'CONTINUE'
+  }
+
+  /** Measured signed-in lifetime: first tick → last SIGNED_IN tick. */
+  lifetime(entry: KeepaliveEntry): string {
+    if (entry.lastSignedInAt === undefined) return '(never signed in during this keepalive)'
+    const ms = Date.parse(entry.lastSignedInAt) - Date.parse(entry.startedAt)
+    const min = Math.max(0, Math.round(ms / 60_000))
+    return `${min} min (first tick → last SIGNED_IN tick)`
+  }
+
+  remove(owner: string, site: string): boolean {
+    const key = KeepaliveRegistry.key(owner, site)
+    const entry = this.entries.get(key)
+    if (entry === undefined) return false
+    clearInterval(entry.timer)
+    this.entries.delete(key)
+    return true
+  }
+
+  list(): Array<Omit<KeepaliveEntry, 'timer'>> {
+    return [...this.entries.values()].map(({ timer, ...rest }) => {
+      void timer
+      return rest
+    })
+  }
+
+  stopAll(): void {
+    for (const entry of this.entries.values()) clearInterval(entry.timer)
+    this.entries.clear()
+  }
+}
+
+function appendKeepaliveTick(config: ConstellationConfig, line: Record<string, unknown>): void {
+  try {
+    fs.mkdirSync(config.rootDir, { recursive: true })
+    fs.appendFileSync(path.join(config.rootDir, 'session-keepalive.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...line }) + '\n')
+  } catch { /* best effort */ }
 }
 
 /** One verification pass against a live owner session, shared by
@@ -167,7 +267,7 @@ export async function verifySessionOnce(
   }
 }
 
-export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, watches: SessionWatchRegistry): void {
+export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, watches: SessionWatchRegistry, keepalives: KeepaliveRegistry): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
       try { return await handler(args) } catch (error) { return errorResult(error) }
@@ -177,6 +277,72 @@ export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, wat
    *  own tab, so leases on the caller's tabs are untouched). */
   const verifyOnce = (ownerRaw: string | undefined, site: string) =>
     verifySessionOnce(env.config, env.sessionFor, ownerRaw, site)
+
+  /** One keepalive tick. Visit mode = verifySessionOnce (a throwaway tab at
+   *  the proof surface — an actual account-owned visit, budget-counted); noop
+   *  mode = read the owner's CURRENT page and evaluate the rule against it
+   *  (no navigation; a mid-load read retries once after 2 s). */
+  const keepaliveTick = async (owner: string, site: string, mode: 'visit' | 'noop'): Promise<void> => {
+    const key = KeepaliveRegistry.key(owner, site)
+    if (!keepalives.inFlightGuard(key)) return
+    try {
+      const session = env.sessionFor(owner)
+      if (session.context === undefined) {
+        keepalives.remove(owner, site)
+        appendKeepaliveTick(env.config, { owner, site, mode, state: 'STOPPED', reason: 'browser session closed — keepalive stopped' })
+        return
+      }
+      let ok = false
+      let reason = ''
+      if (mode === 'visit') {
+        if (env.budget !== undefined) {
+          try { env.budget.spend(owner) } catch {
+            appendKeepaliveTick(env.config, { owner, site, mode, state: 'SKIPPED_BUDGET', reason: 'budget exhausted — tick skipped, keepalive continues' })
+            keepalives.record(owner, site, 'SKIPPED_BUDGET')
+            return
+          }
+        }
+        ;({ ok, reason } = await verifyOnce(owner, site))
+      } else {
+        const rule = loadProofRules(env.config)[site]
+        if (rule === undefined) {
+          keepalives.remove(owner, site)
+          appendKeepaliveTick(env.config, { owner, site, mode, state: 'STOPPED', reason: `no proof rule for "${site}"` })
+          return
+        }
+        const read = async (): Promise<{ ok: boolean; reason: string }> => {
+          const page = await session.currentPage()
+          const text = await page.evaluate(() => document.body?.innerText ?? '')
+          return evaluateProof(rule, text)
+        }
+        ;({ ok, reason } = await read())
+        if (!ok) {
+          // The page may be mid-navigation (a lane's own work) — one retry
+          // after a settle beats a false SIGNED_OUT transition.
+          await new Promise(resolve => setTimeout(resolve, 2_000))
+          ;({ ok, reason } = await read())
+        }
+      }
+      const state: KeepaliveTickState = ok ? 'SIGNED_IN' : 'SIGNED_OUT'
+      const prev = keepalives.get(owner, site)?.lastState
+      appendKeepaliveTick(env.config, { owner, site, mode, state, reason })
+      keepalives.record(owner, site, state)
+      if (prev === 'SIGNED_IN' && state === 'SIGNED_OUT') {
+        const entry = keepalives.get(owner, site)
+        appendKeepaliveTick(env.config, { owner, site, mode, state: 'TRANSITION', reason: 'SIGNED IN → SIGNED OUT', lifetime: entry !== undefined ? keepalives.lifetime(entry) : '?' })
+        keepalives.remove(owner, site) // the transition IS the deliverable; stop cleanly
+      }
+    } catch (error) {
+      const reasonText = error instanceof Error ? error.message : String(error)
+      appendKeepaliveTick(env.config, { owner, site, mode, state: 'ERROR', reason: reasonText })
+      keepalives.record(owner, site, 'ERROR')
+      if (/failed to launch|no proof rule|Target page|Browser has been closed/i.test(reasonText)) {
+        keepalives.remove(owner, site) // no orphan timers
+      }
+    } finally {
+      keepalives.releaseFlight(key)
+    }
+  }
 
   t('session_verify', 'Verify one owner\'s session against a PER-SITE PROOF RULE (run-8 §3): renders the site\'s account-owned surface in its own throwaway tab and asserts must_contain/must_not_contain. `myaccount.google.com` accepting a session is NOT proof that Gemini accepts it — that false green cost two run-7 lanes two hours; each site needs its own rule.',
     { owner: z.string().describe('Owner whose session to verify'), site: z.string().describe('Proof-rule key, e.g. "google-gemini" (session_proof_set adds rules)') },
@@ -208,14 +374,20 @@ export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, wat
       return textResult(`Watching "${first.owner}" × ${site} every ${interval}s — currently ${first.ok ? 'SIGNED IN' : `NOT SIGNED IN (${first.reason})`}. session_status reads transitions.`)
     })
 
-  t('session_status', 'Live session health: every watch (owner × site), its current state, and when that state began — plus one-shot verification via session_verify. The run-8 answer to "the lane discovered its session was dead at request 30".',
+  t('session_status', 'Live session health: every watch (owner × site), its current state, and when that state began — plus one-shot verification via session_verify, and every running keepalive with its measured lifetime. The run-8 answer to "the lane discovered its session was dead at request 30".',
     {},
     async () => {
       const rows = watches.list()
-      if (rows.length === 0) return textResult('(no session watches — session_watch {owner, site} starts one; session_verify is the one-shot)')
-      return textResult(rows.map(row =>
-        `${row.owner} × ${row.site}: ${row.lastOk === true ? 'SIGNED IN' : 'NOT SIGNED IN'} since ${row.since ?? '?'} (checked ${row.lastCheckedAt ?? '?'})${row.lastOk === false ? ` — ${row.lastReason ?? ''}` : ''}`,
-      ).join('\n'))
+      const keepaliveRows = keepalives.list()
+      if (rows.length === 0 && keepaliveRows.length === 0) return textResult('(no session watches or keepalives — session_watch {owner, site} starts one; session_verify is the one-shot)')
+      const lines: string[] = []
+      for (const row of rows) {
+        lines.push(`${row.owner} × ${row.site}: ${row.lastOk === true ? 'SIGNED IN' : 'NOT SIGNED IN'} since ${row.since ?? '?'} (checked ${row.lastCheckedAt ?? '?'})${row.lastOk === false ? ` — ${row.lastReason ?? ''}` : ''}`)
+      }
+      for (const row of keepaliveRows) {
+        lines.push(`keepalive ${row.owner} × ${row.site} (${row.mode}, every ${row.everyS}s): last ${row.lastState ?? '?'} at ${row.lastTickAt ?? '?'} · ${row.ticks} tick(s) · lifetime so far ${keepalives.get(row.owner, row.site) ? keepalives.lifetime(keepalives.get(row.owner, row.site)!) : '?'}`)
+      }
+      return textResult(lines.join('\n'))
     })
 
   t('session_watch_stop', 'Stop one session watch.',
@@ -248,5 +420,50 @@ export function registerSessionTools(server: ToolRegistrar, env: SessionEnv, wat
       return textResult(remove === true
         ? `Removed proof rule "${site}" (known now: ${Object.keys(rules).join(', ') || 'none'})`
         : `Proof rule "${site}" saved: ${rules[site]?.name} — ${url}. Verify with session_verify {owner, site:"${site}"}.`)
+    })
+
+  t('session_keepalive', 'Periodic account-owned visit against a proof rule (round-7 §5): every ≥300 s, mode "visit" opens a throwaway tab at the proof surface (an actual visit — budget-counted) and asserts the rule; mode "noop" only reads the owner\'s current page. MEASURES the session\'s real lifetime and fires a TRANSITION record (session-keepalive.jsonl) the moment it dies — HONEST LIMIT: if the sign-out is server-side (the measured ~20-minute Google behavior), no keepalive prevents it; the deliverable is the measured lifetime + the alert, not a promise. Stops cleanly on the transition, on browser close, or via session_keepalive_stop. No arguments lists active keepalives.',
+    {
+      owner: z.string().optional().describe('Owner whose session to keep measuring'),
+      site: z.string().optional().describe('Proof-rule key (session_proof_set adds rules)'),
+      every_s: z.number().int().optional().describe('Tick interval, default 600, FLOOR 300 (login-protection politeness)'),
+      mode: z.enum(['visit', 'noop']).optional().describe('visit = navigate the proof surface (default); noop = read the current page only'),
+    },
+    async ({ owner, site, every_s, mode }: any) => {
+      if (owner === undefined || site === undefined) {
+        const rows = keepalives.list()
+        return textResult(rows.length === 0
+          ? '(no keepalives — session_keepalive {owner, site} starts one; ticks log to session-keepalive.jsonl)'
+          : rows.map(row => `${row.owner} × ${row.site} (${row.mode}, every ${row.everyS}s): last ${row.lastState ?? '?'} at ${row.lastTickAt ?? '?'} · ${row.ticks} tick(s)`).join('\n'))
+      }
+      const tickMode = mode ?? 'visit'
+      const interval = Math.max(every_s ?? 600, 300)
+      if (keepalives.list().length >= 10) throw new Error('10 keepalives already running — session_keepalive_stop one first')
+      const first = await verifyOnce(owner, site)
+      if (!first.ok) {
+        return textResult([
+          `NOT starting: "${first.owner}" is NOT signed in on ${site} (${first.reason}).`,
+          'A keepalive measures a LIVE session\'s lifetime — sign in (and session_verify) first; starting from signed-out would measure nothing.',
+        ].join('\n'), true)
+      }
+      const timer = setInterval(() => { void keepaliveTick(first.owner, site, tickMode) }, interval * 1000)
+      timer.unref()
+      keepalives.add({ owner: first.owner, site, mode: tickMode, everyS: interval, startedAt: new Date().toISOString(), lastState: 'SIGNED_IN', lastSignedInAt: new Date().toISOString(), lastTickAt: new Date().toISOString(), timer })
+      appendKeepaliveTick(env.config, { owner: first.owner, site, mode: tickMode, state: 'SIGNED_IN', reason: 'keepalive started (initial verify passed)' })
+      return textResult([
+        `Keepalive ON: "${first.owner}" × ${site} every ${interval}s (${tickMode}) — currently SIGNED IN.`,
+        `Measuring lifetime and visiting the proof surface each tick; the TRANSITION record fires the moment the session dies (watch it in session_status / session-keepalive.jsonl).`,
+        `Honest limit: a server-side sign-out (~20 min on Google test accounts) will NOT be prevented — this measures and alerts, it does not promise to keep the session alive.`,
+      ].join('\n'))
+    })
+
+  t('session_keepalive_stop', 'Stop one session keepalive (it also stops itself on the signed-in→signed-out transition or browser close).',
+    { owner: z.string(), site: z.string() },
+    async ({ owner, site }: any) => {
+      const entry = keepalives.get(owner, site)
+      const lifetime = entry !== undefined ? keepalives.lifetime(entry) : ''
+      return textResult(keepalives.remove(owner, site)
+        ? `Stopped keepalive "${owner}" × ${site}. Measured lifetime: ${lifetime}.`
+        : `No keepalive for "${owner}" × ${site}.`, )
     })
 }

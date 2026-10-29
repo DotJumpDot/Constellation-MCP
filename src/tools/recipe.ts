@@ -24,6 +24,7 @@ import type { ConstellationConfig } from '../config.js'
 import type { JarStore } from './http.js'
 import { performLeg, type RequestResult, type RequestSpec } from './http.js'
 import { verdictOf, type AuthzVerdict } from './diff.js'
+import { appendVerdictEntry } from './evidence.js'
 import type { BudgetGuard } from './budget.js'
 import type { ScopeGuard } from '../scope.js'
 
@@ -107,6 +108,87 @@ export interface Recipe {
 
 export function recipesFile(config: ConstellationConfig): string {
   return path.join(config.rootDir, 'fixture-recipes.json')
+}
+
+/** ---------------- recipe baselines + drift (round-7 gap list §4) ----------
+ *  A boundary that denied last week and allows today is a candidate, and that
+ *  TRANSITION is invisible unless something remembers the last verdict. The
+ *  runner writes a baseline after every expect resolution; NOT_FOUND never
+ *  touches it (a broken fixture must not poison the memory). */
+
+export type RecipeTransition = 'DENY→ALLOW' | 'ALLOW→DENY' | 'UNCHANGED' | 'INCONCLUSIVE'
+
+export interface RecipeBaselineRun {
+  verdict: AuthzVerdict
+  deciding_field: string
+  expect: string
+  passed: boolean
+  at: string
+  statuses: { probe: number; miss: number; own?: number }
+  shas: { probe: string; miss: string; own?: string }
+}
+
+interface BaselineFile {
+  [recipe: string]: {
+    current: RecipeBaselineRun
+    /** Newest last, capped — the drift table reads the last two. */
+    history: RecipeBaselineRun[]
+  }
+}
+
+const ALLOW_FAMILY: ReadonlySet<AuthzVerdict> = new Set(['DATA_LEAK', 'SOFT_ALLOW'])
+
+/** Pure: the transition between two verdicts. Either side NOT_FOUND (or a
+ *  missing previous) is INCONCLUSIVE — never a claim. */
+export function classifyTransition(previous: AuthzVerdict | undefined, current: AuthzVerdict): RecipeTransition {
+  if (previous === undefined || previous === 'NOT_FOUND' || current === 'NOT_FOUND') return 'INCONCLUSIVE'
+  const prevAllow = ALLOW_FAMILY.has(previous)
+  const curAllow = ALLOW_FAMILY.has(current)
+  if (prevAllow === curAllow) return 'UNCHANGED'
+  return prevAllow ? 'ALLOW→DENY' : 'DENY→ALLOW'
+}
+
+function loadBaselines(config: ConstellationConfig): BaselineFile {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(config.rootDir, 'recipe-baselines.json'), 'utf8')) as BaselineFile
+  } catch { return {} }
+}
+
+/** Record one expect resolution. Returns the transition from the previous
+ *  baseline (undefined when nothing comparable: first reading, or the current
+ *  verdict is NOT_FOUND — which must NOT poison the baseline). */
+export function recordBaseline(config: ConstellationConfig, recipe: string, run: Omit<RecipeBaselineRun, 'at'>): { transition?: RecipeTransition; skipped?: boolean } {
+  if (run.verdict === 'NOT_FOUND') return { skipped: true }
+  const file = loadBaselines(config)
+  const previous = file[recipe]?.current
+  const full: RecipeBaselineRun = { ...run, at: new Date().toISOString() }
+  const entry = file[recipe] ?? { current: full, history: [] }
+  entry.current = full
+  entry.history.push(full)
+  if (entry.history.length > 20) entry.history.shift()
+  file[recipe] = entry
+  try {
+    fs.mkdirSync(config.rootDir, { recursive: true })
+    fs.writeFileSync(path.join(config.rootDir, 'recipe-baselines.json'), JSON.stringify(file, null, 2) + '\n')
+  } catch { /* best effort — the run's verdict still returns */ }
+  const transition = classifyTransition(previous?.verdict, run.verdict)
+  return { transition }
+}
+
+/** The stored baseline + recent history for one recipe (or all, for the drift table). */
+export function readBaselines(config: ConstellationConfig, recipe?: string): BaselineFile {
+  const all = loadBaselines(config)
+  if (recipe === undefined) return all
+  return recipe in all ? { [recipe]: all[recipe]! } : {}
+}
+
+/** Drop one recipe's baseline (recipe_baseline {recipe, reset: true}). */
+export function clearBaseline(config: ConstellationConfig, recipe: string): boolean {
+  const file = loadBaselines(config)
+  if (!(recipe in file)) return false
+  delete file[recipe]
+  try { fs.writeFileSync(path.join(config.rootDir, 'recipe-baselines.json'), JSON.stringify(file, null, 2) + '\n') } catch { /* best effort */ }
+  return true
 }
 
 export function loadRecipes(config: ConstellationConfig): Record<string, Recipe> {
@@ -201,6 +283,160 @@ export interface RecipeEnv {
   budget?: BudgetGuard
 }
 
+/** Structured recipe outcome (the fixture_recipe_run handler formats it;
+ *  cell_run reads it — `failedAction: 'expect'` means an AUTHORIZATION
+ *  outcome failed, any other action means the fixture/session broke). */
+export interface RecipeRunOutcome {
+  ok: boolean
+  failedAtStep?: number
+  failedAction?: string
+  failedOwner?: string
+  reason?: string
+  lines: string[]
+  vars: Record<string, string>
+  seconds: number
+}
+
+/** The recipe executor, shared by fixture_recipe_run and cell_run (round-7
+ *  §1): per-step owner switching, $var capture, baseline/drift recording in
+ *  the expect arm, run audit, first-failure diagnostics. */
+export async function executeRecipe(env: RecipeEnv, recipe: Recipe, owner: string): Promise<RecipeRunOutcome> {
+  const name = recipe.name
+  const vars: Record<string, string> = {}
+  const lines: string[] = []
+  let session: BrowserSession | undefined
+  let sessionOwner = ''
+  let lastStepOwner = owner
+  const start = Date.now()
+  const audit = (record: Record<string, unknown>): void => {
+    try { fs.appendFileSync(recipesFile(env.config).replace('fixture-recipes.json', 'fixture-recipe-runs.jsonl'), JSON.stringify({ ts: new Date().toISOString(), recipe: name, owner, ...record }) + '\n') } catch { /* best effort */ }
+  }
+  for (const [index, rawStep] of recipe.steps.entries()) {
+    const step = rawStep as RecipeStep
+    const stepOwner = (step.owner !== undefined && step.owner !== '' ? step.owner : (recipe.owner ?? owner)).trim()
+    lastStepOwner = stepOwner
+    if (sessionOwner !== stepOwner) {
+      session = env.sessionFor(stepOwner)
+      sessionOwner = stepOwner
+      lines.push(`[step ${index + 1}] → switching to "${stepOwner}"'s browser`)
+    }
+    const active = session!
+    const page = await active.currentPage()
+    try {
+      switch (step.action) {
+        case 'navigate': {
+          const url = interpolateVars(step.url!, vars)
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
+          lines.push(`[step ${index + 1}] navigate ${url}`)
+          break
+        }
+        case 'click': {
+          const locator = step.selector !== undefined && step.selector !== ''
+            ? page.locator(interpolateVars(step.selector, vars)).first()
+            : page.locator(`text=${JSON.stringify(interpolateVars(step.deep_text!, vars))}`).first()
+          await locator.click({ timeout: 10_000 })
+          lines.push(`[step ${index + 1}] click ${step.selector ?? `text "${step.deep_text}"`}`)
+          break
+        }
+        case 'type': {
+          const text = interpolateVars(step.text!, vars)
+          await page.locator(interpolateVars(step.selector!, vars)).first().fill(text, { timeout: 10_000 })
+          if (step.press !== undefined && step.press !== '') await page.locator(interpolateVars(step.selector!, vars)).first().press(step.press)
+          lines.push(`[step ${index + 1}] type ${text.length} chars into ${step.selector}`)
+          break
+        }
+        case 'capture': {
+          const text = await page.evaluate(() => document.body?.innerText ?? '')
+          const value = captureFromText(text, step.regex!)
+          if (value === undefined) {
+            lines.push(`[step ${index + 1}] capture ${step.label}: NOT FOUND`)
+            throw new Error(`capture "${step.label}" failed: /${step.regex}/ matched nothing on ${page.url()}. Page text head: ${text.slice(0, 600).replace(/\s+/g, ' ')}`)
+          }
+          vars[step.label!] = value
+          lines.push(`[step ${index + 1}] captured ${step.label} = ${value}`)
+          break
+        }
+        case 'verify': {
+          await page.waitForTimeout(800)
+          const text = await page.evaluate(() => document.body?.innerText ?? '')
+          const verdict = evaluateVerify(text, step)
+          if (!verdict.ok) {
+            const detail = [...verdict.why, ...verdict.hints].join('; ')
+            throw new Error(`verification FAILED at step ${index + 1}: ${detail}. Page text head: ${text.slice(0, 600).replace(/\s+/g, ' ')}`)
+          }
+          lines.push(`[step ${index + 1}] verify OK (${[...normalizeStringArray(step.must_contain).map(needle => `"${needle}" present`), ...normalizeStringArray(step.must_not_contain).map(needle => `"${needle}" absent`)].join(', ')})${step.case_sensitive === true ? ' [exact case]' : ''}`)
+          break
+        }
+        case 'expect': {
+          // Authorization assertion: probe vs miss control through diff_pair
+          // semantics (smoke round 5). A leg with `browser: '<owner>'` (or
+          // true = the step owner) rides that owner's LIVE browser session
+          // (round 6): the same identity the grant/revoke clicks used, so
+          // browser-login products stay testable without a jar.
+          const leg = (raw: Record<string, unknown>): Promise<RequestResult> =>
+            performLeg(env, raw as unknown as RequestSpec & { browser?: unknown }, stepOwner, 'fixture_recipe')
+          const [probe, miss, own] = await Promise.all([
+            leg(step.probe!),
+            leg(step.miss!),
+            step.own !== undefined ? leg(step.own) : Promise.resolve(undefined),
+          ])
+          const verdict = verdictOf({ probe, miss, ...(own !== undefined ? { own } : {}) })
+          // Baseline + drift (round-7 §4): remember what the boundary DID, so
+          // a later run can name the transition. NOT_FOUND never records (a
+          // broken fixture must not poison the baseline), and a DENY→ALLOW
+          // opening cites itself in the evidence chain.
+          const baseline = recordBaseline(env.config, name, {
+            verdict: verdict.verdict,
+            deciding_field: verdict.deciding_field,
+            expect: step.expect!,
+            passed: expectPasses(verdict.verdict, step.expect!),
+            statuses: { probe: probe.status, miss: miss.status, ...(own !== undefined ? { own: own.status } : {}) },
+            shas: { probe: probe.body_sha256, miss: miss.body_sha256, ...(own !== undefined ? { own: own.body_sha256 } : {}) },
+          })
+          if (baseline.transition === 'DENY→ALLOW') {
+            try {
+              appendVerdictEntry(env.config, stepOwner, 'recipe_drift', {
+                verdict: verdict.verdict,
+                deciding_field: verdict.deciding_field,
+                probe: { status: probe.status, sha: probe.body_sha256 },
+                miss: { status: miss.status, sha: miss.body_sha256 },
+                transition: 'DENY→ALLOW',
+                object: name,
+              })
+            } catch { /* the chain must never fail the run */ }
+            lines.push(`[step ${index + 1}] ⚠ TRANSITION DENY→ALLOW — this boundary OPENED since its last baseline: candidate (the transition is cited in the evidence chain)`)
+          }
+          if (!expectPasses(verdict.verdict, step.expect!)) {
+            const wanted = step.expect === 'deny'
+              ? 'the boundary to DENY the other identity'
+              : 'the other identity to have access'
+            throw new Error(`authorization assertion FAILED at step ${index + 1}: expected ${wanted}, but diff_pair said ${verdict.verdict} (deciding: ${verdict.deciding_field}) — ${verdict.note}`)
+          }
+          lines.push(`[step ${index + 1}] expect ${step.expect} OK — ${verdict.verdict} (deciding: ${verdict.deciding_field})`)
+          break
+        }
+        case 'wait': {
+          await page.waitForTimeout(Math.min(step.ms ?? 1000, 30_000))
+          lines.push(`[step ${index + 1}] wait ${Math.min(step.ms ?? 1000, 30_000)} ms`)
+          break
+        }
+        default: {
+          // Round-7 D1: an unknown/missing action must FAIL the run, never
+          // skip silently — loadRecipes trusts the file on disk, and a step
+          // that matches no arm asserts nothing.
+          throw new Error(`unknown step action ${JSON.stringify(step.action) ?? '(missing)'} at step ${index + 1} — valid: navigate|click|type|capture|verify|wait|expect`)
+        }
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      audit({ step: index + 1, action: step.action, ok: false, reason, vars })
+      return { ok: false, failedAtStep: index + 1, failedAction: step.action, failedOwner: lastStepOwner, reason, lines, vars, seconds: Math.round((Date.now() - start) / 1000) }
+    }
+  }
+  audit({ step: recipe.steps.length, action: 'complete', ok: true, vars })
+  return { ok: true, lines, vars, seconds: Math.round((Date.now() - start) / 1000) }
+}
+
 export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
@@ -264,122 +500,62 @@ export function registerRecipeTools(server: ToolRegistrar, env: RecipeEnv): void
       // silently skip a step whose action is missing.
       const invalid = validateRecipe(name, recipe)
       if (invalid !== undefined) return textResult(`Refusing to run "${name}": ${invalid} — fix it with fixture_recipe_set.`, true)
-      const vars: Record<string, string> = {}
-      const lines: string[] = []
-      let session: BrowserSession | undefined
-      let sessionOwner = ''
-      const start = Date.now()
-      for (const [index, rawStep] of recipe.steps.entries()) {
-        const step = rawStep as RecipeStep
-        const stepOwner = (step.owner !== undefined && step.owner !== '' ? step.owner : (recipe.owner ?? owner)).trim()
-        if (sessionOwner !== stepOwner) {
-          session = env.sessionFor(stepOwner)
-          sessionOwner = stepOwner
-          lines.push(`[step ${index + 1}] → switching to "${stepOwner}"'s browser`)
-        }
-        const active = session!
-        const page = await active.currentPage()
-        try {
-          switch (step.action) {
-            case 'navigate': {
-              const url = interpolateVars(step.url!, vars)
-              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
-              lines.push(`[step ${index + 1}] navigate ${url}`)
-              break
-            }
-            case 'click': {
-              const locator = step.selector !== undefined && step.selector !== ''
-                ? page.locator(interpolateVars(step.selector, vars)).first()
-                : page.locator(`text=${JSON.stringify(interpolateVars(step.deep_text!, vars))}`).first()
-              await locator.click({ timeout: 10_000 })
-              lines.push(`[step ${index + 1}] click ${step.selector ?? `text "${step.deep_text}"`}`)
-              break
-            }
-            case 'type': {
-              const text = interpolateVars(step.text!, vars)
-              await page.locator(interpolateVars(step.selector!, vars)).first().fill(text, { timeout: 10_000 })
-              if (step.press !== undefined && step.press !== '') await page.locator(interpolateVars(step.selector!, vars)).first().press(step.press)
-              lines.push(`[step ${index + 1}] type ${text.length} chars into ${step.selector}`)
-              break
-            }
-            case 'capture': {
-              const text = await page.evaluate(() => document.body?.innerText ?? '')
-              const value = captureFromText(text, step.regex!)
-              if (value === undefined) {
-                lines.push(`[step ${index + 1}] capture ${step.label}: NOT FOUND`)
-                throw new Error(`capture "${step.label}" failed: /${step.regex}/ matched nothing on ${page.url()}. Page text head: ${text.slice(0, 600).replace(/\s+/g, ' ')}`)
-              }
-              vars[step.label!] = value
-              lines.push(`[step ${index + 1}] captured ${step.label} = ${value}`)
-              break
-            }
-            case 'verify': {
-              await page.waitForTimeout(800)
-              const text = await page.evaluate(() => document.body?.innerText ?? '')
-              const verdict = evaluateVerify(text, step)
-              if (!verdict.ok) {
-                const detail = [...verdict.why, ...verdict.hints].join('; ')
-                throw new Error(`verification FAILED at step ${index + 1}: ${detail}. Page text head: ${text.slice(0, 600).replace(/\s+/g, ' ')}`)
-              }
-              lines.push(`[step ${index + 1}] verify OK (${[...normalizeStringArray(step.must_contain).map(needle => `"${needle}" present`), ...normalizeStringArray(step.must_not_contain).map(needle => `"${needle}" absent`)].join(', ')})${step.case_sensitive === true ? ' [exact case]' : ''}`)
-              break
-            }
-            case 'expect': {
-              // Authorization assertion: probe vs miss control through
-              // diff_pair semantics (smoke round 5) — a recipe can now prove
-              // the boundary held or broke, not just that text is present.
-              // A leg with `browser: '<owner>'` (or true = the step owner)
-              // rides that owner's LIVE browser session (round 6): the same
-              // identity the grant/revoke clicks used, so browser-login
-              // products stay testable without a jar.
-              const leg = (raw: Record<string, unknown>): Promise<RequestResult> =>
-                performLeg(env, raw as unknown as RequestSpec & { browser?: unknown }, stepOwner, 'fixture_recipe')
-              const [probe, miss, own] = await Promise.all([
-                leg(step.probe!),
-                leg(step.miss!),
-                step.own !== undefined ? leg(step.own) : Promise.resolve(undefined),
-              ])
-              const verdict = verdictOf({ probe, miss, ...(own !== undefined ? { own } : {}) })
-              if (!expectPasses(verdict.verdict, step.expect!)) {
-                const wanted = step.expect === 'deny'
-                  ? 'the boundary to DENY the other identity'
-                  : 'the other identity to have access'
-                throw new Error(`authorization assertion FAILED at step ${index + 1}: expected ${wanted}, but diff_pair said ${verdict.verdict} (deciding: ${verdict.deciding_field}) — ${verdict.note}`)
-              }
-              lines.push(`[step ${index + 1}] expect ${step.expect} OK — ${verdict.verdict} (deciding: ${verdict.deciding_field})`)
-              break
-            }
-            case 'wait': {
-              await page.waitForTimeout(Math.min(step.ms ?? 1000, 30_000))
-              lines.push(`[step ${index + 1}] wait ${Math.min(step.ms ?? 1000, 30_000)} ms`)
-              break
-            }
-            default: {
-              // Round-7 D1: an unknown/missing action must FAIL the run, never
-              // skip silently — loadRecipes trusts the file on disk, and a
-              // step that matches no arm asserts nothing.
-              throw new Error(`unknown step action ${JSON.stringify(step.action) ?? '(missing)'} at step ${index + 1} — valid: navigate|click|type|capture|verify|wait|expect`)
-            }
-          }
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error)
-          const record = { ts: new Date().toISOString(), recipe: name, owner, step: index + 1, action: step.action, ok: false, reason, vars }
-          try { fs.appendFileSync(recipesFile(env.config).replace('fixture-recipes.json', 'fixture-recipe-runs.jsonl'), JSON.stringify(record) + '\n') } catch { /* best effort */ }
-          return textResult([
-            `RECIPE FAILED at step ${index + 1}/${recipe.steps.length} (${step.action}) as "${stepOwner}":`,
-            reason,
-            '',
-            `Variables captured so far: ${Object.entries(vars).map(([key, value]) => `${key}=${value}`).join(', ') || '(none)'}`,
-            'Fix the step or the session and re-run — the recipe is unchanged.',
-          ].join('\n'), true)
-        }
+      const outcome = await executeRecipe(env, recipe, owner)
+      if (!outcome.ok) {
+        return textResult([
+          `RECIPE FAILED at step ${outcome.failedAtStep}/${recipe.steps.length} (${outcome.failedAction}) as "${outcome.failedOwner}":`,
+          outcome.reason,
+          '',
+          `Variables captured so far: ${Object.entries(outcome.vars).map(([key, value]) => `${key}=${value}`).join(', ') || '(none)'}`,
+          'Fix the step or the session and re-run — the recipe is unchanged.',
+        ].join('\n'), true)
       }
-      const record = { ts: new Date().toISOString(), recipe: name, owner, step: recipe.steps.length, action: 'complete', ok: true, vars }
-      try { fs.appendFileSync(recipesFile(env.config).replace('fixture-recipes.json', 'fixture-recipe-runs.jsonl'), JSON.stringify(record) + '\n') } catch { /* best effort */ }
       return textResult([
-        `RECIPE "${name}" COMPLETE — ${recipe.steps.length} step(s) in ${Math.round((Date.now() - start) / 1000)} s.`,
-        ...lines,
-        `Variables captured: ${Object.entries(vars).map(([key, value]) => `${key}=${value}`).join(', ') || '(none)'}`,
+        `RECIPE "${name}" COMPLETE — ${recipe.steps.length} step(s) in ${outcome.seconds} s.`,
+        ...outcome.lines,
+        `Variables captured: ${Object.entries(outcome.vars).map(([key, value]) => `${key}=${value}`).join(', ') || '(none)'}`,
       ].join('\n'))
+    })
+
+  t('recipe_baseline', 'Show one recipe\'s stored baseline (round-7 §4): the verdict, deciding field, statuses and body shas of its last expect resolution, plus recent history. The runner records a baseline after EVERY expect step (never on NOT_FOUND — a broken fixture must not poison the memory); `reset: true` drops it so the next run becomes a fresh first reading.',
+    {
+      recipe: z.string().describe('Recipe name'),
+      reset: z.boolean().optional().describe('Drop the stored baseline'),
+    },
+    async ({ recipe, reset }: any) => {
+      if (reset === true) {
+        return textResult(clearBaseline(env.config, recipe)
+          ? `Baseline for "${recipe}" dropped — the next expect resolution becomes a fresh first reading.`
+          : `No baseline stored for "${recipe}".`, )
+      }
+      const stored = readBaselines(env.config, recipe)[recipe]
+      if (stored === undefined) return textResult(`No baseline stored for "${recipe}" yet — run the recipe; the expect step records it automatically.`)
+      const render = (run: RecipeBaselineRun) =>
+        `${run.at} — ${run.verdict} (deciding: ${run.deciding_field}, expect ${run.expect} ${run.passed ? 'HELD' : 'BROKE'}; probe ${run.statuses.probe}/miss ${run.statuses.miss}${run.statuses.own !== undefined ? `/own ${run.statuses.own}` : ''}; sha ${run.shas.probe.slice(0, 8)}…/${run.shas.miss.slice(0, 8)}…)`
+      return textResult([
+        `BASELINE "${recipe}":`,
+        render(stored.current),
+        ...(stored.history.length > 1 ? ['', `history (${stored.history.length}, oldest first):`, ...stored.history.slice(0, -1).map(render)] : []),
+        '',
+        'recipe_drift names the transition between the last two readings.',
+      ].join('\n'))
+    })
+
+  t('recipe_drift', 'The transition is the finding (round-7 §4): a boundary that DENIED last week and ALLOWS today is a candidate, and nothing remembered that. This table compares each recipe\'s last two baseline readings — DENY→ALLOW (opening = candidate; the runner already cited it in the evidence chain), ALLOW→DENY, UNCHANGED, INCONCLUSIVE (a NOT_FOUND on either side: the fixture broke, prove nothing). Omit `recipe` for every recipe with a baseline.',
+    { recipe: z.string().optional() },
+    async ({ recipe }: any) => {
+      const stored = readBaselines(env.config, recipe)
+      const names = Object.keys(stored)
+      if (names.length === 0) return textResult(recipe !== undefined
+        ? `No baseline for "${recipe}" — run the recipe first (expect steps record automatically).`
+        : '(no baselines yet — run any recipe with an expect step)')
+      return textResult(names.map(name => {
+        const entry = stored[name]!
+        if (entry.history.length < 2) return `${name}: first reading ${entry.current.verdict} at ${entry.current.at} — no comparison yet`
+        const prev = entry.history[entry.history.length - 2]!
+        const transition = classifyTransition(prev.verdict, entry.current.verdict)
+        const marker = transition === 'DENY→ALLOW' ? ' ⚠ OPENING — candidate' : transition === 'ALLOW→DENY' ? ' (boundary tightened)' : ''
+        return `${name}: ${transition} (${prev.verdict} at ${prev.at} → ${entry.current.verdict} at ${entry.current.at})${marker}`
+      }).join('\n'))
     })
 }

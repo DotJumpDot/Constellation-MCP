@@ -972,3 +972,102 @@ test('diff_pair: SOFT_ALLOW names the miss control when no own leg was sent (rou
   assert.equal(verdictOf({ probe: leg('aaa'), miss, own: leg('aaa') }).verdict, 'DATA_LEAK', 'same bytes as a PRESENT owner leg is still DATA_LEAK')
   assert.match(verdictOf({ probe: leg('aaa'), miss, own: leg('zzz') }).note, /different bytes than the owner/, 'with an own leg the owner wording stays')
 })
+
+test('cells: foldCellStatus statuses (round-7 §1)', async () => {
+  const cellTools = await import('../src/tools/cell.js')
+  const cell = { id: 'c1', engagement: 'e', object: 'shared page revoke', principal: 'tester', expect: 'deny' as const, createdAt: '2026-10-29T00:00:00Z' }
+  const legRun = (over: Partial<cellTools.CellRunRecord>): cellTools.CellRunRecord => ({
+    ts: '2026-10-29T01:00:00Z', id: 'c1', ok: true, source: 'legs', expect: 'deny', ...over,
+  } as cellTools.CellRunRecord)
+  assert.equal(cellTools.foldCellStatus(cell, []).status, 'NEVER TESTED')
+  assert.equal(cellTools.foldCellStatus(cell, [legRun({ verdict: 'NOT_FOUND', ok: false, deciding_field: 'none' })]).status, 'INCONCLUSIVE', 'the run-7 false-green, structurally impossible now')
+  assert.equal(cellTools.foldCellStatus(cell, [legRun({ verdict: 'AUTHORIZATION_DENIAL' })]).status, 'NEGATIVE', 'boundary held as designed')
+  assert.equal(cellTools.foldCellStatus(cell, [legRun({ verdict: 'DATA_LEAK', ok: false })]).status, 'CANDIDATE')
+  assert.equal(cellTools.foldCellStatus(cell, [legRun({ verdict: 'SOFT_ALLOW', ok: false })]).status, 'CANDIDATE')
+  // The LAST run decides.
+  assert.equal(cellTools.foldCellStatus(cell, [legRun({ verdict: 'DATA_LEAK', ok: false }), legRun({ verdict: 'AUTHORIZATION_DENIAL' })]).status, 'NEGATIVE')
+  // Recipe-source runs: fail at expect = CANDIDATE; fail anywhere else = INCONCLUSIVE.
+  assert.equal(cellTools.foldCellStatus(cell, [{ ts: 't', id: 'c1', ok: true, source: 'recipe', expect: 'deny' }]).status, 'NEGATIVE')
+  assert.equal(cellTools.foldCellStatus(cell, [{ ts: 't', id: 'c1', ok: false, source: 'recipe', expect: 'deny', failedAction: 'expect' }]).status, 'CANDIDATE')
+  assert.equal(cellTools.foldCellStatus(cell, [{ ts: 't', id: 'c1', ok: false, source: 'recipe', expect: 'deny', failedAction: 'verify' }]).status, 'INCONCLUSIVE')
+})
+
+test('structural: json diff names the field, lists suppressed volatile (round-7 §3)', async () => {
+  const { structuralJsonDiff, renderStructuralDiff, isVolatileValueShape } = await import('../src/tools/structural.js')
+  const a = { role: 'member', csrf: 'abc', items: [1, 2, 3] }
+  const b = { role: 'owner', csrf: 'xyz', items: [1, 2] }
+  const result = structuralJsonDiff(a, b, { suppressVolatile: true })
+  assert.equal(result.changed.length, 2, 'role + items.length; csrf suppressed')
+  assert.ok(result.changed.some(c => c.path === 'role' && c.a === 'member' && c.b === 'owner'))
+  assert.ok(result.suppressed.some(s => s.path === 'csrf' && /volatile key/.test(s.reason)), 'suppression is LISTED, never silent')
+  const text = renderStructuralDiff(result)
+  assert.match(text, /role: member → owner/)
+  assert.match(text, /suppressed/)
+  // Value-shape suppression: UUID-vs-UUID on a non-volatile key.
+  const shaped = structuralJsonDiff({ ref: '3f2a8c4d-1111-2222-3333-444455556666' }, { ref: '3f2a8c4d-9999-8888-7777-666655554444' }, { suppressVolatile: true })
+  assert.equal(shaped.changed.length, 0)
+  assert.equal(shaped.suppressed.length, 1, 'UUID-shaped values on both sides count as volatile')
+  assert.equal(isVolatileValueShape('2026-10-29T12:00:00Z'), true)
+  assert.equal(isVolatileValueShape('plain text'), false)
+  // Without suppression, nothing is hidden (probe-vs-own honesty).
+  const raw = structuralJsonDiff({ csrf: 'abc' }, { csrf: 'xyz' })
+  assert.equal(raw.changed.length, 1)
+  assert.equal(raw.suppressed.length, 0)
+})
+
+test('structural: jsonpath subset — chains, indexes, wildcard fan-out (round-7 §2)', async () => {
+  const { queryJsonPath } = await import('../src/tools/structural.js')
+  const doc = { data: { items: [{ id: 'org-1', role: 'admin' }, { id: 'org-2', role: 'member' }] } }
+  assert.deepEqual(queryJsonPath(doc, 'data.items[0].id'), ['org-1'])
+  assert.deepEqual(queryJsonPath(doc, 'data.items[*].id'), ['org-1', 'org-2'])
+  assert.deepEqual(queryJsonPath(doc, 'data.missing.id'), [])
+  assert.deepEqual(queryJsonPath(doc, 'data.items[9].id'), [])
+})
+
+test('recipe baselines: NOT_FOUND never poisons; drift names the transition (round-7 §4)', async () => {
+  const fsMod = await import('node:fs')
+  const osMod = await import('node:os')
+  const pathMod = await import('node:path')
+  const recipeTools = await import('../src/tools/recipe.js')
+  const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'constellation-baseline-'))
+  try {
+    const config = { rootDir: dir } as never
+    const tuple = (verdict: 'AUTHORIZATION_DENIAL' | 'SOFT_ALLOW' | 'NOT_FOUND') => ({
+      verdict, deciding_field: 'status', expect: 'deny', passed: verdict === 'AUTHORIZATION_DENIAL',
+    })
+    const first = recipeTools.recordBaseline(config, 'r1', tuple('AUTHORIZATION_DENIAL'))
+    assert.equal(first.transition, 'INCONCLUSIVE', 'first reading has nothing to compare')
+    const opened = recipeTools.recordBaseline(config, 'r1', tuple('SOFT_ALLOW'))
+    assert.equal(opened.transition, 'DENY→ALLOW', 'the opening is named without being told the previous verdict')
+    const stable = recipeTools.recordBaseline(config, 'r1', tuple('SOFT_ALLOW'))
+    assert.equal(stable.transition, 'UNCHANGED')
+    assert.equal(recipeTools.classifyTransition(undefined, 'SOFT_ALLOW'), 'INCONCLUSIVE')
+    assert.equal(recipeTools.classifyTransition('NOT_FOUND', 'SOFT_ALLOW'), 'INCONCLUSIVE')
+    assert.equal(recipeTools.classifyTransition('SOFT_ALLOW', 'AUTHORIZATION_DENIAL'), 'ALLOW→DENY')
+    // NOT_FOUND skips the write entirely — the baseline still says SOFT_ALLOW.
+    const poisoned = recipeTools.recordBaseline(config, 'r1', tuple('NOT_FOUND'))
+    assert.equal(poisoned.skipped, true)
+    assert.equal(recipeTools.readBaselines(config, 'r1').r1!.current.verdict, 'SOFT_ALLOW', 'a broken fixture did not poison the baseline')
+    assert.equal(recipeTools.clearBaseline(config, 'r1'), true)
+    assert.equal(Object.keys(recipeTools.readBaselines(config)).length, 0)
+  } finally {
+    fsMod.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('keepalive registry: records ticks, measures lifetime, stops on remove (round-7 §5)', async () => {
+  const sessionTools = await import('../src/tools/session.js')
+  const registry = new sessionTools.KeepaliveRegistry()
+  const entry = registry.add({
+    owner: 'scout', site: 'google-gemini', mode: 'visit', everyS: 300,
+    startedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+    lastSignedInAt: new Date(Date.now() - 60_000).toISOString(),
+    timer: setTimeout(() => undefined, 60_000),
+  })
+  registry.record('scout', 'google-gemini', 'SIGNED_IN')
+  assert.equal(registry.get('scout', 'google-gemini')!.ticks, 1)
+  assert.match(registry.lifetime(entry), /5 min/, 'first tick → last SIGNED IN (the recorded tick refreshed it to now)')
+  assert.equal(registry.list().length, 1)
+  assert.equal(registry.remove('scout', 'google-gemini'), true)
+  assert.equal(registry.list().length, 0)
+})

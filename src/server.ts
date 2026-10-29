@@ -14,11 +14,13 @@ import { registerGitTools } from './tools/git.js'
 import { BudgetGuard, registerBudgetTools } from './tools/budget.js'
 import { FixtureStore, registerFixtureTools } from './tools/fixture.js'
 import { registerDiffTools } from './tools/diff.js'
-import { SessionWatchRegistry, registerSessionTools } from './tools/session.js'
+import { SessionWatchRegistry, KeepaliveRegistry, registerSessionTools } from './tools/session.js'
 import { registerEvidenceTools } from './tools/evidence.js'
 import { registerDupeTools } from './tools/dupcheck.js'
 import { InjectStore, registerInjectTools } from './tools/injectlab.js'
 import { registerRecipeTools } from './tools/recipe.js'
+import { registerCellTools } from './tools/cell.js'
+import { registerReportTools } from './tools/report.js'
 
 export interface ConstellationServer {
   connect(): Promise<void>
@@ -35,6 +37,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   const fixtures = new FixtureStore(oob, config)
   const injects = new InjectStore(path.join(config.rootDir, 'injectlab'))
   const watches = new SessionWatchRegistry()
+  const keepalives = new KeepaliveRegistry()
 
   const mcp = new McpServer({ name: 'constellation', version: '0.1.0' }, {
     instructions: [
@@ -45,7 +48,8 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
       'Secrets: reference $secret:NAME inside http_request instead of pasting values.',
       'browser_run_code_unsafe is the escape hatch (full Page API + Node require, NOT scope-guarded inside) — use it only when guarded tools cannot express the step.',
       'human_task_* / lane_freeze / team_snapshot are NATIVE team tools with no mcp__ prefix — do not add a server prefix to them.',
-      'Manufacture fixtures, do not hand-build them: fixture_publish (public URL + canary; fixture_hits answers canary_seen), fixture_forge (real .docx/.pdf for browser_upload), dupe_check before deep work, diff_pair for the authorization verdict, session_verify/session_watch with per-site proof rules, http_replay to vary exactly one field, evidence_capture/evidence_verify for the tamper-evident chain.',
+      'Manufacture fixtures, do not hand-build them: fixture_publish (public URL + canary; fixture_hits answers canary_seen), fixture_forge (real .docx/.pdf for browser_upload), dupe_check before deep work, diff_pair for the authorization verdict (it cites itself in the evidence chain), session_verify/session_watch with per-site proof rules, http_replay to vary exactly one field, http_extract for one VALUE out of a capture, evidence_capture/evidence_verify for the tamper-evident chain.',
+      'Track the work in CELLS, not memory: cell_register the object+principal+expected verdict, cell_run stores the verdict tuple (NOT_FOUND = INCONCLUSIVE, never negative), cell_status is the scoreboard, cell_ledger replaces hand-curated markdown, recipe_drift names DENY→ALLOW transitions, report_assemble builds the skeleton from CANDIDATE cells only.',
     ].join('\n'),
   })
 
@@ -58,12 +62,14 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerBrowserTools(registrar, env)
   registerHttpTools(registrar, { ...env, sessionFor: owner => registry.sessionFor(owner) }, jars)
   registerFixtureTools(registrar, fixtures)
-  registerDiffTools(registrar, { jars, scope, budget, sessionFor: owner => registry.sessionFor(owner) })
-  registerSessionTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner) }, watches)
+  registerDiffTools(registrar, { config, jars, scope, budget, sessionFor: owner => registry.sessionFor(owner) })
+  registerSessionTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner), budget }, watches, keepalives)
   registerEvidenceTools(registrar, config)
   registerDupeTools(registrar)
   registerInjectTools(registrar, injects, { config, fixtures, budget, sessionFor: owner => registry.sessionFor(owner) }, config.outputDir)
   registerRecipeTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner), jars, scope, budget })
+  registerCellTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner), jars, scope, budget })
+  registerReportTools(registrar, { config })
   registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)
   registerMailTools(registrar)
@@ -79,6 +85,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
     },
     async dispose(): Promise<void> {
       watches.stopAll()
+      keepalives.stopAll()
       await registry.disposeAll()
       await oob.dispose()
     },

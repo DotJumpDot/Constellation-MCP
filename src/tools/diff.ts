@@ -15,6 +15,7 @@ import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '..
 import type { ScopeGuard } from '../scope.js'
 import type { JarStore, RequestResult, RequestSpec } from './http.js'
 import { performLeg } from './http.js'
+import { appendVerdictEntry } from './evidence.js'
 
 export type AuthzVerdict = 'AUTHORIZATION_DENIAL' | 'NOT_FOUND' | 'SOFT_ALLOW' | 'DATA_LEAK'
 
@@ -83,6 +84,7 @@ export function firstJsonDiff(a: unknown, b: unknown, prefix = ''): string | und
 }
 
 export interface DiffEnv {
+  config: import('../config.js').ConstellationConfig
   jars: JarStore
   scope: ScopeGuard
   budget?: import('./budget.js').BudgetGuard
@@ -112,7 +114,7 @@ export function registerDiffTools(server: ToolRegistrar, env: DiffEnv): void {
     },
     async ({ probe, miss, own, anon, owner }: any) => {
       const who = owner ?? 'unknown'
-      const run = (spec: RequestSpec & { browser?: unknown }): Promise<import('./http.js').RequestResult> =>
+      const run = (spec: RequestSpec & { browser?: unknown }): Promise<RequestResult> =>
         performLeg(env, spec, who, 'diff_pair')
       const [probeResult, missResult, ownResult, anonResult] = await Promise.all([
         run(probe),
@@ -129,6 +131,23 @@ export function registerDiffTools(server: ToolRegistrar, env: DiffEnv): void {
           if (found !== undefined) deciding = `body ${found}`
         } catch { /* non-JSON bodies: keep 'body' */ }
       }
+      // Round-7 "small change": a non-NOT_FOUND verdict cites ITSELF in the
+      // tamper-evident chain — the statuses + shas are the report core, and a
+      // lane no longer re-runs evidence_capture minutes later to capture what
+      // it already proved.
+      let evidenceLine = ''
+      if (verdict !== 'NOT_FOUND') {
+        try {
+          const entry = appendVerdictEntry(env.config, who, 'diff_pair', {
+            verdict,
+            deciding_field: deciding,
+            probe: { status: probeResult.status, sha: probeResult.body_sha256 },
+            miss: { status: missResult.status, sha: missResult.body_sha256 },
+            ...(ownResult !== undefined ? { own: { status: ownResult.status, sha: ownResult.body_sha256 } } : {}),
+          })
+          evidenceLine = `evidence: chain entry #${entry.seq} (hash ${entry.entry_hash.slice(0, 12)}…)\n`
+        } catch { /* the chain must never fail the verdict */ }
+      }
       const line = (label: string, result: RequestResult): string =>
         `${label}: HTTP ${result.status} sha=${result.body_sha256.slice(0, 12)}… (${result.timing_ms} ms)`
       return textResult([
@@ -137,6 +156,7 @@ export function registerDiffTools(server: ToolRegistrar, env: DiffEnv): void {
         ...(anonResult !== undefined && anonResult.status >= 200 && anonResult.status < 300
           ? [`⚠ UNAUTHENTICATED access also returns HTTP ${anonResult.status} — check whether this object needs any session at all`]
           : []),
+        evidenceLine,
         '',
         line('probe (other identity)', probeResult),
         line('miss control (random id)', missResult),
