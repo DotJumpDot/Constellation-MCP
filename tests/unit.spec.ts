@@ -494,6 +494,39 @@ test('redact: header values, bearer/JWT/base64 runs are masked (run-5 §1)', asy
   assert.equal(redactSecrets('token authentication failed for the lane'), 'token authentication failed for the lane')
 })
 
+test('redact: Playwright action arguments never echo (run-11 D12)', async () => {
+  const { redactSecrets } = await import('../src/redact.js')
+  // A failed fill carries the VALUE it was typing straight into the error —
+  // the exact field leak (a lane password) from run 11.
+  const filled = redactSecrets('locator.fill: Timeout 30000ms exceeded\n  - filling input[name="password"] with "A-password-hunter2"')
+  assert.doesNotMatch(filled, /hunter2/)
+  assert.match(filled, /filling input\[name="password"\] with ••••••/)
+  const typed = redactSecrets('page.type("#otp", "123456") failed')
+  assert.doesNotMatch(typed, /123456/)
+  assert.match(typed, /type\(••••••\)/)
+  assert.doesNotMatch(redactSecrets('fill("s3cret-value") rejected'), /s3cret-value/)
+  // Named press keys keep their shape (they are not credentials)
+  assert.equal(redactSecrets('press("Enter") settled'), 'press("Enter") settled')
+  assert.equal(redactSecrets('press("Control+a") settled'), 'press("Control+a") settled')
+  // A press that IS a value gets masked
+  assert.doesNotMatch(redactSecrets('press("my-password-1") rejected'), /my-password-1/)
+})
+
+test('dupe_check: per-keyword hits merge by CVE id, newest first (run-11 D13)', async () => {
+  const { mergeNvdHits } = await import('../src/tools/dupcheck.js')
+  const zendesk = [
+    { id: 'CVE-2024-49193', published: '2024-07-02', description: 'Zendesk Support ticket history read' },
+    { id: 'CVE-2023-1111', published: '2023-02-01', description: 'older' },
+  ]
+  const support = [
+    { id: 'CVE-2024-49193', published: '2024-07-02', description: 'duplicate across keywords' },
+    { id: 'CVE-2025-22222', published: '2025-01-05', description: 'newest' },
+  ]
+  const merged = mergeNvdHits([zendesk, support, []])
+  assert.deepEqual(merged.map(h => h.id), ['CVE-2025-22222', 'CVE-2024-49193', 'CVE-2023-1111'], 'deduped by id, newest first')
+  assert.equal(merged.length, 3, 'the cross-keyword duplicate counts once')
+})
+
 test('redact: describeErrorChain output passes through redactSecrets at the boundary', async () => {
   const { redactSecrets } = await import('../src/redact.js')
   const redacted = redactSecrets(describeErrorChain(new Error('POST /api failed: authorization: Bearer sk-proj-abcdefghij0123456789ABCDEFGHIJKLMNOP')))

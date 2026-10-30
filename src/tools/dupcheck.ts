@@ -35,6 +35,20 @@ export function parseNvdResponse(payload: unknown): NvdHit[] {
   }).filter(hit => hit.id !== '?')
 }
 
+/** Merge per-keyword hit lists into one deduped list, newest first — pure so
+ *  tests pin it. NVD ANDs a joined keyword string (run-11 D13: a joined
+ *  "zendesk support portal" query returned 0 while "zendesk" alone returns
+ *  15), so keywords are queried INDEPENDENTLY and unioned here. */
+export function mergeNvdHits(hitLists: NvdHit[][]): NvdHit[] {
+  const byId = new Map<string, NvdHit>()
+  for (const hits of hitLists) {
+    for (const hit of hits) {
+      if (hit.id !== '?' && !byId.has(hit.id)) byId.set(hit.id, hit)
+    }
+  }
+  return [...byId.values()].sort((a, b) => (a.published < b.published ? 1 : a.published > b.published ? -1 : a.id.localeCompare(b.id)))
+}
+
 /** Extract candidate dupe ids from a known-issues page's text — pure. */
 export function extractAdvisoryIds(text: string): { cves: string[]; ghsas: string[] } {
   return {
@@ -49,25 +63,52 @@ export function registerDupeTools(server: ToolRegistrar): void {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('dupe_check', 'Duplicate-risk pre-check (run-8 §7): NVD keyword search (public, no key) + optional scan of the program\'s known-issues page for CVE/GHSA ids. Run this BEFORE deep work — a run-7 candidate died as a duplicate of a 5-month-old report that one call would have surfaced. A high dupe score is a STOP: read the prior reports, then either differentiate or drop.',
+  t('dupe_check', 'Duplicate-risk pre-check (run-8 §7): NVD keyword search (public, no key) + optional scan of the program\'s known-issues page for CVE/GHSA ids. Keywords are queried INDEPENDENTLY and merged — never as one joined string (NVD ANDs it and under-reports; run-11 D13), max 4 per call (anonymous rate limit). Run this BEFORE deep work — a run-7 candidate died as a duplicate of a 5-month-old report that one call would have surfaced. A high dupe score is a STOP: read the prior reports, then either differentiate or drop.',
     {
       keywords: z.array(z.string()).min(1).describe('Product/feature terms, e.g. ["klaviyo", "tracking snippet XSS"]'),
       known_issues_url: z.string().optional().describe('The program\'s known-issues page (fetches and extracts CVE/GHSA ids)'),
     },
     async ({ keywords, known_issues_url }: any) => {
       const lines: string[] = []
-      const query = keywords.join(' ').slice(0, 200)
-      try {
-        const response = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(query)}&resultsPerPage=10`)
-        if (response.ok) {
-          const hits = parseNvdResponse(await response.json() as unknown)
-          lines.push(`NVD keyword search ("${query}"): ${hits.length} published CVE(s)`)
-          for (const hit of hits) lines.push(`  ${hit.id} (${hit.published}) — ${hit.description.slice(0, 140)}`)
-        } else {
-          lines.push(`NVD keyword search: HTTP ${response.status} (rate limit is 5/30s without a key — retry shortly)`)
+      // Run-11 D13: keywords are queried INDEPENDENTLY and merged (union) —
+      // NVD ANDs a joined keyword string, so "zendesk support portal"
+      // returned 0 published CVEs while "zendesk" alone returns 15. Capped at
+      // 4 queries because the anonymous rate limit is 5 per 30 s.
+      const terms = [...new Set(
+        (Array.isArray(keywords) ? keywords : [keywords])
+          .filter((k: unknown): k is string => typeof k === 'string' && k.trim() !== '')
+          .map((k: string) => k.trim()),
+      )].slice(0, 4)
+      const perTerm: string[] = []
+      const hitLists: NvdHit[][] = []
+      let rateLimited = false
+      for (const term of terms) {
+        if (rateLimited) { perTerm.push(`"${term}": skipped (rate limited)`); continue }
+        try {
+          const response = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(term)}&resultsPerPage=10`)
+          if (response.ok) {
+            const hits = parseNvdResponse(await response.json() as unknown)
+            hitLists.push(hits)
+            perTerm.push(`"${term}": ${hits.length}`)
+          } else {
+            perTerm.push(`"${term}": HTTP ${response.status}`)
+            if (response.status === 403 || response.status === 429) rateLimited = true
+          }
+        } catch (error) {
+          perTerm.push(`"${term}": ${error instanceof Error ? error.message : String(error)}`)
         }
-      } catch (error) {
-        lines.push(`NVD keyword search failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      const merged = mergeNvdHits(hitLists)
+      lines.push(`NVD keyword search — ${terms.length} keyword(s) queried INDEPENDENTLY and merged (NVD ANDs a joined string; run-11 D13):`)
+      lines.push(`  per keyword: ${perTerm.join(' · ')}`)
+      const shown = merged.slice(0, 15)
+      lines.push(`  merged: ${merged.length} unique CVE(s)${shown.length < merged.length ? ` (showing ${shown.length}, newest first)` : ' (newest first)'}`)
+      for (const hit of shown) lines.push(`  ${hit.id} (${hit.published}) — ${hit.description.slice(0, 140)}`)
+      if (keywords.length > terms.length) {
+        lines.push(`  WARNING: only the first ${terms.length} keyword(s) were queried (anonymous NVD rate limit is 5 per 30 s) — ${keywords.length - terms.length} dropped`)
+      }
+      if (merged.length === 0) {
+        lines.push('  NOTE: 0 CVEs is UNCONFIRMED — run the raw NVD query yourself before treating a dupe risk as clear')
       }
       if (known_issues_url !== undefined && known_issues_url !== '') {
         try {

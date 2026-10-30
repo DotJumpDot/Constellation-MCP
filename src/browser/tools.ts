@@ -882,7 +882,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ].join('\n'))
     })
 
-  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). Scope-guarded: every imported domain must be in the importer\'s scope; the audit records the host list only.',
+  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session.',
     {
       owner: z.string().describe('Owner whose browser receives the cookies'),
       handoff_id: z.string().optional().describe('Handoff id from browser_cookies_export'),
@@ -902,14 +902,17 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         targetLabel = report.hosts.join(', ')
         extraLines = report.warnings
         if (report.hosts.length > 0) {
-          // The audited host list — values never appear in audit or transcript.
+          // Run-11 D15: an import is a HANDOFF, not target traffic — cookies
+          // only enter a browser's state, and driving that browser to any
+          // host still goes through the navigation guard. The old per-host
+          // assert forced a scope WIDENING just to move a session (a
+          // parent-domain cookie was refused against exact-host entries), so
+          // the import path audits instead of asserting. The audit line
+          // carries the host list only — values never appear.
           env.scope.audit(`cookie-import:${targetLabel}`, who, 'browser_cookies_import', {
             allowed: true,
-            reason: `external profile "${profile_dir}": ${cookies.length} cookie(s) across ${report.hosts.length} host(s)`,
+            reason: `handoff (no traffic): external profile "${profile_dir}": ${cookies.length} cookie(s) across ${report.hosts.length} host(s) — navigation to any host remains scope-guarded`,
           })
-          for (const host of report.hosts) {
-            env.scope.assert(/^https?:\/\//i.test(host) ? `https://${host}/` : `https://${host}/`, who, 'browser_cookies_import')
-          }
         }
       } else {
         if (handoff_id === undefined) throw new Error('pass either handoff_id (from browser_cookies_export) or profile_dir (an external Chrome/Edge profile)')
@@ -918,13 +921,11 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         cookies = handoff.cookies
         targetLabel = handoff.domain
         if (targetLabel !== '(all)') {
-          for (const part of targetLabel.split(',')) {
-            env.scope.assert(/^https?:\/\//i.test(part) ? part : `https://${part}/`, who, 'browser_cookies_import')
-          }
+          env.scope.audit(`cookie-import:${targetLabel}`, who, 'browser_cookies_import', {
+            allowed: true,
+            reason: `handoff (no traffic): ${cookies.length} cookie(s) from "${handoff.fromOwner}" — navigation to any host remains scope-guarded`,
+          })
         }
-      }
-      if (domain_override === undefined && targetLabel !== '(all)') {
-        // The assert above already ran for every imported host; nothing more.
       }
       const context = await session.ensure()
       const finalCookies = cookies.map(cookie => ({ ...cookie, ...(domain_override === undefined ? {} : { domain: domain_override }) }))
@@ -1182,27 +1183,78 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Dispatched ${action} via CDP.\nNow at: ${await pageOverview(page)}\n\n${truncate(await snapshotOf(page), 40_000)}`)
     })
 
-  t('browser_run_code_unsafe', 'UNSAFE escape hatch: run `async (page, require) => {...}` server-side with the full Playwright Page API on the owner\'s current tab, plus Node `require` (fs, path, …) for saving artifacts. NOT scope-guarded inside — only use it when the guarded tools cannot express the step (bulk sweeps, waitUntil networkidle, complex flows).',
-    { code: z.string().describe('Function expression, e.g. `async (page, require) => { await page.goto(url); return page.title() }`'), ...OWNER_FIELD, ...TAB_FIELD },
-    async ({ code, owner, tab }: any) => {
+  // Run-11 D11: one live escape-hatch run per owner. A tool-level timeout
+  // does NOT (cannot) stop the code — the lane must be told it is still
+  // running, and the owner stays BUSY for further escape-hatch calls until
+  // it settles; the settled result is reported by the next call.
+  const unsafeRuns = new Map<string, { startedAt: number; done?: { finishedAt: number; summary: string } }>()
+
+  t('browser_run_code_unsafe', 'UNSAFE escape hatch: run `async (page, require) => {...}` server-side with the full Playwright Page API on the owner\'s current tab, plus Node `require` (fs, path, …) for saving artifacts. NOT scope-guarded inside — only use it when the guarded tools cannot express the step (bulk sweeps, waitUntil networkidle, complex flows). Timeout semantics (run-11 D11): past timeout_ms (default 45000) the tool returns STILL_RUNNING — the code KEEPS RUNNING server-side, artifacts keep landing, and further run_code_unsafe calls on that owner are refused until it settles (the next call then reports its result).',
+    {
+      code: z.string().describe('Function expression, e.g. `async (page, require) => { await page.goto(url); return page.title() }`'),
+      timeout_ms: z.number().int().optional().describe('In-tool budget in ms (default 45000, capped 300000). A timeout means STILL_RUNNING, not failure — the code continues.'),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ code, owner, tab, timeout_ms }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
+      const prior = unsafeRuns.get(who)
+      if (prior !== undefined && prior.done === undefined) {
+        const elapsed = Math.round((Date.now() - prior.startedAt) / 1000)
+        throw new Error(`owner "${who}" is BUSY: a previous run_code_unsafe started ${elapsed}s ago and is STILL EXECUTING (a timeout never stops the code — its artifacts may still be landing). Wait for it to settle (the next call reports its result) or use another owner.`)
+      }
+      const priorNote = prior?.done === undefined ? '' : `[harness] your previous (timed-out) run FINISHED at ${new Date(prior.done.finishedAt).toISOString()} — result: ${prior.done.summary}\n`
+      unsafeRuns.delete(who)
       const page = await tabFor(session, who, tab)
       const fn = makeUserFn(code)
       const nodeRequire = createRequire(import.meta.url)
-      const result = await fn(page, nodeRequire)
-      // Round-11 fix (window spam): the escape hatch can create EXTRA browser
-      // contexts (`browser.newContext()` / `page.context().browser().newContext()`)
-      // — each one is a separate Chrome WINDOW that bypasses the tab registry,
-      // tab leases, the ownership label and the bottom park, and the human reads
-      // it as window spam (measured: one lane left 4 open at Playwright's default
-      // 1296x808). Sweep them after the code returns and say so; tabs inside the
-      // owner's context are the supported way.
-      const swept = await sweepExtraContexts(page)
-      const sweptNote = swept.length === 0
+      const limit = Math.max(1_000, Math.min(300_000, timeout_ms ?? 45_000))
+      const record: { startedAt: number; done?: { finishedAt: number; summary: string } } = { startedAt: Date.now() }
+      unsafeRuns.set(who, record)
+      const executing = (async () => {
+        try {
+          const result = await fn(page, nodeRequire)
+          // Round-11 fix (window spam): the escape hatch can create EXTRA
+          // browser contexts (`browser.newContext()` / `page.context().browser().newContext()`)
+          // — each one is a separate Chrome WINDOW that bypasses the tab
+          // registry, tab leases, the ownership label and the bottom park.
+          // Sweep them after the code returns and say so; tabs inside the
+          // owner's context are the supported way.
+          const swept = await sweepExtraContexts(page)
+          return { kind: 'done' as const, result, swept }
+        } catch (error) {
+          return { kind: 'error' as const, error }
+        }
+      })()
+      const outcome = await Promise.race([
+        executing,
+        new Promise<{ kind: 'timeout' }>(resolve => {
+          setTimeout(() => resolve({ kind: 'timeout' as const }), limit).unref()
+        }),
+      ])
+      if (outcome.kind === 'timeout') {
+        // D11: the code keeps running; the settle handler records the result
+        // (and sweeps stray contexts) so the next call can report it.
+        void executing.then(late => {
+          record.done = {
+            finishedAt: Date.now(),
+            summary: late.kind === 'done'
+              ? truncate(JSON.stringify(late.result) ?? 'undefined', 400)
+              : `ERROR: ${late.error instanceof Error ? late.error.message : String(late.error)}`,
+          }
+        })
+        return textResult([
+          `STILL_RUNNING: the code exceeded its ${limit}ms budget and KEEPS RUNNING server-side — a timeout never stops it (run-11 D11).`,
+          'Its artifacts can keep appearing after this return; check the artifacts directory.',
+          `Further run_code_unsafe calls on "${who}" are REFUSED until it settles; the next call will report the finished result.`,
+        ].join('\n'), true)
+      }
+      unsafeRuns.delete(who)
+      if (outcome.kind === 'error') throw outcome.error
+      const sweptNote = outcome.swept.length === 0
         ? ''
-        : `[harness] closed ${swept.length} extra browser context(s)/window(s) created by this code — use tabs in the owner context (browser_tabs new / tab_open), never a new browser context. Closed pages: ${JSON.stringify(swept)}\n`
-      const rendered = result === undefined ? 'undefined' : JSON.stringify(result, null, 2) ?? String(result)
-      return textResult(sweptNote + truncate(rendered, 50_000))
+        : `[harness] closed ${outcome.swept.length} extra browser context(s)/window(s) created by this code — use tabs in the owner context (browser_tabs new / tab_open), never a new browser context. Closed pages: ${JSON.stringify(outcome.swept)}\n`
+      const rendered = outcome.result === undefined ? 'undefined' : JSON.stringify(outcome.result, null, 2) ?? String(outcome.result)
+      return textResult(priorNote + sweptNote + truncate(rendered, 50_000))
     })
 
   t('browser_wait_for', 'Wait for text to appear or for a time to pass on the owner\'s current tab.',

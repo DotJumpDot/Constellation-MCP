@@ -26,6 +26,18 @@ const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g
 /** `Bearer`/`Basic` scheme credentials. */
 const AUTH_SCHEME_RE = /\b(bearer|basic|token)\s+([A-Za-z0-9._~+/=-]{8,})/gi
 
+/** Playwright action-argument echoes (run-11 D12): a failed `fill`/`type` can
+ *  carry the VALUE it was typing straight into the error's call log — a lane
+ *  following the "read credentials inside run_code_unsafe" rule still leaked
+ *  a password this way. The whole argument list is masked: Playwright's
+ *  two-arg forms (`page.type(selector, text)`) carry the value as the SECOND
+ *  argument, so masking only the first quoted string is not enough. */
+const ACTION_ARG_RE = /\b(fill|type|insertText|sendKeys|setPassword)\((?:[^()\\]|\\.|\([^()]*\))*\)/g
+const ACTION_WITH_RE = /\b((?:filling|typing|entering|submitting)[^.\n]*?\bwith\s+)(["'])(?:(?!\2)[^\\]|\\.)*\2/gi
+/** press keeps a NAMED key's shape (Enter/Control+a are not credentials); a
+ *  press whose "key" is a value gets the same mask. */
+const PRESS_ARG_RE = /\bpress\((?:[^()\\]|\\.|\([^()]*\))*\)/g
+
 function maskValue(value: string): string {
   const head = value.slice(0, 6)
   return value.length <= 8 ? '[redacted]' : `${head}…[redacted]`
@@ -45,6 +57,12 @@ export function redactSecrets(text: string): string {
     return `${scheme} ${maskValue(value)}`
   })
   out = out.replace(LONG_TOKEN_RE, '[redacted]')
+  out = out.replace(ACTION_ARG_RE, (all: string, action: string) => `${action}(••••••)`)
+  out = out.replace(ACTION_WITH_RE, (_all: string, prefix: string) => `${prefix}••••••`)
+  out = out.replace(PRESS_ARG_RE, (all: string) => {
+    const key = all.slice(all.indexOf('"') + 1, all.lastIndexOf('"'))
+    return /^(?:Control|Ctrl|Shift|Alt|Meta|Command|Cmd)(?:\+[A-Za-z0-9]+)+$|^(?:Enter|Tab|Escape|Backspace|Delete|Home|End|PageUp|PageDown|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|F\d{1,2}|[A-Z])$/.test(key) ? all : 'press(••••••)'
+  })
   return out
 }
 

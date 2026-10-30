@@ -231,7 +231,18 @@ export async function readProfileCookies(profileDir: string, domainFilter?: stri
   let unsupported = 0
   try {
     const tempDb = path.join(tempDir, 'Cookies')
-    fs.copyFileSync(layout.cookiesFile, tempDb)
+    try {
+      fs.copyFileSync(layout.cookiesFile, tempDb)
+    } catch (error) {
+      // Run-11 D14: while the profile's own browser is RUNNING it holds the
+      // Cookies DB locked — retries do not help (a pwsh Copy-Item retry
+      // failed identically in the field). Say the fix, not the stack.
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EBUSY' || code === 'EPERM' || code === 'ETXTBSY') {
+        throw new Error(`"${layout.cookiesFile}" is locked by the browser that owns it (${code}) — close that Chrome/Edge first, or read the cookies from the LIVE session instead (browser_cookies_export on an attached/owner browser) and import the handoff. Retrying while it runs will keep failing.`)
+      }
+      throw error
+    }
     const key = await loadChromiumCookieKey(layout.stateDir)
     const db = new DatabaseSync(tempDb, { readOnly: true })
     try {
