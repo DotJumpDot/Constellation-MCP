@@ -8,7 +8,7 @@ import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
-import { SHARED_OWNER, canTouchTab, loadOwnerLabels, type BrowserSession } from './session.js'
+import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, type BrowserSession } from './session.js'
 import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
@@ -1190,8 +1190,19 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const fn = makeUserFn(code)
       const nodeRequire = createRequire(import.meta.url)
       const result = await fn(page, nodeRequire)
+      // Round-11 fix (window spam): the escape hatch can create EXTRA browser
+      // contexts (`browser.newContext()` / `page.context().browser().newContext()`)
+      // — each one is a separate Chrome WINDOW that bypasses the tab registry,
+      // tab leases, the ownership label and the bottom park, and the human reads
+      // it as window spam (measured: one lane left 4 open at Playwright's default
+      // 1296x808). Sweep them after the code returns and say so; tabs inside the
+      // owner's context are the supported way.
+      const swept = await sweepExtraContexts(page)
+      const sweptNote = swept.length === 0
+        ? ''
+        : `[harness] closed ${swept.length} extra browser context(s)/window(s) created by this code — use tabs in the owner context (browser_tabs new / tab_open), never a new browser context. Closed pages: ${JSON.stringify(swept)}\n`
       const rendered = result === undefined ? 'undefined' : JSON.stringify(result, null, 2) ?? String(result)
-      return textResult(truncate(rendered, 50_000))
+      return textResult(sweptNote + truncate(rendered, 50_000))
     })
 
   t('browser_wait_for', 'Wait for text to appear or for a time to pass on the owner\'s current tab.',

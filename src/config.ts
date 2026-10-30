@@ -38,6 +38,17 @@ export interface ConstellationConfig {
    *  of its monitor's work area with only the tab strip peeking (round-8 §5,
    *  the human's measured preference — top = availTop + availH − peek). */
   windowPeekPx: number
+  /** PARK box applied by the launch helper in addition to the peek (round-11
+   *  fix — the human's MEASURED preference is also a fixed left offset and
+   *  size; the launch flag alone left windows flush at the screen's left edge,
+   *  measured left = availLeft + 0 vs spec availLeft + 367):
+   *  left = workArea.left + offset, width/height in px.
+   *  CONSTELLATION_WINDOW_PARK_LEFT_OFFSET (default 367),
+   *  CONSTELLATION_WINDOW_PARK_WIDTH (default 945),
+   *  CONSTELLATION_WINDOW_PARK_HEIGHT (default 1012). */
+  windowParkLeftOffset: number
+  windowParkWidth: number
+  windowParkHeight: number
   /** true (default; CONSTELLATION_FOCUS_GUARD=0 disables): arm the post-spawn
    *  focus watchdog on every launch — when the freshly spawned Chrome steals
    *  the foreground (it always does, at window creation), hand it back via
@@ -77,6 +88,9 @@ export function defaultConfig(): ConstellationConfig {
     windowPosition: env('WINDOW_POSITION'),
     startMinimized: env('START_MINIMIZED') === '1' || env('START_MINIMIZED') === 'true',
     windowPeekPx: int('WINDOW_PEEK_PX', 36),
+    windowParkLeftOffset: int('WINDOW_PARK_LEFT_OFFSET', 367),
+    windowParkWidth: int('WINDOW_PARK_WIDTH', 945),
+    windowParkHeight: int('WINDOW_PARK_HEIGHT', 1012),
     focusGuard: env('FOCUS_GUARD') !== '0' && env('FOCUS_GUARD') !== 'false',
   }
 }
@@ -110,6 +124,18 @@ export function applyCliArgs(config: ConstellationConfig, argv: string[]): strin
       const raw = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : value()
       const v = Number.parseInt(raw ?? '', 10)
       if (Number.isFinite(v)) config.windowPeekPx = v
+      continue
+    }
+    const parkFlag = ['--window-park-left-offset', '--window-park-width', '--window-park-height']
+      .find(flag => arg === flag || arg.startsWith(`${flag}=`))
+    if (parkFlag !== undefined) {
+      const raw = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : value()
+      const v = Number.parseInt(raw ?? '', 10)
+      if (Number.isFinite(v)) {
+        if (parkFlag === '--window-park-left-offset') config.windowParkLeftOffset = v
+        else if (parkFlag === '--window-park-width') config.windowParkWidth = v
+        else config.windowParkHeight = v
+      }
       continue
     }
     const key = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg

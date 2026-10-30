@@ -11,18 +11,23 @@ const { chromium } = pwCore
 const exec = promisify(execFile)
 
 /** Work area (taskbar-excluded bounds) of the Windows screen containing a
- *  point — the bottom-anchor input. Undefined on any failure (best effort). */
-async function workAreaAt(x: number, y: number): Promise<{ top: number; height: number } | undefined> {
+ *  point — the park input (round-11 fix: the park needs the work area's LEFT
+ *  and WIDTH too, not just its bottom edge). Undefined on any failure. */
+async function workAreaAt(x: number, y: number): Promise<{ left: number; top: number; width: number; height: number } | undefined> {
   try {
     const script =
       'Add-Type -AssemblyName System.Windows.Forms; ' +
       `$s = [System.Windows.Forms.Screen]::FromPoint([System.Drawing.Point]::new(${Math.round(x)}, ${Math.round(y)})); ` +
-      '"{0} {1}" -f $s.WorkingArea.Y, $s.WorkingArea.Height'
+      '"{0} {1} {2} {3}" -f $s.WorkingArea.X, $s.WorkingArea.Y, $s.WorkingArea.Width, $s.WorkingArea.Height'
     const { stdout } = await exec('powershell.exe', ['-NoProfile', '-Command', script], { windowsHide: true, timeout: 10_000 })
     const parts = stdout.trim().split(/\s+/)
-    const top = Number.parseInt(parts[0] ?? '', 10)
-    const height = Number.parseInt(parts[1] ?? '', 10)
-    if (Number.isFinite(top) && Number.isFinite(height)) return { top, height }
+    const left = Number.parseInt(parts[0] ?? '', 10)
+    const top = Number.parseInt(parts[1] ?? '', 10)
+    const width = Number.parseInt(parts[2] ?? '', 10)
+    const height = Number.parseInt(parts[3] ?? '', 10)
+    if (Number.isFinite(left) && Number.isFinite(top) && Number.isFinite(width) && Number.isFinite(height)) {
+      return { left, top, width, height }
+    }
     return undefined
   } catch {
     return undefined
@@ -137,6 +142,46 @@ export function cascadeWindowPosition(position: string, owner: string): string {
 export function clampWindowPeek(peek: number): number {
   if (!Number.isFinite(peek)) return 36
   return Math.min(60, Math.max(20, Math.round(peek)))
+}
+
+/** Bounds of a PARKED window (round-11 fix): the human's measured preference
+ *  is bottom-of-work-area peek AND a fixed left offset + size, not only a top
+ *  anchor. The launch flag alone left every window flush at the monitor's left
+ *  edge (measured left = availLeft + 0 / +cascade vs spec availLeft + 367), and
+ *  Playwright-created extra contexts were never parked at all. Pure. */
+export function parkBounds(
+  work: { left: number; top: number; width: number; height: number },
+  peek: number,
+  leftOffset: number,
+  width: number,
+  height: number,
+): { left: number; top: number; width: number; height: number } {
+  return {
+    left: work.left + leftOffset,
+    top: work.top + work.height - peek,
+    width,
+    height,
+  }
+}
+
+/** Close browser contexts a lane's escape-hatch code created and collect their
+ *  page URLs (round-11 fix). `browser.newContext()` is a separate Chrome WINDOW:
+ *  it bypasses the tab registry, tab leases, the ownership label and the park —
+ *  the human reads it as window spam (measured round 11: one lane left 4 such
+ *  windows open at Playwright's default 1296x808, none parked). Tabs inside
+ *  the owner's context are the only supported way; best effort. */
+export async function sweepExtraContexts(page: Page): Promise<string[][]> {
+  try {
+    const primary = page.context()
+    const browser = primary.browser()
+    if (browser === null) return []
+    const extras = browser.contexts().filter(context => context !== primary)
+    const urls = extras.map(context => context.pages().map(p => p.url()))
+    for (const context of extras) await context.close().catch(() => undefined)
+    return urls
+  } catch {
+    return []
+  }
 }
 
 export class BrowserSession {
@@ -376,12 +421,20 @@ export class BrowserSession {
       const cdp = await context.newCDPSession(page)
       try {
         const { windowId } = await cdp.send('Browser.getWindowForTarget') as { windowId: number }
-        const readBounds = () => cdp.send('Browser.getWindowBounds', { windowId }) as Promise<{ bounds: { left: number; top: number } }>
+        const readBounds = () => cdp.send('Browser.getWindowBounds', { windowId }) as Promise<{
+          bounds: { left: number; top: number; width?: number; height?: number; windowState?: string }
+        }>
         let { bounds } = await readBounds()
         const work = await workAreaAt(bounds.left + 50, bounds.top + 50)
         if (work === undefined) return
         const peek = clampWindowPeek(this.config.windowPeekPx)
-        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { top: work.top + work.height - peek } })
+        const target = parkBounds(work, peek, this.config.windowParkLeftOffset, this.config.windowParkWidth, this.config.windowParkHeight)
+        // Bounds are set WHOLE (round-11): top alone pinned the bottom edge but
+        // left/size stayed at the launch flag / Playwright default, so nothing
+        // matched the human's measured box on any launch path. windowState is
+        // normalized first — a maximized/minimized window ignores left/top.
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => undefined)
+        await cdp.send('Browser.setWindowBounds', { windowId, bounds: target })
         // Read-back + one retry: Chrome applies bounds asynchronously and a
         // first read can still show the pre-park position or a DPI-rounded
         // strip. The spec's verification is by MEASUREMENT (visibleStrip =
@@ -389,8 +442,10 @@ export class BrowserSession {
         await new Promise(resolve => setTimeout(resolve, 250))
         ;({ bounds } = await readBounds())
         const strip = work.top + work.height - bounds.top
-        if (Math.abs(strip - peek) > 8) {
-          await cdp.send('Browser.setWindowBounds', { windowId, bounds: { top: work.top + work.height - peek } })
+        const leftOk = Math.abs(bounds.left - target.left) <= 8
+        const sizeOk = Math.abs((bounds.width ?? 0) - target.width) <= 8 && Math.abs((bounds.height ?? 0) - target.height) <= 8
+        if (Math.abs(strip - peek) > 8 || !leftOk || !sizeOk) {
+          await cdp.send('Browser.setWindowBounds', { windowId, bounds: target })
         }
       } finally {
         await cdp.detach().catch(() => undefined)

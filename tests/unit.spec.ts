@@ -923,11 +923,17 @@ test('config: window-position + start-minimized + peek env and flags (quiet spaw
   assert.equal(config.startMinimized, false)
   assert.equal(config.windowPosition, undefined)
   assert.equal(config.windowPeekPx, 36, 'peek defaults to the measured preference')
-  const rest = applyCliArgs(config, ['--window-position=2560,100', '--start-minimized', '--headless', '--window-peek-px=44', 'positional'])
+  assert.equal(config.windowParkLeftOffset, 367, 'park left offset defaults to the measured preference')
+  assert.equal(config.windowParkWidth, 945, 'park width defaults to the measured preference')
+  assert.equal(config.windowParkHeight, 1012, 'park height defaults to the measured preference')
+  const rest = applyCliArgs(config, ['--window-position=2560,100', '--start-minimized', '--headless', '--window-peek-px=44', '--window-park-left-offset=12', '--window-park-width=800', '--window-park-height=600', 'positional'])
   assert.equal(config.windowPosition, '2560,100')
   assert.equal(config.startMinimized, true)
   assert.equal(config.headless, true)
   assert.equal(config.windowPeekPx, 44)
+  assert.equal(config.windowParkLeftOffset, 12)
+  assert.equal(config.windowParkWidth, 800)
+  assert.equal(config.windowParkHeight, 600)
   assert.deepEqual(rest, ['positional'])
 })
 
@@ -1086,6 +1092,18 @@ test('window parking: peek clamps into the clickable band (round-8 §5)', async 
   assert.equal(clampWindowPeek(400), 60, 'never eats half the work area')
   assert.equal(clampWindowPeek(Number.NaN), 36, 'a bad config value falls back to the default')
   assert.equal(clampWindowPeek(44.7), 45, 'rounded to whole pixels')
+})
+
+test('window parking: the whole measured box is applied, not just the bottom anchor (round-11 D10)', async () => {
+  const { parkBounds } = await import('../src/browser/session.js')
+  // Live measurements from the round-11 window check: the left monitor is
+  // work area {-1920, 0, 1920, 1032}; the human's measured preference is
+  // left = availLeft + 367, top = availTop + availH − 36, 945×1012.
+  const leftMonitor = { left: -1920, top: 0, width: 1920, height: 1032 }
+  assert.deepEqual(parkBounds(leftMonitor, 36, 367, 945, 1012), { left: -1553, top: 996, width: 945, height: 1012 })
+  const primary = { left: 0, top: 0, width: 1920, height: 1032 }
+  assert.deepEqual(parkBounds(primary, 36, 367, 945, 1012), { left: 367, top: 996, width: 945, height: 1012 }, 'any monitor keeps the offsets relative to its work area')
+  assert.deepEqual(parkBounds(leftMonitor, 20, 367, 945, 1012), { left: -1553, top: 1012, width: 945, height: 1012 }, 'a narrower peek hangs lower')
 })
 
 test('http body encoding: arrays/scalars are JSON, strings verbatim — asserted on the bytes the server received (D9)', async () => {
