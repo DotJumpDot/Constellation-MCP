@@ -80,7 +80,12 @@ export async function dpapiUnprotect(encrypted: Buffer): Promise<Buffer> {
   const outFile = `${inFile}.out`
   try {
     fs.writeFileSync(inFile, encrypted.toString('base64'))
+    // Add-Type first: plain powershell.exe 5.1 -NoProfile does NOT auto-load
+    // System.Security, so [Security.Cryptography.ProtectedData] is "unable to
+    // find type" without it (run-12 field defect — broke every profile_dir
+    // import on a stock box; the load is idempotent and free when present).
     const script =
+      `Add-Type -AssemblyName System.Security; ` +
       `$in = [IO.File]::ReadAllText('${inFile.replace(/'/g, "''")}'); ` +
       `$out = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($in), $null, 'CurrentUser'); ` +
       `[IO.File]::WriteAllText('${outFile.replace(/'/g, "''")}', [Convert]::ToBase64String($out))`

@@ -1501,3 +1501,33 @@ test('focus guard: script assembly + config switch (run-9 focus advice)', async 
   const config = defaultConfig()
   assert.equal(config.focusGuard, true, 'the watchdog is armed by default')
 })
+
+test('DPAPI helper round-trips a CurrentUser blob (Windows only; run-12 assembly-load defect)', { skip: process.platform !== 'win32' }, async () => {
+  const { dpapiUnprotect } = await import('../src/browser/cookies.js')
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const exec = promisify(execFile)
+  const secret = Buffer.from('dpapi-round-trip-secret-0123456789', 'utf8')
+  // Protect through the same shell shape the helper uses — a stock
+  // powershell.exe 5.1 -NoProfile with NO manual assembly load on the
+  // PROTECT side would fail the same way; the fix must make the helper's
+  // own side self-sufficient regardless.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dpapi-rt-'))
+  try {
+    const inFile = path.join(dir, 'in.b64')
+    const outFile = `${inFile}.out`
+    fs.writeFileSync(inFile, secret.toString('base64'))
+    await exec('powershell.exe', ['-NoProfile', '-Command',
+      `Add-Type -AssemblyName System.Security; ` +
+      `$in = [IO.File]::ReadAllText('${inFile.replace(/'/g, "''")}'); ` +
+      `$out = [Security.Cryptography.ProtectedData]::Protect([Convert]::FromBase64String($in), $null, 'CurrentUser'); ` +
+      `[IO.File]::WriteAllText('${outFile.replace(/'/g, "''")}', [Convert]::ToBase64String($out))`,
+    ], { windowsHide: true, timeout: 15_000 })
+    const protectedBlob = Buffer.from(fs.readFileSync(outFile, 'utf8').trim(), 'base64')
+    assert.notEqual(protectedBlob.toString('base64'), secret.toString('base64'), 'really is encrypted')
+    const roundTripped = await dpapiUnprotect(protectedBlob)
+    assert.equal(roundTripped.toString('utf8'), secret.toString('utf8'), 'the helper unprotects what PowerShell protected — incl. the assembly load')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
