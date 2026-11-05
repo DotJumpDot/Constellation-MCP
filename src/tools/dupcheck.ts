@@ -178,21 +178,25 @@ export function registerDupeTools(server: ToolRegistrar): void {
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('dupe_check', 'Duplicate-risk pre-check (run-8 §7): NVD keyword search (public, no key) + optional scan of the program\'s known-issues page for CVE/GHSA ids. Keywords are queried INDEPENDENTLY and merged — never as one joined string (NVD ANDs it and under-reports; run-11 D13), max 4 per call (anonymous rate limit). Keyword search returns the 10 NEWEST CVEs, so also pass `cve_ids` for any KNOWN id — a direct cveId lookup always resolves an older CVE on a noisy product (the live drill\'s "litellm" keyword check missed July\'s KEV CVE-2026-59822 until the id was the query). The newest merged hits are ENRICHED with KEV (CISA exploit date from the NVD record), sightings/bundles and affected products from vulnerability.circl.lu (bounded, best-effort) — exploited-in-the-wild is a very different dupe signal than merely-filed. Run this BEFORE deep work — a run-7 candidate died as a duplicate of a 5-month-old report that one call would have surfaced. A high dupe score is a STOP: read the prior reports, then either differentiate or drop.',
+  t('dupe_check', 'Duplicate-risk pre-check (run-8 §7): NVD keyword search and/or direct cveId lookups (public, no key) + optional scan of the program\'s known-issues page for CVE/GHSA ids. Keywords are queried INDEPENDENTLY and merged — never as one joined string (NVD ANDs it and under-reports; run-11 D13), max 4 per call (anonymous rate limit). Keyword search returns the 10 NEWEST CVEs, so also pass `cve_ids` for any KNOWN id — a direct cveId lookup always resolves an older CVE on a noisy product (the live drill\'s "litellm" keyword check missed July\'s KEV CVE-2026-59822 until the id was the query); `cve_ids` alone is a complete call. The newest merged hits are ENRICHED with KEV (CISA exploit date from the NVD record), sightings/bundles and affected products from vulnerability.circl.lu (bounded, best-effort) — exploited-in-the-wild is a very different dupe signal than merely-filed. Run this BEFORE deep work — a run-7 candidate died as a duplicate of a 5-month-old report that one call would have surfaced. A high dupe score is a STOP: read the prior reports, then either differentiate or drop.',
     {
-      keywords: z.array(z.string()).min(1).describe('Product/feature terms, e.g. ["klaviyo", "tracking snippet XSS"]'),
+      keywords: z.array(z.string()).min(1).optional().describe('Product/feature terms, e.g. ["klaviyo", "tracking snippet XSS"]. Omit when you already have cve_ids — at least one of keywords/cve_ids is required'),
       known_issues_url: z.string().optional().describe('The program\'s known-issues page (fetches and extracts CVE/GHSA ids)'),
       kev_deep: z.boolean().optional().describe('Also query every KEV catalog via Circl (adds one request per enriched CVE; default off — the NVD record already carries the CISA date)'),
       cve_ids: z.array(z.string()).optional().describe('Known CVE ids to look up DIRECTLY (max 4, anonymous rate limit) — keyword search only sees the 10 newest, so an older CVE needs this'),
     },
     async ({ keywords, known_issues_url, kev_deep, cve_ids }: any) => {
       const lines: string[] = []
+      // `keywords` is optional at the schema boundary: a known id alone is a
+      // complete dupe check. The live drill's `dupe_check {cve_ids}` call was
+      // rejected with "Required at keywords" before this normalization.
+      const keywordList = Array.isArray(keywords) ? keywords : []
       // Run-11 D13: keywords are queried INDEPENDENTLY and merged (union) —
       // NVD ANDs a joined keyword string, so "zendesk support portal"
       // returned 0 published CVEs while "zendesk" alone returns 15. Capped at
       // 4 queries because the anonymous rate limit is 5 per 30 s.
       const terms = [...new Set(
-        (Array.isArray(keywords) ? keywords : [keywords])
+        keywordList
           .filter((k: unknown): k is string => typeof k === 'string' && k.trim() !== '')
           .map((k: string) => k.trim()),
       )].slice(0, 4)
@@ -221,11 +225,15 @@ export function registerDupeTools(server: ToolRegistrar): void {
       // the id itself was the keyword. cve_ids does DIRECT cveId lookups
       // (same parser, same enrichment) so a known id always resolves.
       const CVE_ID_RE = /^CVE-\d{4}-\d{4,7}$/i
-      const wantedIds = [...new Set(
+      const providedIds = [...new Set(
         (Array.isArray(cve_ids) ? cve_ids : [])
           .filter((id: unknown): id is string => typeof id === 'string' && id.trim() !== '')
           .map((id: string) => id.trim().toUpperCase()),
-      )].slice(0, 4)
+      )]
+      // Cap AFTER dedupe: a repeated id is not a rate-limit drop (the live
+      // check passed ["CVE-2026-59822", "cve-2026-59822"] and the old warning
+      // claimed one id had been dropped for the rate limit).
+      const wantedIds = providedIds.slice(0, 4)
       const perId: string[] = []
       for (const id of wantedIds) {
         if (!CVE_ID_RE.test(id)) { perId.push(`${id}: not a CVE id (expected CVE-YYYY-NNNN)`); continue }
@@ -245,12 +253,19 @@ export function registerDupeTools(server: ToolRegistrar): void {
         }
       }
       const merged = mergeNvdHits(hitLists)
-      lines.push(`NVD keyword search — ${terms.length} keyword(s) queried INDEPENDENTLY and merged (NVD ANDs a joined string; run-11 D13):`)
-      lines.push(`  per keyword: ${perTerm.join(' · ')}`)
+      if (terms.length === 0 && wantedIds.length === 0) {
+        return textResult('Nothing to check: pass at least one keyword or one cve_id (CVE-YYYY-NNNN).', true)
+      }
+      if (terms.length === 0) {
+        lines.push('NVD keyword search — skipped (no keywords supplied; direct ids only)')
+      } else {
+        lines.push(`NVD keyword search — ${terms.length} keyword(s) queried INDEPENDENTLY and merged (NVD ANDs a joined string; run-11 D13):`)
+        lines.push(`  per keyword: ${perTerm.join(' · ')}`)
+      }
       if (wantedIds.length > 0) {
         lines.push(`  direct ids:  ${perId.join(' · ')}`)
-        if (cve_ids !== undefined && (Array.isArray(cve_ids) ? cve_ids : []).length > wantedIds.length) {
-          lines.push(`  WARNING: only the first ${wantedIds.length} cve_id(s) were queried (anonymous NVD rate limit is 5 per 30 s) — ${(Array.isArray(cve_ids) ? cve_ids : []).length - wantedIds.length} dropped`)
+        if (providedIds.length > wantedIds.length) {
+          lines.push(`  WARNING: only the first ${wantedIds.length} unique cve_id(s) were queried (anonymous NVD rate limit is 5 per 30 s) — ${providedIds.length - wantedIds.length} dropped`)
         }
       }
       const shown = merged.slice(0, 15)
@@ -271,8 +286,8 @@ export function registerDupeTools(server: ToolRegistrar): void {
         lines.push(`  KEV: ${kevCount} of ${merged.length} CVE(s) flagged (CISA, from the NVD record); sightings/bundles from vulnerability.circl.lu (${enrichedCount} of ${merged.length} enriched)`)
         lines.push('  NOTE: enrichment is a signal, not proof of a duplicate — read the prior report before deciding.')
       }
-      if (keywords.length > terms.length) {
-        lines.push(`  WARNING: only the first ${terms.length} keyword(s) were queried (anonymous NVD rate limit is 5 per 30 s) — ${keywords.length - terms.length} dropped`)
+      if (keywordList.length > terms.length) {
+        lines.push(`  WARNING: only the first ${terms.length} keyword(s) were queried (anonymous NVD rate limit is 5 per 30 s) — ${keywordList.length - terms.length} dropped`)
       }
       if (merged.length === 0) {
         lines.push('  NOTE: 0 CVEs is UNCONFIRMED — run the raw NVD query yourself before treating a dupe risk as clear')

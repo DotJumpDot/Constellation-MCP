@@ -1984,3 +1984,50 @@ test('dupe_check: cve_ids resolve directly when the keyword window misses them (
     stub.close()
   }
 })
+
+test('dupe_check: cve_ids ALONE passes the registered schema and skips the keyword section (live drill 2026-11-05)', async () => {
+  const { registerDupeTools } = await import('../src/tools/dupcheck.js')
+  // Schema-boundary regression: the MCP client validates the zod object
+  // before the handler runs. `.min(1)` on a required `keywords` made a
+  // `dupe_check {cve_ids:[...]}` call fail with "Required at keywords" even
+  // though the handler supports ids alone - captureTools() cannot see this
+  // because it discards the schema, so assert the schema itself here.
+  let schema: Record<string, { safeParse: (value: unknown) => { success: boolean } }> = {}
+  const handlers = new Map<string, (args: Record<string, unknown>) => Promise<unknown>>()
+  registerDupeTools({
+    registerTool: (name: string, _info: unknown, registered: never, handler: never) => {
+      schema = registered as unknown as typeof schema
+      handlers.set(name, handler as unknown as (args: Record<string, unknown>) => Promise<unknown>)
+    },
+  } as never)
+  assert.equal(schema.keywords!.safeParse(undefined).success, true, 'keywords is optional')
+  assert.equal(schema.cve_ids!.safeParse(['CVE-2026-59822']).success, true, 'cve_ids accepts a list')
+  assert.equal(schema.keywords!.safeParse([]).success, false, 'an empty keyword list is still rejected when supplied')
+  // Offline NVD stub for the direct cveId lookup; Circl points at a closed
+  // port so enrichment degrades to its error token without touching the net.
+  const stub = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ vulnerabilities: [{ cve: {
+      id: 'CVE-2026-59822', published: '2026-07-08T00:00:00.000',
+      descriptions: [{ lang: 'en', value: 'OAuth passthrough substitution' }],
+      cisaExploitAdd: '2026-09-02T00:00:00.000',
+    } }] }))
+  })
+  await new Promise<void>(r => stub.listen(0, '127.0.0.1', r))
+  const port = (stub.address() as { port: number }).port
+  process.env.CONSTELLATION_NVD_BASE = `http://127.0.0.1:${port}`
+  process.env.CONSTELLATION_VL_BASE = 'http://127.0.0.1:1'
+  try {
+    const text = textOf(await handlers.get('dupe_check')!({ cve_ids: ['CVE-2026-59822'] }) as never)
+    assert.match(text, /NVD keyword search — skipped \(no keywords supplied; direct ids only\)/, 'no keyword section when none supplied')
+    assert.match(text, /direct ids:\s+CVE-2026-59822: found/, 'the id resolves without any keyword')
+    assert.match(text, /\[KEV 2026-09-02\]/, 'the KEV date rides the direct lookup')
+    assert.doesNotMatch(text, /0 CVEs is UNCONFIRMED/, 'a resolved id kills the 0-CVE note')
+    const deduped = textOf(await handlers.get('dupe_check')!({ cve_ids: ['CVE-2026-59822', 'cve-2026-59822'] }) as never)
+    assert.doesNotMatch(deduped, /dropped/, 'a repeated id is not reported as a rate-limit drop')
+  } finally {
+    delete process.env.CONSTELLATION_NVD_BASE
+    delete process.env.CONSTELLATION_VL_BASE
+    stub.close()
+  }
+})
