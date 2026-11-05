@@ -1941,3 +1941,46 @@ test('cell shape: register + cross-engagement filter returns only matching cells
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('dupe_check: cve_ids resolve directly when the keyword window misses them (lead drill 2026-11-05)', async () => {
+  const { registerDupeTools } = await import('../src/tools/dupcheck.js')
+  // NVD stub: keyword search sees only the 10 newest (returns an older-free
+  // list — here, nothing); the cveId lookup returns the July KEV record the
+  // keyword window cannot reach. Circl points at a closed port so enrichment
+  // degrades to its error token instead of touching the network.
+  const stub = http.createServer((req, res) => {
+    const url = req.url ?? ''
+    res.writeHead(200, { 'content-type': 'application/json' })
+    if (url.includes('cveId=CVE-2026-59822')) {
+      res.end(JSON.stringify({ vulnerabilities: [{ cve: {
+        id: 'CVE-2026-59822', published: '2026-07-08T00:00:00.000',
+        descriptions: [{ lang: 'en', value: 'OAuth passthrough substitution' }],
+        cisaExploitAdd: '2026-09-02T00:00:00.000',
+      } }] }))
+    } else {
+      res.end(JSON.stringify({ vulnerabilities: [] }))
+    }
+  })
+  await new Promise<void>(r => stub.listen(0, '127.0.0.1', r))
+  const port = (stub.address() as { port: number }).port
+  process.env.CONSTELLATION_NVD_BASE = `http://127.0.0.1:${port}`
+  process.env.CONSTELLATION_VL_BASE = `http://127.0.0.1:1`
+  try {
+    const handlers = await captureTools(s => registerDupeTools(s as never))
+    const keywordOnly = textOf(await handlers.get('dupe_check')!({ keywords: ['litellm'] }))
+    assert.match(keywordOnly, /0 CVEs is UNCONFIRMED/, 'the keyword window alone misses the old CVE')
+
+    const withIds = textOf(await handlers.get('dupe_check')!({
+      keywords: ['litellm'],
+      cve_ids: ['CVE-2026-59822', 'not-an-id'],
+    }))
+    assert.match(withIds, /direct ids:\s+CVE-2026-59822: found/, 'the direct lookup resolves')
+    assert.match(withIds, /NOT-AN-ID: not a CVE id/, 'a malformed id is named honestly (ids are canonicalized to uppercase)')
+    assert.match(withIds, /CVE-2026-59822 \(2026-07-08\).*\[KEV 2026-09-02\]/, 'the hit line carries the CISA date even with Circl down')
+    assert.doesNotMatch(withIds, /0 CVEs is UNCONFIRMED/, 'a found id kills the 0-CVE note')
+  } finally {
+    delete process.env.CONSTELLATION_NVD_BASE
+    delete process.env.CONSTELLATION_VL_BASE
+    stub.close()
+  }
+})
