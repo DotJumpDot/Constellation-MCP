@@ -533,6 +533,25 @@ test('redact: describeErrorChain output passes through redactSecrets at the boun
   assert.match(redacted, /authorization: Bearer sk-pro…\[redacted\]/)
 })
 
+test('snapshot: consecutive bare img rows collapse to one counted row (jora run 2026-11-05)', async () => {
+  const { collapseImgRuns } = await import('../src/browser/tools.js')
+  // The Bugcrowd submission page emitted a 228-row anonymous img run; 96 such
+  // snapshots cost ~22k transcript lines in the dead jora session.
+  const run = Array.from({ length: 228 }, () => '    - img').join('\n')
+  const collapsed = collapseImgRuns(`- document:\n  - main:\n${run}\n    - button "Submit"`)
+  assert.equal(collapsed.split('\n').length, 4, 'the 228-row run becomes one line')
+  assert.match(collapsed, /- img ×228/)
+  assert.match(collapsed, /- button "Submit"/, 'content after the run survives')
+  // Named images never collapse — they carry information
+  const named = collapseImgRuns('- img "Program logo"\n- img "Program logo"')
+  assert.equal(named, '- img "Program logo"\n- img "Program logo"')
+  // A lone bare img keeps its shape (nothing to count)
+  assert.equal(collapseImgRuns('  - img'), '  - img')
+  // Runs at different indent levels stay separate (different nesting)
+  const mixed = collapseImgRuns('  - img\n  - img\n    - img')
+  assert.deepEqual(mixed.split('\n'), ['  - img ×2', '    - img'])
+})
+
 test('mask: password values are replaced, short values skipped (run-5 §6)', async () => {
   const { maskSecrets } = await import('../src/redact.js')
   const snapshot = '- textbox: correct-horse-battery\n- textbox: MyMaster!PW42\n- textbox: ab\n- heading "Login"'

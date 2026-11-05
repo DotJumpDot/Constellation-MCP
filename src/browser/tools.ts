@@ -268,7 +268,7 @@ async function snapshotOf(page: Page): Promise<string> {
       await page.waitForFunction(() => (document.body?.innerText ?? '').trim().length > 200, undefined, { timeout: 6_000 }).catch(() => undefined)
       snapshot = await page.locator('html').ariaSnapshot()
     }
-    return maskSecrets(snapshot, secrets)
+    return maskSecrets(collapseImgRuns(snapshot), secrets)
   } catch (ariaError) {
     const reason = ariaError instanceof Error ? ariaError.message : String(ariaError)
     try {
@@ -279,6 +279,37 @@ async function snapshotOf(page: Page): Promise<string> {
       return `[aria snapshot unavailable: ${reason}; DOM text fallback failed: ${domReason}]\nURL: ${page.url()}`
     }
   }
+}
+
+/** Collapse runs of consecutive IDENTICAL bare `- img` rows (jora run
+ *  2026-11-05): the Bugcrowd submission page's aria snapshot carried 228
+ *  anonymous img rows, and ~96 snapshots of that page burned ~22k transcript
+ *  lines (a 12.3 MB session export) for zero information — the lead kept
+ *  paying for them on every request. One `- img ×N` row keeps the count so
+ *  the model still knows images exist (browser_evaluate when one matters).
+ *  Only runs of the exact same line merge: named images (`- img "Program
+ *  logo"`) and different indent levels (different nesting) never collapse. */
+export function collapseImgRuns(snapshot: string): string {
+  const lines = snapshot.split('\n')
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]!
+    if (/^\s*- img\s*$/.test(line)) {
+      let n = 1
+      while (i + n < lines.length && lines[i + n] === line) n++
+      if (n > 1) {
+        out.push(`${line.slice(0, line.indexOf('- img'))}- img ×${n}`)
+      } else {
+        out.push(line)
+      }
+      i += n
+    } else {
+      out.push(line)
+      i++
+    }
+  }
+  return out.join('\n')
 }
 
 async function afterActionResult(page: Page): Promise<string> {
