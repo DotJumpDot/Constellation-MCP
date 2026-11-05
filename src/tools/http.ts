@@ -409,6 +409,10 @@ export interface RequestSpec {
   timeout_ms?: number
   max_body_bytes?: number
   auth?: AuthSpec
+  /** Always write the full body to the owner artifacts and report body_file
+   *  (2026-11-05 A4): an MCP tools/list is typically 2-20 KB — below the
+   *  20 KB auto-save — yet belongs on disk, not in the transcript. */
+  save_body?: boolean
 }
 
 /** HTTP authorization (DST-Comet live-run ask: B2's b2_authorize_account wants
@@ -471,6 +475,7 @@ const REQUEST_SHAPE: z.ZodRawShape = {
   redirect: z.enum(['follow', 'manual']).optional().describe('follow: every redirect hop re-enters the scope guard (run-9 §2 — an out-of-scope hop is an audited DENY, never a quiet follow). manual: the 3xx comes back as-is.'),
   timeout_ms: z.number().int().optional(),
   max_body_bytes: z.number().int().optional().describe('Body preview cap (default 20000; sha256 always covers the full body)'),
+  save_body: z.boolean().optional().describe('Always write the full body to the owner artifacts and report body_file (sha256 + bytes) instead of relying on the 20 KB auto-save — for JSON a finding cites (an MCP tools/list, an API document) that belongs on disk, not in the transcript'),
   auth: z.object({
     type: z.enum(['basic', 'bearer']),
     username: z.string().optional(),
@@ -629,7 +634,7 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256. Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB). `browser: "<owner>"` (or true) sends the request through that owner\'s LIVE browser session — its cookie state, the identity the browser stages logged in — instead of a jar.',
+  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256. Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB); `save_body: true` forces that disk write for ANY size (A4 — a 2-20 KB MCP tools/list belongs on disk, not in the transcript). `browser: "<owner>"` (or true) sends the request through that owner\'s LIVE browser session — its cookie state, the identity the browser stages logged in — instead of a jar.',
     { ...REQUEST_SHAPE, owner: z.string().optional().describe('Attribution for the scope audit log') },
     async (args: any) => {
       const { owner, ...spec } = args
@@ -640,16 +645,25 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       const ring = captures.get(who) ?? []
       let stored = ''
       let bodyFile: string | undefined
-      if (result.body.length > 20_000) {
+      // A4 (2026-11-05): save_body forces the disk write for ANY size — a
+      // 2-20 KB tools/list used to land whole in the transcript. The
+      // extension follows the content type so the artifact is openable.
+      const wantsSave = (spec as RequestSpec).save_body === true || result.body.length > 20_000
+      if (wantsSave) {
         try {
           const dir = path.join(env.config.outputDir, who, 'responses')
           fs.mkdirSync(dir, { recursive: true })
-          const file = path.join(dir, `${result.body_sha256}.txt`)
+          const ct = (result.headers['content-type'] ?? '').toLowerCase()
+          const ext = ct.includes('json') ? '.json' : ct.includes('html') ? '.html' : ct.includes('xml') ? '.xml' : '.txt'
+          const file = path.join(dir, `${result.body_sha256}${ext}`)
           // body_full is the COMPLETE body (round-7 fix: this used to write
           // the capped preview, so body_file lied about being whole).
           if (!fs.existsSync(file)) fs.writeFileSync(file, result.body_full ?? result.body)
           bodyFile = file
-          stored = `\nbody_file: ${file} (full ${result.body_full?.length ?? result.body.length} bytes; output truncated above)`
+          const full = result.body_full?.length ?? result.body.length
+          stored = (spec as RequestSpec).save_body === true && result.body_full === undefined
+            ? `\nbody_file: ${file} (full ${full} bytes; output shows the capped preview)`
+            : `\nbody_file: ${file} (full ${full} bytes; output truncated above)`
         } catch { /* best effort */ }
       }
       ring.push({

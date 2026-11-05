@@ -124,13 +124,57 @@ export function registerEvidenceTools(server: ToolRegistrar, config: Constellati
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('evidence_log', 'Read the tamper-evident evidence chain (every evidence_capture appended here, each entry hashing the previous). Newest first.',
+  // A5 (2026-11-05): evidence_capture needs a live page, so an on-disk
+  // artifact (an mcp_tools tools/list snapshot, a body_file, a forged
+  // document) could not enter the tamper-evident chain. evidence_file
+  // hashes ANY on-disk file into it — a report then cites the snapshot's
+  // hash, not a path a human has to re-hash.
+  t('evidence_file', 'Hash-chain an ON-DISK artifact into the tamper-evident evidence chain (A5) — evidence_capture needs a live page, but an mcp_tools snapshot, an http_request body_file, or a forged fixture document is already bytes on disk. Reads the file, sha256-hashes it, optionally copies it into the owner\'s evidence dir, and appends one chain entry. Never prints file contents.',
+    {
+      label: z.string().min(1).describe('Evidence label, e.g. "mcp tools/list snapshot"'),
+      path: z.string().describe('Absolute file path (or ~-relative) of the artifact to chain'),
+      owner: z.string().optional().describe('Owner whose evidence dir receives the copy and the chain attribution'),
+      copy: z.boolean().optional().describe('Copy the bytes into <owner>/evidence/<stamp>-<label>/ (default true); false = hash in place'),
+    },
+    async ({ label, path: rawPath, owner, copy }: any) => {
+      const who = owner ?? 'unknown'
+      const resolved = rawPath.startsWith('~/')
+        ? path.join(process.env.USERPROFILE ?? process.env.HOME ?? '.', rawPath.slice(2))
+        : rawPath
+      let stat: fs.Stats
+      try { stat = fs.statSync(resolved) } catch {
+        return textResult(`No such file: ${resolved}`, true)
+      }
+      if (stat.isDirectory()) return textResult(`${resolved} is a directory — evidence_file chains ONE file`, true)
+      const bytes = fs.readFileSync(resolved)
+      const sha256 = createHash('sha256').update(bytes).digest('hex')
+      let evidenceDir = path.dirname(resolved)
+      if (copy !== false) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+        const safeLabel = label.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60)
+        evidenceDir = path.join(config.outputDir, who, 'evidence', `${stamp}-${safeLabel}`)
+        fs.mkdirSync(evidenceDir, { recursive: true })
+        fs.copyFileSync(resolved, path.join(evidenceDir, path.basename(resolved)))
+      }
+      const chained = appendChainEntry(config, {
+        owner: who,
+        label,
+        files: [{ name: path.basename(resolved), sha256 }],
+      })
+      return textResult([
+        `Evidence "${label}" captured in ${evidenceDir}`,
+        `  ${path.basename(resolved)} — ${bytes.length} bytes — sha256 ${sha256.slice(0, 16)}…`,
+        `chain entry #${chained.seq} — hash ${chained.entry_hash.slice(0, 12)}… (evidence_verify checks the whole chain)`,
+      ].join('\n'))
+    })
+
+  t('evidence_log', 'Read the tamper-evident evidence chain (every evidence_capture and evidence_file appended here, each entry hashing the previous). Newest first.',
     { owner: z.string().optional().describe('Filter to one owner'), limit: z.number().int().optional().describe('Default 20') },
     async ({ owner, limit }: any) => {
       let chain = readChain(config).reverse()
       if (owner !== undefined) chain = chain.filter(entry => entry.owner === owner)
       chain = chain.slice(0, limit ?? 20)
-      if (chain.length === 0) return textResult('(chain empty or nothing from this owner — evidence_capture writes it)')
+      if (chain.length === 0) return textResult('(chain empty or nothing from this owner — evidence_capture/evidence_file write it)')
       return textResult(chain.map(entry =>
         `#${entry.seq} ${entry.ts} [${entry.owner}] ${entry.label}${entry.files !== undefined ? ` — ${entry.files.length} file(s)` : ''} hash ${entry.entry_hash.slice(0, 12)}…`,
       ).join('\n'))

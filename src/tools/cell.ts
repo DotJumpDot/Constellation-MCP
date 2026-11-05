@@ -43,6 +43,10 @@ export interface CellRecord {
   miss?: Record<string, unknown>
   own?: Record<string, unknown>
   notes?: string
+  /** Cross-engagement bug-shape tag (A6, 2026-11-05): the same shapes recur
+   *  across vendors — "list-vs-call", "auth-fallback", "owner-written-never-
+   *  checked". cell_status {shape} recalls every cell of that shape. */
+  shape?: string
   createdAt: string
 }
 
@@ -94,6 +98,7 @@ export function loadCells(config: ConstellationConfig): Record<string, CellRecor
         ...(raw.miss !== undefined ? { miss: raw.miss as Record<string, unknown> } : {}),
         ...(raw.own !== undefined ? { own: raw.own as Record<string, unknown> } : {}),
         ...(typeof raw.notes === 'string' ? { notes: raw.notes } : {}),
+        ...(typeof raw.shape === 'string' && raw.shape.trim() !== '' ? { shape: raw.shape } : {}),
         createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : new Date().toISOString(),
       }
     }
@@ -168,10 +173,11 @@ export function registerCellTools(server: ToolRegistrar, env: CellEnv): void {
       miss: z.record(z.string(), z.unknown()).optional().describe('The random-id lookup-miss control'),
       own: z.record(z.string(), z.unknown()).optional().describe('Leg as the object owner (enables DATA_LEAK)'),
       recipe: z.string().optional().describe('Named fixture recipe that stages this cell (runs INSTEAD of legs)'),
+      shape: z.string().optional().describe('Cross-engagement shape tag, e.g. list-vs-call, auth-fallback — cell_status {shape} recalls every run of that shape across engagements'),
       notes: z.string().optional().describe('Preconditions worth remembering (accounts, state)'),
       remove: z.boolean().optional(),
     },
-    async ({ id, engagement, object: cellObject, principal, expect, probe, miss, own, recipe, notes, remove }: any) => {
+    async ({ id, engagement, object: cellObject, principal, expect, probe, miss, own, recipe, shape, notes, remove }: any) => {
       if (remove === true) {
         const file = cellsFile(env.config)
         let parsed: Record<string, unknown> = {}
@@ -192,11 +198,12 @@ export function registerCellTools(server: ToolRegistrar, env: CellEnv): void {
         ...(probe !== undefined ? { probe } : {}),
         ...(miss !== undefined ? { miss } : {}),
         ...(own !== undefined ? { own } : {}),
+        ...(shape !== undefined && String(shape).trim() !== '' ? { shape: String(shape).trim() } : {}),
         ...(notes !== undefined ? { notes } : {}),
         createdAt: new Date().toISOString(),
       }
       saveCell(env.config, cell)
-      return textResult(`Cell "${id}" registered — ${engagement}: ${cellObject} (expect ${expect}, principal "${principal}")${recipe !== undefined ? ` via recipe "${recipe}"` : ' via diff legs'}. Run it with cell_run {id}.`)
+      return textResult(`Cell "${id}" registered — ${engagement}: ${cellObject} (expect ${expect}, principal "${principal}")${recipe !== undefined ? ` via recipe "${recipe}"` : ' via diff legs'}${cell.shape !== undefined ? ` [shape ${cell.shape}]` : ''}. Run it with cell_run {id}.`)
     })
 
   t('cell_run', 'Execute one registered cell and store its verdict tuple (round-7 §1): legs cells run probe/miss/own through diff_pair semantics; recipe cells execute their fixture recipe. Every run appends the FULL evidence tuple (statuses, body shas, deciding field) to cell-runs.jsonl and — when a real verdict lands — cites itself in the tamper-evident chain. NOT_FOUND records as INCONCLUSIVE, never negative: a lookup miss proves nothing.',
@@ -273,11 +280,14 @@ export function registerCellTools(server: ToolRegistrar, env: CellEnv): void {
       ].join('\n'))
     })
 
-  t('cell_status', 'The engagement scoreboard (round-7 §1): every cell as NEVER TESTED | INCONCLUSIVE | NEGATIVE | CANDIDATE with its last verdict tuple. NOT_FOUND is INCONCLUSIVE by rule — the false-green that shipped a green pipeline with zero findings cannot be re-created by optimism here.',
-    { engagement: z.string().optional().describe('Filter to one engagement (default: all)') },
-    async ({ engagement }: any) => {
-      const cells = Object.values(loadCells(env.config)).filter(cell => engagement === undefined || cell.engagement === engagement)
-      if (cells.length === 0) return textResult(`(no cells${engagement !== undefined ? ` for "${engagement}"` : ''} — cell_register creates one)`)
+  t('cell_status', 'The engagement scoreboard (round-7 §1): every cell as NEVER TESTED | INCONCLUSIVE | NEGATIVE | CANDIDATE with its last verdict tuple. NOT_FOUND is INCONCLUSIVE by rule — the false-green that shipped a green pipeline with zero findings cannot be re-created by optimism here. `shape` filters by the cross-engagement bug-shape tag (A6): the same shapes recur across vendors, so "every list-vs-call cell we ever ran" is one call.',
+    { engagement: z.string().optional().describe('Filter to one engagement (default: all)'), shape: z.string().optional().describe('Filter by cross-engagement shape tag (case-insensitive)') },
+    async ({ engagement, shape }: any) => {
+      const shapeWant = shape !== undefined ? shape.trim().toLowerCase() : undefined
+      const cells = Object.values(loadCells(env.config))
+        .filter(cell => engagement === undefined || cell.engagement === engagement)
+        .filter(cell => shapeWant === undefined || (cell.shape ?? '').trim().toLowerCase() === shapeWant)
+      if (cells.length === 0) return textResult(`(no cells${engagement !== undefined ? ` for "${engagement}"` : ''}${shapeWant !== undefined ? ` with shape "${shapeWant}"` : ''} — cell_register creates one)`)
       const runs = readRuns(env.config)
       return textResult(cells.map(cell => {
         const { status, last } = foldCellStatus(cell, runs)
@@ -301,6 +311,7 @@ export function registerCellTools(server: ToolRegistrar, env: CellEnv): void {
           `${cell.id} — ${status}`,
           `  object:    ${cell.object}`,
           `  principal: ${cell.principal} · expect ${cell.expect}${cell.recipe !== undefined ? ` · recipe ${cell.recipe}` : ''}`,
+          ...(cell.shape !== undefined ? [`  shape:     ${cell.shape}`] : []),
           ...(cell.notes !== undefined ? [`  notes:     ${cell.notes}`] : []),
           `  runs: ${mine.length}${last !== undefined ? ` · last ${last.source === 'legs' ? `${last.verdict} (${last.deciding_field}) probe ${last.statuses?.probe}/miss ${last.statuses?.miss}` : `${last.ok ? 'recipe ok' : `recipe failed at ${last.failedAction}`}`} ${last.ts}` : ''}`,
           ...(last?.evidenceSeq !== undefined ? [`  evidence:  chain #${last.evidenceSeq} hash ${last.evidenceHash?.slice(0, 12)}…`] : []),
