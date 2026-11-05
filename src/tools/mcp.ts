@@ -346,9 +346,15 @@ export function registerMcpTools(server: ToolRegistrar, env: McpEnv): void {
       fs.mkdirSync(paths.dir, { recursive: true })
       fs.writeFileSync(diffFile, JSON.stringify({ ts: new Date().toISOString(), url, baseline, after: fetched.tools, diff }, null, 2) + '\n')
       if (snapshot !== false) {
+        // ONE path object for the write AND the index line. snapshotPaths()
+        // stamps with the current millisecond, so two calls can straddle a
+        // tick and the index then names a file that was never written - the
+        // next diff reads an empty baseline and reports every tool as "added"
+        // (found by the 2026-11-05 live drill, second diff).
+        const freshPaths = snapshotPaths(env.config, who, url)
         const fresh = { ts: new Date().toISOString(), url, ...(fetched.protocolVersion !== undefined ? { protocolVersion: fetched.protocolVersion } : {}), tools: fetched.tools }
-        fs.writeFileSync(snapshotPaths(env.config, who, url).file, JSON.stringify(fresh, null, 2) + '\n')
-        fs.appendFileSync(paths.index, JSON.stringify({ ts: fresh.ts, url, count: fetched.tools.length, file: snapshotPaths(env.config, who, url).file, hashes: fetched.tools.map(tool => ({ name: tool.name, sha256: toolHash(tool) })) }) + '\n')
+        fs.writeFileSync(freshPaths.file, JSON.stringify(fresh, null, 2) + '\n')
+        fs.appendFileSync(paths.index, JSON.stringify({ ts: fresh.ts, url, count: fetched.tools.length, file: freshPaths.file, hashes: fetched.tools.map(tool => ({ name: tool.name, sha256: toolHash(tool) })) }) + '\n')
       }
       const lines = [
         `MCP tools/list ${diff.added.length + diff.changed.length + diff.removed.length === 0 ? 'UNCHANGED' : 'CHANGED'} — ${url} (baseline ${baseline.ts})`,
