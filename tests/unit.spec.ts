@@ -2152,12 +2152,19 @@ test('dns_takeover_check: handler scope-asserts every host, then reports per-hos
 test('evidence_scan: hits redacted to first4…last4 + sha256, placeholders counted, chain entry appended (#3)', async () => {
   const { registerEvidenceTools, verifyChain } = await import('../src/tools/evidence.js')
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-'))
+  // Synthetic values, ASSEMBLED from fragments: GitHub secret scanning flags
+  // any complete key-shaped literal even when it is obviously fake (alert on
+  // 3e58967) — each fragment is far too short to match a partner pattern, and
+  // only the joined RUNTIME value exercises the scanner regex.
+  const fakeAws = ['AKIA', '2X7Y', 'QZ9W', 'BCDE', '45FG'].join('')
+  const fakeGoogle = ['AIza', 'SyA', '1234567', '890abcde', 'fghijklmnopqrstuv'].join('')
+  const fakeDocs = ['AKIA', '9999XXXX', 'XXXXXXXX'].join('')
   try {
     fs.mkdirSync(path.join(dir, 'shared', 'bundle'), { recursive: true })
     fs.writeFileSync(path.join(dir, 'shared', 'bundle', 'config.js'), [
-      'const awsKey = "AKIA2X7YQZ9WBCDE45FG"',
-      'const gkey = "AIzaSyA1234567890abcdefghijklmnopqrstuv"',
-      'const docsKey = "AKIA9999XXXXXXXXXXXX"',
+      `const awsKey = "${fakeAws}"`,
+      `const gkey = "${fakeGoogle}"`,
+      `const docsKey = "${fakeDocs}"`,
       'sharedSecret: "changeme-please-123"',
       'const note = "nothing here"',
       '',
@@ -2167,8 +2174,8 @@ test('evidence_scan: hits redacted to first4…last4 + sha256, placeholders coun
     assert.match(text, /Scanned 1 file\(s\)/)
     assert.match(text, /\[aws-access-key-id\] value=AKIA…45FG \(20 chars\)/, 'the hit is redacted to first4…last4 + length')
     assert.match(text, /\[google-api-key\]/)
-    assert.doesNotMatch(text, /AKIA2X7YQZ9WBCDE45FG/, 'the full value NEVER appears')
-    assert.doesNotMatch(text, /AIzaSyA1234567890abcdefghijklmnopqrstuv/)
+    assert.doesNotMatch(text, new RegExp(fakeAws), 'the full value NEVER appears')
+    assert.doesNotMatch(text, new RegExp(fakeGoogle))
     assert.match(text, /2 placeholder-shaped match\(es\) filtered/, 'the XXXX key and changeme are counted, not cried wolf')
     assert.doesNotMatch(text, /changeme-please-123/)
     assert.match(text, /chain entry #1/, 'the scan itself is evidence')
