@@ -3,7 +3,7 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import pwCore from 'playwright-core'
-import type { BrowserContext, Page } from 'playwright-core'
+import type { BrowserContext, Page, Request, Response } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { armFocusGuard, type FocusGuard } from './focus.js'
 
@@ -52,6 +52,19 @@ export interface NetworkRecord {
   url: string
   status?: number
   resourceType?: string
+}
+
+/** One observed response WITH its live Playwright handles (advice
+ *  2026-11-06 #1): browser_network_requests kept metadata only, so the body
+ *  of a call that already happened was only recoverable by re-driving the
+ *  flow. The handles let browser_network_bodies fetch request headers, the
+ *  request body and the response body LAZILY — best effort: Playwright
+ *  disposes response bodies once the page navigates away, so an unavailable
+ *  body is reported honestly, never faked. */
+export interface NetworkCapture extends NetworkRecord {
+  status: number
+  request: Request
+  response: Response
 }
 
 const CONSOLE_RING = 300
@@ -192,6 +205,8 @@ export class BrowserSession {
   lastUsed = Date.now()
   consoleLines: string[] = []
   network: NetworkRecord[] = []
+  /** Response handles for browser_network_bodies (same ring size). */
+  netCaptures: NetworkCapture[] = []
   launching?: Promise<BrowserContext>
   /** Job/engagement label shown on the info tab (browser_owner_info). */
   infoJob?: string
@@ -291,6 +306,17 @@ export class BrowserSession {
     context.on('response', response => {
       this.network.push({ method: response.request().method(), url: response.url(), status: response.status() })
       if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
+      // Keep the live handle (advice 2026-11-06 #1) — the ring holds the last
+      // NET_RING responses of the session for lazy body retrieval.
+      this.netCaptures.push({
+        method: response.request().method(),
+        url: response.url(),
+        status: response.status(),
+        ...(response.request().resourceType() === undefined ? {} : { resourceType: response.request().resourceType() }),
+        request: response.request(),
+        response,
+      })
+      if (this.netCaptures.length > NET_RING) this.netCaptures.splice(0, this.netCaptures.length - NET_RING)
     })
   }
 

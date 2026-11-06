@@ -37,6 +37,31 @@ function wrap(line: string, width: number): string {
   return out.join('\n      ')
 }
 
+/** Parse the `## branch...remote [ahead N, behind M]` line of
+ *  `git status --porcelain=v1 -b` — pure so tests pin it. A branch with NO
+ *  upstream is never "synced" (advice 2026-11-06 #4: repo_commit claimed
+ *  "Pushed." even when the push silently needed a retry). */
+export interface BranchSync {
+  branch: string
+  remote?: string
+  ahead: number
+  behind: number
+  synced: boolean
+}
+
+export function parseBranchSync(line: string): BranchSync {
+  const trimmed = line.trim()
+  const head = /^##\s+(\S+)/.exec(trimmed)
+  const branch = head === null ? '' : head[1]!.split('...')[0]!
+  const remoteMatch = /\.\.\.(\S+)/.exec(trimmed)
+  const remote = remoteMatch === null ? undefined : remoteMatch[1]!.replace(/\s*\[.*$/, '')
+  const aheadMatch = /ahead (\d+)/.exec(trimmed)
+  const behindMatch = /behind (\d+)/.exec(trimmed)
+  const ahead = aheadMatch === null ? 0 : Number.parseInt(aheadMatch[1]!, 10)
+  const behind = behindMatch === null ? 0 : Number.parseInt(behindMatch[1]!, 10)
+  return { branch, remote, ahead, behind, synced: remote !== undefined && ahead === 0 && behind === 0 }
+}
+
 async function git(cwd: string, ...args: string[]): Promise<string> {
   try {
     const { stdout } = await exec('git', args, { cwd, windowsHide: true, maxBuffer: 16 * 1024 * 1024 })
@@ -89,8 +114,24 @@ export function registerGitTools(server: ToolRegistrar): void {
       if (repo !== undefined) lastRepo = repo
       const cwd = repo ?? defaultRepo()
       const staged = (await git(cwd, 'diff', '--cached', '--name-only')).split('\n').map(s => s.trim()).filter(s => s !== '')
-      const wanted = new Set(paths)
-      const extraneous = staged.filter(s => !wanted.has(s))
+      // Rename support (advice 2026-11-06 #4): `git mv old new` stages BOTH the
+      // deletion of `old` and the add of `new`, so a caller passing only the
+      // NEW path was refused for "staged changes outside your paths" — and
+      // committing one side of a rename would split it. A staged path counts
+      // as inside the caller's paths when it EQUALS one or lives UNDER a
+      // given directory; when a staged rename's destination is inside, its
+      // SOURCE joins the commit set.
+      const covered = (stagedPath: string, list: readonly string[]): boolean =>
+        list.some(p => stagedPath === p || stagedPath.startsWith(`${p.replace(/[\\/]+$/, '')}/`))
+      const renameRows = (await git(cwd, 'diff', '--cached', '--name-status', '-M'))
+        .split('\n').map(s => s.trim()).filter(s => s !== '')
+      const renameSources = new Set<string>()
+      for (const row of renameRows) {
+        const cols = row.split('\t')
+        if (cols.length === 3 && /^R/.test(cols[0]!) && covered(cols[2]!, paths)) renameSources.add(cols[1]!)
+      }
+      const effective = [...paths, ...renameSources]
+      const extraneous = staged.filter(s => !covered(s, effective))
       if (extraneous.length > 0)
         return textResult(`Refusing: the index already holds staged changes outside your paths: ${extraneous.join(', ')}. Coordinate with their owner first.`, true)
       // Validate paths against the worktree BEFORE git add: git's own error
@@ -105,7 +146,11 @@ export function registerGitTools(server: ToolRegistrar): void {
           'git status the repo and fix the path list; the remaining paths were not staged.',
         ].join('\n'), true)
       }
-      await git(cwd, 'add', '--', ...paths)
+      // Stage the CALLER's paths only — the rename sources are ALREADY in
+      // the index (that is why they looked extraneous), and `git add` on a
+      // path that exists in neither worktree nor index is fatal. `-A` so a
+      // deliberately-passed deleted path still stages its deletion.
+      await git(cwd, 'add', '-A', '--', ...paths)
       const message = renderCommitMessage({ type, subject, bullets, verification })
       const file = path.join(tmpdir(), `constellation-commit-${Date.now()}.txt`)
       const { writeFileSync, unlinkSync } = await import('node:fs')
@@ -116,11 +161,38 @@ export function registerGitTools(server: ToolRegistrar): void {
         try { unlinkSync(file) } catch { /* fine */ }
       }
       const hash = (await git(cwd, 'rev-parse', '--short', 'HEAD')).trim()
-      const pushed = push === true ? await git(cwd, 'push') : undefined
+      // Truthful push (advice 2026-11-06 #4): GitHub flaked twice in one
+      // night with `fatal error in commit_refs` AFTER the commit, and the
+      // tool still said "Pushed." — the claim is now verified against
+      // `git status -sb`, with one retry, and an unverified push is an ERROR.
+      let pushLine: string | undefined
+      let pushFailed = false
+      if (push === true) {
+        let pushed = false
+        let lastError = ''
+        for (let attempt = 1; attempt <= 2 && !pushed; attempt++) {
+          try {
+            await git(cwd, 'push')
+            pushed = true
+          } catch (error) {
+            lastError = error instanceof Error ? error.message.split('\n')[0]!.trim() : String(error)
+          }
+          if (!pushed && attempt === 1) await new Promise(resolve => setTimeout(resolve, 1_500))
+        }
+        const statusLine = (await git(cwd, 'status', '--porcelain=v1', '-b')).split('\n')[0] ?? ''
+        const sync = parseBranchSync(statusLine)
+        if (pushed && sync.synced) {
+          pushLine = `Pushed and VERIFIED — ${sync.branch} matches ${sync.remote}.`
+        } else {
+          pushFailed = true
+          pushLine = `PUSH UNVERIFIED — ${pushed ? 'the push command succeeded' : `push failed: ${lastError}`} but git status reads "${statusLine.trim()}" (${sync.ahead} ahead, ${sync.behind} behind${sync.remote === undefined ? ', NO upstream configured' : ''}). Run repo_status before claiming "pushed".`
+        }
+      }
       return textResult([
         `Committed ${hash} — ${type}: ${subject}`,
-        ...(pushed !== undefined ? ['Pushed.'] : []),
+        ...(renameSources.size > 0 ? [`Included staged rename source(s): ${[...renameSources].join(', ')}`] : []),
+        ...(pushLine !== undefined ? [pushLine] : []),
         message.trimEnd(),
-      ].join('\n'))
+      ].join('\n'), pushFailed)
     })
 }

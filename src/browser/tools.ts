@@ -80,6 +80,30 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}\n… [truncated ${s.length - max} chars]`
 }
 
+/** Last-N matching captures for browser_network_bodies — pure so tests pin
+ *  the filter order (url substring, then method, then the newest `limit`). */
+export function pickNetworkCaptures<T extends { method: string; url: string }>(
+  rows: readonly T[], urlContains: string | undefined, method: string | undefined, limit: number | undefined,
+): T[] {
+  let out = rows.slice()
+  if (urlContains !== undefined && urlContains !== '') out = out.filter(row => row.url.includes(urlContains))
+  if (method !== undefined && method !== '') {
+    const wantedMethod = method.toUpperCase()
+    out = out.filter(row => row.method.toUpperCase() === wantedMethod)
+  }
+  return out.slice(-(limit ?? 20))
+}
+
+/** File extension for a saved body, from its content-type. */
+export function bodyExtension(contentType: string | undefined): string {
+  const ct = (contentType ?? '').toLowerCase()
+  if (ct.includes('json')) return '.json'
+  if (ct.includes('html')) return '.html'
+  if (ct.includes('xml')) return '.xml'
+  if (ct.startsWith('text/')) return '.txt'
+  return '.bin'
+}
+
 /** Compile a user-supplied `async (page, require) => {...}` expression. Pure
  *  so tests can pin the shape without a browser. */
 export function makeUserFn(code: string): (page: unknown, requireFn: NodeJS.Require) => Promise<unknown> {
@@ -539,6 +563,75 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (filter !== undefined && filter !== '') rows = rows.filter(r => r.url.includes(filter))
       if (rows.length === 0) return textResult('(no network activity captured)')
       return textResult(rows.map(r => `${r.status === undefined ? ' →' : r.status} ${r.method} ${r.url}`).join('\n'))
+    })
+
+  // Advice 2026-11-06 #1: the depth plans' replay cards need the EXACT call
+  // the app already made (headers, body, JWT shape) — the body used to be
+  // visible only in devtools by hand or by re-driving the flow with a
+  // page.on('response') hook. The session now keeps live response handles
+  // (last 200); this tool exports them to the owner's artifacts dir with
+  // sha256 + a short redacted preview — bodies stay OUT of the transcript.
+  t('browser_network_bodies', 'Captured request/response BODIES for calls this owner\'s browser already made (advice 2026-11-06 #1): per matching response — method/URL/status, request headers (secrets redacted), request body and response body written to the owner\'s artifacts dir with sha256 + byte counts and a short redacted preview. This is what a replay card (http_replay/diff_pair) needs: the genuine call, not a re-drive. Best-effort retroactive: Playwright disposes bodies after the page navigates away — an unavailable body is reported with the reason; the last 200 responses keep live handles.',
+    {
+      url_contains: z.string().optional().describe('Substring filter on URL (required in practice — otherwise the last 20 responses dump)'),
+      method: z.string().optional().describe('Exact HTTP method filter, e.g. "POST"'),
+      limit: z.number().int().optional().describe('Max matches (newest last); default 20'),
+      max_bytes: z.number().int().optional().describe('Per-body byte cap for what is WRITTEN (default 131072, hard cap 2097152)'),
+      ...OWNER_FIELD,
+    },
+    async ({ url_contains, method, limit, max_bytes, owner }: any) => {
+      const { session } = sessionOf(env, owner)
+      const rows = pickNetworkCaptures(session.netCaptures, url_contains, method, limit)
+      if (rows.length === 0)
+        return textResult('(no matching captured responses — handles exist only for this owner session\'s last 200 responses, and bodies die when the page navigates away; if the flow already moved on, re-drive it and call this immediately after)', true)
+      const cap = Math.max(1_024, Math.min(2_097_152, max_bytes ?? 131_072))
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const dir = path.join(session.artifactDir(), 'bodies', stamp)
+      fs.mkdirSync(dir, { recursive: true })
+      const shaOf = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex')
+      const lines: string[] = [`Captured ${rows.length} response(s) → ${dir}`, '']
+      for (let at = 0; at < rows.length; at++) {
+        const row = rows[at]!
+        const num = String(at + 1).padStart(2, '0')
+        let headersText = ''
+        try {
+          headersText = Object.entries(await row.request.allHeaders()).map(([k, v]) => `${k}: ${v}`).sort().join('\n')
+        } catch {
+          headersText = Object.entries(row.request.headers()).map(([k, v]) => `${k}: ${v}`).sort().join('\n')
+        }
+        fs.writeFileSync(path.join(dir, `${num}.req.headers.txt`), redactSecrets(headersText) + '\n')
+        const reqBody = row.request.postDataBuffer()
+        const reqNote = reqBody === null
+          ? 'request body: none'
+          : (() => {
+              const bytes = reqBody.subarray(0, cap)
+              const ext = bodyExtension(row.request.headers()['content-type'])
+              const file = path.join(dir, `${num}.req${ext}`)
+              fs.writeFileSync(file, bytes)
+              return `request body: ${reqBody.length} bytes${reqBody.length > cap ? ` (only the first ${cap} written)` : ''} — ${num}.req${ext} — sha256 ${shaOf(bytes).slice(0, 16)}…`
+            })()
+        let resNote: string
+        let preview = ''
+        try {
+          const body = await row.response.body()
+          const bytes = body.subarray(0, cap)
+          const ext = bodyExtension(row.response.headers()['content-type'])
+          const file = path.join(dir, `${num}.res${ext}`)
+          fs.writeFileSync(file, bytes)
+          resNote = `response body: ${body.length} bytes${body.length > cap ? ` (only the first ${cap} written)` : ''} — ${num}.res${ext} — sha256 ${shaOf(bytes).slice(0, 16)}…`
+          preview = truncate(redactSecrets(body.toString('utf8').slice(0, 200)).replace(/\s+/g, ' ').trim(), 200)
+        } catch (error) {
+          resNote = `response body: UNAVAILABLE — ${describeErrorChain(error).slice(0, 160)} (bodies die when the page navigates; re-drive the flow and call this immediately after)`
+        }
+        lines.push(
+          `[${num}] ${row.status} ${row.method} ${row.url}`,
+          `  ${reqNote}`,
+          `  ${resNote}`,
+          ...(preview === '' ? [] : [`  preview: ${preview}`]),
+        )
+      }
+      lines.push('', `headers: ${rows.length}.req.headers.txt file(s) (redacted); chain one with evidence_file when it becomes a finding`)
+      return textResult(lines.join('\n'))
     })
 
   t('browser_take_screenshot', 'Screenshot the owner\'s current tab into that owner\'s artifacts folder.',

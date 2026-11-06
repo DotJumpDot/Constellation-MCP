@@ -21,6 +21,7 @@ import { InjectStore, registerInjectTools } from './tools/injectlab.js'
 import { registerRecipeTools } from './tools/recipe.js'
 import { registerCellTools } from './tools/cell.js'
 import { registerMcpTools } from './tools/mcp.js'
+import { registerDnsTools } from './tools/dns.js'
 import { registerReportTools } from './tools/report.js'
 
 export interface ConstellationServer {
@@ -52,6 +53,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
       'Manufacture fixtures, do not hand-build them: fixture_publish (public URL + canary; fixture_hits answers canary_seen), fixture_forge (real .docx/.pdf for browser_upload), dupe_check before deep work (KEV/sightings/bundles enriched), diff_pair for the authorization verdict (it cites itself in the evidence chain), session_verify/session_watch with per-site proof rules, http_replay to vary exactly one field, http_extract for one VALUE out of a capture, evidence_capture/evidence_file/evidence_verify for the tamper-evident chain.',
       'Track the work in CELLS, not memory: cell_register the object+principal+expected verdict (a `shape` tag recalls the same bug shape across engagements), cell_run stores the verdict tuple (NOT_FOUND = INCONCLUSIVE, never negative), cell_status is the scoreboard, cell_ledger replaces hand-curated markdown, recipe_drift names DENY→ALLOW transitions, report_assemble builds the skeleton from CANDIDATE cells only.',
       'MCP surfaces (Methods/72): mcp_tools FIRST (snapshot tools/list — descriptions are agent instructions, so their text stays on disk and never enters the transcript), mcp_diff for rug pulls (description changes after approval), mcp_auth_gate for the none/malformed matrix (bounded 12 requests, 1 req/s, never destructive tools); http_request {save_body:true} captures a JSON body to disk whole; chain the snapshot with evidence_file.',
+      'P1/P2 asks (2026-11-06): browser_network_bodies exports the captured request/response bodies of calls the browser ALREADY made (sha256 + artifacts dir, redacted preview — the input every replay card needs); dns_takeover_check is the read-only dangling-CNAME sweep (versioned fingerprint table, claimable verdicts, fetch:true reads the origin page — NO claiming, ever); evidence_scan runs the secret-pattern scan over an owner\'s artifacts and chains it (hits redacted to first4…last4 + sha256); repo_commit accepts git-mv renames (pass the new path; the staged source is included) and its "Pushed." claim is verified against git status.',
     ].join('\n'),
   })
 
@@ -72,6 +74,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerRecipeTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner), jars, scope, budget })
   registerCellTools(registrar, { config, sessionFor: owner => registry.sessionFor(owner), jars, scope, budget })
   registerMcpTools(registrar, { config, scope, budget })
+  registerDnsTools(registrar, { scope, budget })
   registerReportTools(registrar, { config })
   registerScopeTools(registrar, scope, config.requireScope)
   registerSecretTools(registrar)

@@ -2031,3 +2031,217 @@ test('dupe_check: cve_ids ALONE passes the registered schema and skips the keywo
     stub.close()
   }
 })
+
+// ── P1/P2 asks (advice 2026-11-06): network bodies, dns takeover, evidence
+// scan, repo_commit renames ──────────────────────────────────────────────────
+
+test('browser_network_bodies: pure capture picker + body extension mapping (#1, 2026-11-06)', async () => {
+  const { pickNetworkCaptures, bodyExtension } = await import('../src/browser/tools.js')
+  const rows = [
+    { method: 'GET', url: 'https://a.example/x' },
+    { method: 'POST', url: 'https://a.example/api/v1/login' },
+    { method: 'GET', url: 'https://cdn.other.net/logo.png' },
+    { method: 'POST', url: 'https://a.example/api/v1/invite' },
+  ]
+  const byUrl = pickNetworkCaptures(rows, 'a.example/api', undefined, undefined)
+  assert.equal(byUrl.length, 2, 'url substring filters first')
+  const byUrlMethod = pickNetworkCaptures(rows, 'a.example', 'post', undefined)
+  assert.deepEqual(byUrlMethod.map(r => r.url), ['https://a.example/api/v1/login', 'https://a.example/api/v1/invite'], 'method filter is case-insensitive and keeps order')
+  const limited = pickNetworkCaptures(rows, undefined, undefined, 1)
+  assert.deepEqual(limited.map(r => r.url), ['https://a.example/api/v1/invite'], 'limit keeps the NEWEST rows')
+  assert.equal(pickNetworkCaptures(rows, 'nothing-matches', undefined, undefined).length, 0)
+  assert.equal(bodyExtension('application/json; charset=utf-8'), '.json')
+  assert.equal(bodyExtension('text/html'), '.html')
+  assert.equal(bodyExtension('image/png'), '.bin')
+  assert.equal(bodyExtension(undefined), '.bin')
+})
+
+test('dns_takeover_check: fingerprint verdicts — NXDOMAIN yes, protected no, unknown without fetch, live no (#2)', async () => {
+  const { takeoverVerdict, fingerprintForBody, fingerprintForHost } = await import('../src/tools/dns.js')
+  // dangling at a takeoverable page-provider, NOT fetched → unknown (needs HTTP)
+  const githubChain = { chain: ['assets.example.com', 'user.github.io'], terminal: 'user.github.io', hasCname: true, addresses: ['185.199.108.153'], aStop: undefined, cnameStop: 'ENODATA' }
+  const unknown = takeoverVerdict({ chain: githubChain })
+  assert.equal(unknown.claimable, 'unknown')
+  assert.match(unknown.why, /fetch: true/)
+  // fetched and the unclaimed page matched → TRUE with the provider named
+  const claimed = takeoverVerdict({ chain: githubChain, fetch: { status: 404, body: "There isn't a GitHub Pages site here." } })
+  assert.equal(claimed.claimable, 'true')
+  assert.match(claimed.why!, /GitHub Pages unclaimed page/)
+  // fetched but serving real content → FALSE
+  const live = takeoverVerdict({ chain: githubChain, fetch: { status: 200, body: '<html>the real site</html>' } })
+  assert.equal(live.claimable, 'false')
+  // NXDOMAIN at a takeoverable NXDOMAIN-provider (Azure) → TRUE without fetch
+  const azure = takeoverVerdict({ chain: { chain: ['old.example.com', 'x.cloudapp.azure.com'], terminal: 'x.cloudapp.azure.com', hasCname: true, addresses: [], aStop: 'ENOTFOUND', cnameStop: 'ENODATA' } })
+  assert.equal(azure.claimable, 'true')
+  assert.match(azure.why!, /NXDOMAIN/)
+  // NXDOMAIN at a PROTECTED provider → FALSE, not a dead-pendulum maybe
+  const tm = takeoverVerdict({ chain: { chain: ['old.example.com', 'x.trafficmanager.net'], terminal: 'x.trafficmanager.net', hasCname: true, addresses: [], aStop: 'ENOTFOUND', cnameStop: 'ENODATA' } })
+  assert.equal(tm.claimable, 'false')
+  assert.match(tm.why!, /protected/)
+  // no CNAME at all → nothing to take over
+  const bare = takeoverVerdict({ chain: { chain: ['example.com'], terminal: 'example.com', hasCname: false, addresses: ['93.184.216.34'], aStop: undefined, cnameStop: 'ENODATA' } })
+  assert.equal(bare.claimable, 'false')
+  // body fingerprint needs the status to match
+  assert.equal(fingerprintForBody('user.github.io', 200, "There isn't a GitHub Pages site here."), undefined, 'a 200 carrying the fingerprint text is not the unclaimed page')
+  assert.equal(fingerprintForHost('d1x4example.s3-website-us-east-1.amazonaws.com')?.provider, 'AWS S3 static site')
+  assert.equal(fingerprintForHost('plain.example.com'), undefined)
+})
+
+test('dns_takeover_check: resolveTakeoverHost walks the chain via an injected resolver (#2)', async () => {
+  const dnsMod = await import('../src/tools/dns.js')
+  const stub = {
+    resolveCname: async (host: string) => {
+      if (host === 'assets.example.com') return ['edge.github.io']
+      const err = new Error('no CNAME') as Error & { code: string }
+      err.code = 'ENODATA'
+      throw err
+    },
+    resolve4: async (host: string) => {
+      if (host === 'edge.github.io') {
+        const err = new Error('nx') as Error & { code: string }
+        err.code = 'ENOTFOUND'
+        throw err
+      }
+      return ['203.0.113.9']
+    },
+  } as unknown as import('../src/tools/dns.js').DnsLike
+  const chain = await dnsMod.resolveTakeoverHost('assets.example.com', stub)
+  assert.deepEqual(chain.chain, ['assets.example.com', 'edge.github.io'], 'the walk follows exactly one CNAME hop')
+  assert.equal(chain.hasCname, true)
+  assert.equal(chain.terminal, 'edge.github.io')
+  assert.deepEqual(chain.addresses, [], 'ENOTFOUND at the terminal reads as no A record')
+  assert.equal(chain.aStop, 'ENOTFOUND')
+})
+
+test('dns_takeover_check: handler scope-asserts every host, then reports per-host verdicts offline (#2)', async () => {
+  const { registerDnsTools } = await import('../src/tools/dns.js')
+  const { ScopeGuard } = await import('../src/scope.js')
+  const { BudgetGuard } = await import('../src/tools/budget.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dnstake-'))
+  try {
+    const scope = new ScopeGuard(path.join(dir, 's.json'), path.join(dir, 'a.jsonl'))
+    scope.set({ engagement: 't', in_scope: ['example.com', '*.example.com'], out_scope: [] })
+    const stub = {
+      resolveCname: async (host: string) => {
+        if (host === 'assets.example.com') return ['edge.github.io']
+        const err = new Error('no CNAME') as Error & { code: string }
+        err.code = 'ENODATA'
+        throw err
+      },
+      resolve4: async (host: string) => {
+        if (host === 'edge.github.io') {
+          const err = new Error('nx') as Error & { code: string }
+          err.code = 'ENOTFOUND'
+          throw err
+        }
+        return ['203.0.113.9']
+      },
+    } as unknown as import('../src/tools/dns.js').DnsLike
+    const handlers = await captureTools(s => registerDnsTools(s as never, { scope, budget: new BudgetGuard(), dns: stub }))
+    const denied = await handlers.get('dns_takeover_check')!({ hosts: ['evil.other.com'] })
+    assert.match(textOf(denied), /SCOPE DENIED/, 'an out-of-scope host is refused before ANY DNS query')
+    const ok = textOf(await handlers.get('dns_takeover_check')!({ hosts: ['assets.example.com'] }))
+    assert.match(ok, /CNAME: assets\.example\.com → edge\.github\.io/)
+    assert.match(ok, /claimable: TRUE — .*github\.io is NXDOMAIN/)
+    assert.match(ok, /NO claiming, ever/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('evidence_scan: hits redacted to first4…last4 + sha256, placeholders counted, chain entry appended (#3)', async () => {
+  const { registerEvidenceTools, verifyChain } = await import('../src/tools/evidence.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-'))
+  try {
+    fs.mkdirSync(path.join(dir, 'shared', 'bundle'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'shared', 'bundle', 'config.js'), [
+      'const awsKey = "AKIA2X7YQZ9WBCDE45FG"',
+      'const gkey = "AIzaSyA1234567890abcdefghijklmnopqrstuv"',
+      'const docsKey = "AKIA9999XXXXXXXXXXXX"',
+      'sharedSecret: "changeme-please-123"',
+      'const note = "nothing here"',
+      '',
+    ].join('\n'))
+    const handlers = await captureTools(s => registerEvidenceTools(s as never, { rootDir: dir, outputDir: dir } as never))
+    const text = textOf(await handlers.get('evidence_scan')!({ owner: 'shared' }))
+    assert.match(text, /Scanned 1 file\(s\)/)
+    assert.match(text, /\[aws-access-key-id\] value=AKIA…45FG \(20 chars\)/, 'the hit is redacted to first4…last4 + length')
+    assert.match(text, /\[google-api-key\]/)
+    assert.doesNotMatch(text, /AKIA2X7YQZ9WBCDE45FG/, 'the full value NEVER appears')
+    assert.doesNotMatch(text, /AIzaSyA1234567890abcdefghijklmnopqrstuv/)
+    assert.match(text, /2 placeholder-shaped match\(es\) filtered/, 'the XXXX key and changeme are counted, not cried wolf')
+    assert.doesNotMatch(text, /changeme-please-123/)
+    assert.match(text, /chain entry #1/, 'the scan itself is evidence')
+    assert.equal(verifyChain({ rootDir: dir } as never).ok, true)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('evidence_scan: binary files skipped, zero-hit dirs still chain (#3)', async () => {
+  const { registerEvidenceTools, readChain } = await import('../src/tools/evidence.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scanclean-'))
+  try {
+    fs.mkdirSync(path.join(dir, 'lead'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'lead', 'logo.bin'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0d, 0x0a, 0x1a, 0x0a]))
+    fs.writeFileSync(path.join(dir, 'lead', 'notes.txt'), 'just prose, no keys\n')
+    const handlers = await captureTools(s => registerEvidenceTools(s as never, { rootDir: dir, outputDir: dir } as never))
+    const text = textOf(await handlers.get('evidence_scan')!({ owner: 'lead' }))
+    assert.match(text, /0 credential hits/)
+    assert.match(text, /1 binary skipped/)
+    assert.match(text, /chain entry #1/)
+    assert.equal(readChain({ rootDir: dir } as never).length, 1)
+    const neither = await handlers.get('evidence_scan')!({})
+    assert.match(textOf(neither), /owner \(scans that owner's artifacts dir\) or root/, 'neither owner nor root is an honest error')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('repo_commit: parseBranchSync reads ahead/behind and the synced flag (#4)', async () => {
+  const { parseBranchSync } = await import('../src/tools/git.js')
+  const synced = parseBranchSync('## main...origin/main')
+  assert.equal(synced.branch, 'main')
+  assert.equal(synced.remote, 'origin/main')
+  assert.equal(synced.synced, true)
+  const ahead = parseBranchSync('## main...origin/main [ahead 2]')
+  assert.equal(ahead.ahead, 2)
+  assert.equal(ahead.synced, false)
+  const both = parseBranchSync('## dev...origin/dev [ahead 1, behind 3]')
+  assert.equal(both.ahead, 1)
+  assert.equal(both.behind, 3)
+  assert.equal(both.synced, false)
+  const noUpstream = parseBranchSync('## main')
+  assert.equal(noUpstream.synced, false, 'no upstream is never "synced"')
+})
+
+test('repo_commit: a git-mv rename commits from the NEW path alone (#4)', async () => {
+  const { registerGitTools } = await import('../src/tools/git.js')
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const run = promisify(execFile)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitscan-'))
+  const git = (...args: string[]) => run('git', args, { cwd: dir, windowsHide: true })
+  try {
+    await git('init', '-q')
+    await git('config', 'user.email', 't@example.com')
+    await git('config', 'user.name', 't')
+    fs.mkdirSync(path.join(dir, 'Old'))
+    fs.writeFileSync(path.join(dir, 'Old', 'file.md'), '# one\n')
+    await git('add', '-A')
+    await git('commit', '-q', '-m', 'init')
+    await git('mv', 'Old', 'New')
+    const handlers = await captureTools(s => registerGitTools(s as never))
+    const text = textOf(await handlers.get('repo_commit')!({
+      type: 'Docs', subject: 'rename folder (New)', bullets: ['moved Old to New'], verification: 'test', paths: ['New'], repo: dir,
+    }))
+    assert.match(text, /Committed /, 'the tool no longer refuses the half-named rename')
+    assert.match(text, /Included staged rename source\(s\): Old/)
+    const status = (await git('status', '--porcelain=v1')).stdout
+    assert.equal(status.trim(), '', 'nothing left staged: BOTH sides of the rename committed')
+    const names = (await git('log', '--name-status', '--format=', '-1')).stdout
+    assert.match(names, /R\d+\s+Old\/file\.md\s+New\/file\.md/, 'git records it as one rename')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
