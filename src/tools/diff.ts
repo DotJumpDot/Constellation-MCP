@@ -38,6 +38,15 @@ export function verdictOf(legs: DiffPairLegs): {
   }
   const statusDiffers = probe.status !== miss.status
   let decidingField = statusDiffers ? 'status' : 'body'
+  // Lead smoke 2026-11-09 D1: a status-divergent pair with IDENTICAL bytes
+  // fell through to SOFT_ALLOW with a "different bytes" note printed while
+  // the shas were equal. In this branch sameBytes implies statusDiffers —
+  // the byte-identical SAME-status pair already returned NOT_FOUND above —
+  // so identical bytes here mean only the STATUS distinguishes the real
+  // object from a random id: an existence oracle, not a data disclosure.
+  // SOFT_ALLOW now means exactly what its schema says: 2xx with bytes that
+  // genuinely differ.
+  const sameBytes = probe.body_sha256 === miss.body_sha256
   if (probe.status >= 200 && probe.status < 300) {
     if (legs.own !== undefined && legs.own.status >= 200 && legs.own.status < 300
       && probe.body_sha256 === legs.own.body_sha256) {
@@ -45,6 +54,13 @@ export function verdictOf(legs: DiffPairLegs): {
         verdict: 'DATA_LEAK',
         deciding_field: decidingField,
         note: `another identity received the SAME bytes as the owner (both sha ${probe.body_sha256.slice(0, 12)}…) with HTTP ${probe.status} — the object is not access-controlled`,
+      }
+    }
+    if (sameBytes) {
+      return {
+        verdict: 'AUTHORIZATION_DENIAL',
+        deciding_field: 'status',
+        note: `probe HTTP ${probe.status} vs miss control HTTP ${miss.status} with IDENTICAL bytes — the server distinguishes the real object from a random id, but no data differs from the miss control: a status/existence oracle, not a data disclosure`,
       }
     }
     return {

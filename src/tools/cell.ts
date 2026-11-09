@@ -165,10 +165,10 @@ export function registerCellTools(server: ToolRegistrar, env: CellEnv): void {
   t('cell_register', 'Register one TEST CELL in the machine ledger (round-7 §1): object graph + principal + expected verdict (deny|allow), with either http legs (probe + miss [+ own] — http_request shape, `browser: "<owner>"` rides a live session) or a named fixture recipe that stages the whole cell. This replaces hand-curated "untested cells" markdown: the run-7 review found that ledger wrong in the optimistic direction. `remove: true` deletes.',
     {
       id: z.string().describe('Stable cell id, e.g. "klaviyo-shared-page-revoke"'),
-      engagement: z.string().describe('Engagement/lane name for cell_status filtering'),
-      object: z.string().describe('What object graph this cell exercises (one sentence)'),
-      principal: z.string().describe('Lane/identity whose attribution the legs run under'),
-      expect: z.enum(['deny', 'allow']).describe('The verdict a HEALTHY boundary returns'),
+      engagement: z.string().optional().describe('Engagement/lane name for cell_status filtering (required to create, not to remove)'),
+      object: z.string().optional().describe('What object graph this cell exercises, one sentence (required to create, not to remove)'),
+      principal: z.string().optional().describe('Lane/identity whose attribution the legs run under (required to create, not to remove)'),
+      expect: z.enum(['deny', 'allow']).optional().describe('The verdict a HEALTHY boundary returns (required to create, not to remove)'),
       probe: z.record(z.string(), z.unknown()).optional().describe('Leg AS THE OTHER IDENTITY against the real object'),
       miss: z.record(z.string(), z.unknown()).optional().describe('The random-id lookup-miss control'),
       own: z.record(z.string(), z.unknown()).optional().describe('Leg as the object owner (enables DATA_LEAK)'),
@@ -188,6 +188,17 @@ export function registerCellTools(server: ToolRegistrar, env: CellEnv): void {
         fs.writeFileSync(file, JSON.stringify(parsed, null, 2) + '\n')
         return textResult(`Cell "${id}" removed.`)
       }
+      // Lead smoke 2026-11-09 D2: the four create fields are schema-optional
+      // so `remove: true` accepts an id-only delete; the create path enforces
+      // them here instead of letting zod reject the documented delete shape.
+      const missing = [
+        ...(engagement === undefined ? ['engagement'] : []),
+        ...(cellObject === undefined ? ['object'] : []),
+        ...(principal === undefined ? ['principal'] : []),
+        ...(expect === undefined ? ['expect'] : []),
+      ]
+      if (missing.length > 0)
+        return textResult(`Refusing to save: ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required to create a cell (id-only is valid only with remove: true).`, true)
       if (recipe === undefined && (probe === undefined || miss === undefined))
         return textResult('Refusing to save: a cell needs either probe + miss legs or a named recipe.', true)
       if (recipe !== undefined && loadRecipes(env.config)[recipe] === undefined)

@@ -679,6 +679,15 @@ test('diff_pair: the probe-vs-miss distinction decides the verdict (run-8 §4)',
   assert.equal(blind.deciding_field, 'none')
   assert.match(blind.note, /MISS ON BOTH SIDES/)
   assert.equal(verdictOf({ probe: leg(403, 'x'), miss: leg(403, 'y') }).verdict, 'NOT_FOUND', 'same-status 403/403 is conservative-blind too')
+  // Lead smoke 2026-11-09 D1: probe 2xx with IDENTICAL bytes to the miss but
+  // a different status is a status/existence oracle — never SOFT_ALLOW, and
+  // the note can never claim the bytes differ while the shas are equal.
+  const oracle = verdictOf({ probe: leg(200, 'same'), miss: leg(404, 'same') })
+  assert.equal(oracle.verdict, 'AUTHORIZATION_DENIAL', 'identical bytes + divergent status is an existence oracle, not a soft data allow')
+  assert.equal(oracle.deciding_field, 'status')
+  assert.match(oracle.note, /IDENTICAL bytes/)
+  assert.doesNotMatch(oracle.note, /different bytes/, 'the "different bytes" wording can never print when the shas are equal')
+  assert.equal(verdictOf({ probe: leg(200, 'same'), miss: leg(404, 'same'), own: leg(200, 'zz') }).verdict, 'AUTHORIZATION_DENIAL', 'the oracle verdict holds with an own leg present too')
   assert.deepEqual(firstJsonDiff({ a: { b: 1 }, c: 2 }, { a: { b: 2 }, c: 2 }), '/a/b')
   assert.equal(firstJsonDiff({ a: 1 }, { a: 1, x: 9 }), '/x (added)')
 })
@@ -1937,6 +1946,16 @@ test('cell shape: register + cross-engagement filter returns only matching cells
     assert.match(all, /vendorB-plain/, 'no filter returns everything')
     const ledger = textOf(await handlers.get('cell_ledger')!({ engagement: 'vendorA' }))
     assert.match(ledger, /shape:\s+list-vs-call/, 'the ledger prints the tag')
+    // Lead smoke 2026-11-09 D2: `remove: true` is an id-only delete — the
+    // create-only fields are enforced at runtime, not by zod, so the
+    // documented delete shape passes validation.
+    const removed = textOf(await handlers.get('cell_register')!({ id: 'vendorB-plain', remove: true }))
+    assert.match(removed, /"vendorB-plain" removed/, 'id-only delete round-trips')
+    const afterRemove = textOf(await handlers.get('cell_status')!({}))
+    assert.doesNotMatch(afterRemove, /vendorB-plain/, 'the removed cell is gone from the ledger')
+    const refused = textOf(await handlers.get('cell_register')!({ id: 'no-fields', probe: leg, miss: leg }))
+    assert.match(refused, /Refusing to save: engagement, object, principal, expect are required/, 'a create missing the tuple fields is refused by name')
+    assert.match(refused, /id-only is valid only with remove: true/)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
