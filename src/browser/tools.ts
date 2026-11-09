@@ -80,6 +80,19 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}\n… [truncated ${s.length - max} chars]`
 }
 
+/** The taskbar-badge line appended to launch/map/owner-info output (user ask
+ *  2026-11-10): the lane is TOLD the number, what the human sees on the
+ *  taskbar, and that human_task_create takes it as chrome_badge — the number
+ *  only helps if the agent passes it on when it raises a wall. */
+export function badgeNote(session: BrowserSession): string {
+  const badge = session.taskbarBadge
+  if (badge === undefined) return ''
+  const applied = session.badgeWindows > 0
+    ? `drawn on ${session.badgeWindows} window(s)`
+    : 'still drawing (or unsupported on this shell) — the number is also on the window\'s info tab'
+  return `\nTaskbar badge: ${badge} — this Chrome's taskbar icon shows the number ${badge} (${applied}). Reference "Chrome ${badge}" when talking to the human, and pass chrome_badge: ${badge} to human_task_create so the wall says which window to look at.`
+}
+
 /** Last-N matching captures for browser_network_bodies — pure so tests pin
  *  the filter order (url substring, then method, then the newest `limit`). */
 export function pickNetworkCaptures<T extends { method: string; url: string }>(
@@ -718,13 +731,14 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (action === 'new') {
         if (url !== undefined) env.scope.assert(url, who, 'browser_tabs(new)')
         env.budget.spend(who)
+        const wasDown = session.context === undefined // this call SPAWNED the window
         const { meta, page } = await session.newTab(who, url)
         if (url !== undefined) await assertLandedInScope(env, page, who, url, 'browser_tabs(new)')
         const snap = await session.snapshot()
         const listed = snap.tabs.find(x => x.id === meta.id)
         // `tab:` arguments are the INDEX, not the id — the smoke run passed
         // the id and hit a confusing error, so the pass-it form is spelled out.
-        return textResult(`Opened tab [${listed?.index}] id=${meta.id} — ${url ?? 'about:blank'}${meta.purpose ? ` (purpose: ${meta.purpose})` : ''}\n→ pass tab: ${listed?.index} (the INDEX — not the id) to tab-scoped tools`)
+        return textResult(`Opened tab [${listed?.index}] id=${meta.id} — ${url ?? 'about:blank'}${meta.purpose ? ` (purpose: ${meta.purpose})` : ''}\n→ pass tab: ${listed?.index} (the INDEX — not the id) to tab-scoped tools${wasDown ? badgeNote(session) : ''}`)
       }
       if (index === undefined) throw new Error(`action '${action}' requires an index`)
       const pages = session.pages()
@@ -753,13 +767,14 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const { session, owner: who } = sessionOf(env, owner)
       if (url !== undefined) env.scope.assert(url, who, 'tab_open')
       env.budget.spend(who)
+      const wasDown = session.context === undefined // this call SPAWNED the window
       const { meta, page } = await session.newTab(who, url, purpose)
       if (url !== undefined) await assertLandedInScope(env, page, who, url, 'tab_open')
       meta.leasedBy = who
       meta.leasedAt = Date.now()
       const snap = await session.snapshot()
       const listed = snap.tabs.find(x => x.id === meta.id)
-      return textResult(`Opened + leased tab [${listed?.index}] id=${meta.id} for "${who}"${purpose ? ` (${purpose})` : ''} — ${url ?? 'about:blank'}\n→ pass tab: ${listed?.index} (the INDEX — not the id) to tab-scoped tools`)
+      return textResult(`Opened + leased tab [${listed?.index}] id=${meta.id} for "${who}"${purpose ? ` (${purpose})` : ''} — ${url ?? 'about:blank'}\n→ pass tab: ${listed?.index} (the INDEX — not the id) to tab-scoped tools${wasDown ? badgeNote(session) : ''}`)
     })
 
   t('tab_lease', 'Lease an existing tab: other owners can no longer select or close it.',
@@ -953,7 +968,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         throw new Error('browser_owner_info labels a specific owner window — pass the teammate name (the shared human session gets no label)')
       const { session, owner: who } = sessionOf(env, owner)
       const info = await session.setOwnerInfo(job, engagement)
-      return textResult(`[${who}] label set — job: ${info.job ?? '(unset)'} · engagement: ${info.engagement ?? '(unset)'}${session.context === undefined ? ' (window not launched yet; the label renders at launch)' : ' (info tab updated)'}`)
+      return textResult(`[${who}] label set — job: ${info.job ?? '(unset)'} · engagement: ${info.engagement ?? '(unset)'}${session.taskbarBadge !== undefined ? ` · taskbar badge ${session.taskbarBadge}` : ''}${session.context === undefined ? ' (window not launched yet; the label renders at launch)' : ' (info tab updated)'}`)
     })
 
   // ── Cookie handoff (DST-Comet P0, live run 2026-10-27) ────────────────────
@@ -1123,9 +1138,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const scopeRule = env.scope.current(who)
       const perOwners = env.scope.owners()
       const lines = snaps.length === 0 ? ['(no live sessions — retained profiles below, if any)'] : snaps.map(snap => {
+        const badgePart = snap.taskbarBadge === undefined ? '' : ` — taskbar badge ${snap.taskbarBadge}`
         const head = snap.owner === SHARED_OWNER
-          ? `shared (human session, no label prefix) — profile: ${snap.userDir}`
-          : `${snap.owner} — own window, titles prefixed "[${snap.owner}]" — profile: ${snap.userDir}`
+          ? `shared (human session, no label prefix)${badgePart} — profile: ${snap.userDir}`
+          : `${snap.owner} — own window, titles prefixed "[${snap.owner}]"${badgePart} — profile: ${snap.userDir}`
         const tabs = snap.tabs.map(tab => {
           const marks = [snap.selected === tab.id ? '▶' : ' ', tab.infoTab === true ? 'ℹ' : '', tab.leasedBy ? `leased:${tab.leasedBy}${tab.purpose ? `(${tab.purpose})` : ''}` : '', tab.openedBy !== SHARED_OWNER && tab.openedBy !== snap.owner ? `openedBy:${tab.openedBy}` : ''].filter(Boolean).join(' ')
           return `   ${marks} [${tab.index}] ${tab.title} — ${tab.url}`
@@ -1228,7 +1244,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       })
       const session = env.registry.launchFor(who, user_data_dir, extra_args)
       await session.ensure()
-      return textResult(`Launched "${who}" on ${user_data_dir} (automation flag suppressed${extra_args !== undefined && extra_args.length > 0 ? `, args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.`)
+      return textResult(`Launched "${who}" on ${user_data_dir} (automation flag suppressed${extra_args !== undefined && extra_args.length > 0 ? `, args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.${badgeNote(session)}`)
     })
 
   t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser (launched or CDP-attached; run-8 §5): the attach-mode audit keeps the scope guard a property of what goes out. Violations were already audited — this lists them so a lane can stop and re-scope.',

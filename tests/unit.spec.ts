@@ -1167,6 +1167,81 @@ test('window parking: the whole measured box is applied, not just the bottom anc
   assert.deepEqual(parkBounds(leftMonitor, 20, 367, 945, 1012), { left: -1553, top: 1012, width: 945, height: 1012 }, 'a narrower peek hangs lower')
 })
 
+test('taskbar badges: pool allocates 1..99, frees for reuse, and seeds past the persisted last (restart uniqueness)', async () => {
+  const { TaskbarBadgePool, BADGE_LIMIT } = await import('../src/browser/taskbar-badge.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'badge-'))
+  const pool = new TaskbarBadgePool(path.join(dir, 'badges', 'state.json'))
+  assert.equal(pool.alloc(), 1)
+  assert.equal(pool.alloc(), 2)
+  assert.equal(pool.alloc(), 3)
+  assert.deepEqual(pool.heldBadges(), [1, 2, 3])
+  pool.free(2)
+  assert.deepEqual(pool.heldBadges(), [1, 3], 'free returns the number to the pool')
+  assert.equal(pool.alloc(), 4, 'alloc prefers fresh numbers above `last` (no reuse while fresh ones remain)')
+  // A restart builds a NEW pool from the same state file: it must start ABOVE
+  // the highest number ever handed out so a live window keeps its badge.
+  const restarted = new TaskbarBadgePool(path.join(dir, 'badges', 'state.json'))
+  assert.equal(restarted.alloc(), 5, 'restart seeds above the persisted last')
+  // Wrap: a pool pinned at the limit wraps to the lowest free number.
+  const pinned = new TaskbarBadgePool(undefined, 3)
+  pinned.alloc(); pinned.alloc(); pinned.alloc()
+  pinned.free(2)
+  assert.equal(pinned.alloc(), 2, 'wrap reuses the freed lowest number')
+  pinned.free(1); pinned.free(2); pinned.free(3)
+  assert.equal(BADGE_LIMIT, 99, 'numbers stay human-glanceable (two digits max)')
+})
+
+test('taskbar badges: ICO generation is a valid PNG-in-ICO and differs per number', async () => {
+  const { badgeIconBytes, renderBadgeRgba, encodePng, badgeDigitScale } = await import('../src/browser/taskbar-badge.js')
+  const one = badgeIconBytes(1)
+  // ICONDIR: reserved 0, type 1 (icon), 1 image.
+  assert.equal(one.readUInt16LE(0), 0)
+  assert.equal(one.readUInt16LE(2), 1)
+  assert.equal(one.readUInt16LE(4), 1)
+  assert.equal(one[6], 32, '32px wide entry')
+  assert.equal(one[7], 32, '32px tall entry')
+  // The embedded image is a PNG payload at the declared offset.
+  const pngAt = one.readUInt32LE(18)
+  assert.equal(pngAt, 22)
+  assert.equal(one.readUInt32BE(pngAt), 0x89504e47, 'embedded payload starts with the PNG magic')
+  assert.equal(one.length, 22 + one.readUInt32LE(14), 'entry length covers the whole PNG')
+  const png = one.subarray(22)
+  assert.equal(png.readUInt32BE(16), 32, 'IHDR width 32')
+  assert.equal(png.readUInt32BE(20), 32, 'IHDR height 32')
+  // Different numbers must draw different pixels (a stale cache would hand
+  // two lanes the same picture).
+  assert.notEqual(badgeIconBytes(1).toString('hex'), badgeIconBytes(2).toString('hex'))
+  assert.notEqual(badgeIconBytes(9).toString('hex'), badgeIconBytes(12).toString('hex'))
+  // The raw canvas: background + white digit pixels present; scales fit 32px.
+  const rgba = renderBadgeRgba(1)
+  assert.equal(rgba.length, 32 * 32 * 4)
+  assert.equal(rgba[0], 0x0b, 'blue background r')
+  assert.equal(rgba[1], 0x57, 'blue background g')
+  assert.equal(rgba[2], 0xd0, 'blue background b')
+  const whites = rgba.filter((byte, at) => at % 4 === 0 && byte === 0xff)
+  assert.ok(whites.length > 20, `the digit is drawn (${whites.length} white pixels)`)
+  assert.equal(badgeDigitScale(1), 4)
+  assert.equal(badgeDigitScale(42), 2)
+  assert.equal(badgeDigitScale(100), 1, 'out-of-range numbers still render (1px font)')
+  // encodePng is the exact byte source of the embedded image.
+  const two = badgeIconBytes(2)
+  assert.equal(two.subarray(22).toString('hex'), encodePng(renderBadgeRgba(2), 32, 32).toString('hex'), 'the ICO embeds exactly the PNG of that number')
+})
+
+test('taskbar badges: helper script bakes the needles with PS single-quote doubling, raw backslashes', async () => {
+  const { buildTaskbarBadgeScript } = await import('../src/browser/taskbar-badge.js')
+  const script = buildTaskbarBadgeScript("C:\\Users\\jame j's\\profiles\\scout", 'chrome', "C:\\root\\badges\\badge-7.ico", 7, 12)
+  assert.ok(script.includes("'C:\\Users\\jame j''s\\profiles\\scout'"), 'only the single quote is doubled; backslashes stay raw')
+  assert.ok(script.includes("'C:\\root\\badges\\badge-7.ico'"))
+  assert.ok(script.includes('$n = 7'))
+  assert.ok(script.includes('AddSeconds(12)'))
+  assert.ok(!script.includes('__UDD__') && !script.includes('__ICO__') && !script.includes('__PROCNAME__') && !script.includes('__SECS__') && !script.includes('__N__'))
+  assert.ok(script.includes('chrome.exe'), 'the channel maps to the process name')
+  assert.ok(script.includes('SetOverlayIcon'), 'the helper badges via ITaskbarList3 overlay')
+  assert.ok(buildTaskbarBadgeScript('C:\\u', undefined, 'C:\\i', 3, 5).includes("'chrome.exe'"), 'no channel maps to chrome.exe')
+  assert.ok(buildTaskbarBadgeScript('C:\\u', 'msedge', 'C:\\i', 3, 5).includes("'msedge.exe'"), 'the msedge channel maps to msedge.exe')
+})
+
 test('http body encoding: arrays/scalars are JSON, strings verbatim — asserted on the bytes the server received (D9)', async () => {
   const { JarStore, performRequest } = await import('../src/tools/http.js')
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd9body-'))

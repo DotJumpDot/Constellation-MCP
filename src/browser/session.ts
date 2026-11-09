@@ -6,6 +6,7 @@ import pwCore from 'playwright-core'
 import type { BrowserContext, Page, Request, Response } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { armFocusGuard, type FocusGuard } from './focus.js'
+import { badgePoolFor, ensureBadgeIcon, applyTaskbarBadge } from './taskbar-badge.js'
 
 const { chromium } = pwCore
 const exec = promisify(execFile)
@@ -117,6 +118,10 @@ export interface SessionSnapshot {
   attached: boolean
   userDir: string
   windowLabel: string
+  /** Taskbar badge number of a LAUNCHED owner window (user ask 2026-11-10):
+   *  the number drawn on the taskbar icon's overlay — absent for attached
+   *  sessions (the human's own browser), the shared session and headless. */
+  taskbarBadge?: number
   selected: number | null
   tabs: Array<{ index: number; id: number; title: string; url: string; openedBy: string; purpose?: string; leasedBy?: string; infoTab?: boolean }>
 }
@@ -229,6 +234,13 @@ export class BrowserSession {
   networkObserver?: (method: string, url: string) => void
   /** Out-of-scope requests observed from this session (audit lines). */
   scopeViolations: Array<{ ts: string; method: string; url: string; reason: string }> = []
+  /** Taskbar badge number (user ask 2026-11-10): allocated on every LAUNCH of
+   *  an owner window, freed on close, drawn on the taskbar icon as an overlay
+   *  so the human can tell the lanes' Chromes apart at a glance. */
+  taskbarBadge?: number
+  /** How many windows actually received the overlay (0 = helper could not —
+   *  the number still stands in tool output; the badge is best effort). */
+  badgeWindows = 0
 
   constructor(readonly owner: string, readonly userDir: string, private config: ConstellationConfig) {
     // Seed the info-tab label from disk so a reset/restart window still says
@@ -409,12 +421,35 @@ export class BrowserSession {
       if (!this.config.startMinimized) {
         await this.parkWindow(context)
       }
+      // Taskbar badge (user ask 2026-11-10): every LAUNCHED owner window
+      // carries its badge number as a taskbar overlay icon so the human can
+      // tell the lanes' Chromes apart at a glance. The NUMBER is allocated
+      // before the info tab opens so the tab (and its title, visible in a
+      // parked window's tab strip) already renders with it; the overlay
+      // application follows below. Attached sessions are the human's own
+      // browser — never badged; headless has no taskbar.
+      if (!this.config.headless && this.owner !== SHARED_OWNER && this.taskbarBadge === undefined) {
+        const badge = badgePoolFor(this.config.rootDir).alloc()
+        if (badge !== undefined) this.taskbarBadge = badge
+      }
       // The very first tab of an owner window is the ownership label: which
       // agent owns this window and what job it is running. It cannot be closed
       // by tool calls and is re-pinned if the human closes it in Chrome.
       if (this.owner !== SHARED_OWNER) {
         try { await this.openInfoTab() } catch { /* never block a launch on the label */ }
         this.selected = null
+      }
+      // Draw the badge onto the taskbar icon (best effort — a shell that
+      // cannot do overlays changes nothing above: the number still reaches
+      // the lane through tool output, the window title prefix and the tab).
+      if (this.taskbarBadge !== undefined) {
+        const applied = await applyTaskbarBadge({
+          userDir: this.userDir,
+          channel: this.config.channel,
+          icoPath: ensureBadgeIcon(this.config.rootDir, this.taskbarBadge),
+          badge: this.taskbarBadge,
+        }).catch(() => undefined)
+        this.badgeWindows = applied?.windows ?? 0
       }
       return context
     } finally {
@@ -508,12 +543,18 @@ export class BrowserSession {
     const esc = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     // The window title MUST carry the [owner] prefix: the label init script
     // does not run on data: URLs, and the human-wall panel's "focus chrome"
-    // action matches windows by that prefix (live-run bug 2026-10-27).
-    const html = `<!doctype html><meta charset="utf-8"><title>[${esc(this.owner)}] info — ${esc(this.infoJob ?? 'no job set')}</title>
+    // action matches windows by that prefix (live-run bug 2026-10-27). The
+    // taskbar badge rides as a SUFFIX so the prefix match is untouched, and
+    // a parked window shows it right in the tab strip.
+    const badgeSuffix = this.taskbarBadge === undefined ? '' : ` · taskbar ${this.taskbarBadge}`
+    const badgeLine = this.taskbarBadge === undefined ? '' :
+      `<p style="margin:.2em 0">taskbar badge: <b style="display:inline-block;min-width:1.2em;padding:.05em .35em;background:#0b57d0;color:#fff;border-radius:3px">${this.taskbarBadge}</b> — this window's taskbar icon shows a small <b>${this.taskbarBadge}</b>; agents reference it as "Chrome ${this.taskbarBadge}"</p>`
+    const html = `<!doctype html><meta charset="utf-8"><title>[${esc(this.owner)}] info — ${esc(this.infoJob ?? 'no job set')}${esc(badgeSuffix)}</title>
 <body style="font:15px/1.6 system-ui,sans-serif;max-width:38em;margin:auto;padding:3em 2em;background:#101418;color:#e8e8e8">
 <h1 style="margin:0 0 .2em">[${esc(this.owner)}]</h1>
 <p style="margin:.2em 0;color:#9fd0ff">job: <b>${esc(this.infoJob ?? '(not set — the Lead can call browser_owner_info)')}</b></p>
 <p style="margin:.2em 0">engagement: <b>${esc(this.infoEngagement ?? '—')}</b></p>
+${badgeLine}
 <p style="margin:.8em 0 .2em;font-size:.9em;color:#888">This Chrome window belongs to owner <b>${esc(this.owner)}</b> (Constellation per-owner browser).
 Tab 1 is the ownership label — it is restored automatically if closed; close the whole window to end the owner's session.
 Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
@@ -620,6 +661,7 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
       windowLabel: this.attached
         ? `attached over CDP (${this.cdpUrl ?? '?'}) — closing only disconnects, never closes the human's browser`
         : this.windowLabel === '' ? 'shared profile (no label prefix)' : `${this.windowLabel.trim()} window`,
+      ...(this.taskbarBadge === undefined ? {} : { taskbarBadge: this.taskbarBadge }),
       selected: this.selected,
       tabs,
     }
@@ -632,6 +674,14 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
   }
 
   async close(): Promise<void> {
+    // Free the badge SYNCHRONONOUSLY and first: launchFor() replaces a
+    // session with `void close()` (not awaited), so a later free could race
+    // the new session's allocation and hand the same number to two windows.
+    if (this.taskbarBadge !== undefined) {
+      badgePoolFor(this.config.rootDir).free(this.taskbarBadge)
+      this.taskbarBadge = undefined
+    }
+    this.badgeWindows = 0
     const context = this.context
     this.context = undefined
     this.tabs.clear()
