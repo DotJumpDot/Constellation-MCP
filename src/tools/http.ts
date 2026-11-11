@@ -145,6 +145,58 @@ function hostOf(raw: string): string {
   try { return new URL(raw).host } catch { return raw }
 }
 
+// ── Host-header override (run-39 §12.14) ───────────────────────────────────
+// undici's fetch silently DROPS a caller-supplied Host (spec forbidden
+// header), so a "Host-header replay" used to be a byte-identical copy of the
+// control and could produce a false TESTED-PROTECTED. When the caller
+// supplies Host, hop 0 rides node:http(s) instead — the one transport where
+// the override actually reaches the wire. Later redirect hops use their own
+// host (an override must never ride into a third party).
+
+/** Fetch-like adapter over node:http(s) with a forced Host header. */
+async function rawFetchWithHost(
+  url: string,
+  init: { method: string, headers: Record<string, string>, body?: string, signal: AbortSignal, host: string },
+): Promise<Response> {
+  const mod = url.startsWith('https:') ? (await import('node:https')) : (await import('node:http'))
+  return await new Promise<Response>((resolve, reject) => {
+    const req = mod.request(url, {
+      method: init.method,
+      headers: { ...init.headers, Host: init.host },
+      signal: init.signal,
+    }, res => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('end', () => {
+        const headers = new Headers()
+        for (const [key, value] of Object.entries(res.headers)) {
+          if (value === undefined) continue
+          if (Array.isArray(value)) value.forEach(entry => headers.append(key, entry))
+          else headers.append(key, value)
+        }
+        const text = Buffer.concat(chunks).toString('utf8')
+        resolve(new Response(text, { status: res.statusCode ?? 200, statusText: res.statusMessage ?? '', headers }))
+      })
+      res.on('error', reject)
+    })
+    req.on('error', reject)
+    if (init.body !== undefined) req.write(init.body)
+    req.end()
+  })
+}
+
+/** Extract + remove a Host header (case-insensitive) from a header map. */
+export function takeHostHeader(headers: Record<string, string>): string | undefined {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === 'host') {
+      const value = headers[key]!
+      delete headers[key]
+      return value
+    }
+  }
+  return undefined
+}
+
 /** Strip hop-sensitive headers for a CROSS-HOST redirect: a cookie or an
  *  Authorization value named for one host must never ride into another
  *  (run-9 §2 hardening — browsers strip Authorization cross-origin; we do
@@ -205,13 +257,23 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
   let currentMethod = spec.method ?? 'GET'
   let currentBody = body
   let currentHeaders = headers
-  let response = await fetch(currentUrl, {
-    method: currentMethod,
-    headers: currentHeaders,
-    body: currentBody,
-    redirect: 'manual',
-    signal: AbortSignal.timeout(spec.timeout_ms ?? 30_000),
-  })
+  // Run-39 §12.14: a caller Host override rides hop 0 through the raw
+  // transport (undici fetch silently drops forbidden headers like Host);
+  // redirect hops use their own host, never the override.
+  const hostOverride = takeHostHeader(headers)
+  const single = (url: string, method: string, hdrs: Record<string, string>, reqBody: string | undefined): Promise<Response> => {
+    const signal = AbortSignal.timeout(spec.timeout_ms ?? 30_000)
+    return url === spec.url && hostOverride !== undefined
+      ? rawFetchWithHost(url, { method, headers: hdrs, ...(reqBody === undefined ? {} : { body: reqBody }), signal, host: hostOverride })
+      : fetch(url, {
+          method,
+          headers: hdrs,
+          ...(reqBody === undefined ? {} : { body: reqBody }),
+          redirect: 'manual',
+          signal,
+        })
+  }
+  let response = await single(currentUrl, currentMethod, currentHeaders, currentBody)
   let hops = 0
   while (spec.redirect === 'follow') {
     const hop = redirectHop(response.status, response.headers.get('location') ?? undefined, currentUrl)
@@ -227,13 +289,7 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
     if (hop.get) { currentMethod = 'GET'; currentBody = undefined }
     const hopCookie = jar.getCookieStringSync(currentUrl)
     if (hopCookie !== '') currentHeaders['cookie'] = hopCookie
-    response = await fetch(currentUrl, {
-      method: currentMethod,
-      headers: currentHeaders,
-      body: currentBody,
-      redirect: 'manual',
-      signal: AbortSignal.timeout(spec.timeout_ms ?? 30_000),
-    })
+    response = await single(currentUrl, currentMethod, currentHeaders, currentBody)
   }
   const text = await response.text()
   const timing = Date.now() - started

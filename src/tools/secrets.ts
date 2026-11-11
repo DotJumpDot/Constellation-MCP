@@ -109,7 +109,7 @@ export function jsonSecretKeys(value: string): string[] | undefined {
   return undefined
 }
 
-export function registerSecretTools(server: ToolRegistrar): void {
+export function registerSecretTools(server: ToolRegistrar, scope?: import('../scope.js').ScopeGuard): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
       try { return await handler(args) } catch (error) { return errorResult(error) }
@@ -121,15 +121,21 @@ export function registerSecretTools(server: ToolRegistrar): void {
       ? '(no CONSTELLATION_SECRET_* / DSH_SECRET_* env vars set)'
       : secretNames().join('\n')))
 
-  t('secrets_get', 'Fetch one secret value. Masks by default (a JSON secret also lists its top-level KEYS — run-7 P1-10, enough to navigate shared account pools without reading values); prefer `$secret:<name>` interpolation in http_request so the value never enters the transcript.',
-    { name: z.string().describe('Secret name (without the CONSTELLATION_SECRET_ prefix)'), reveal: z.boolean().optional().describe('Return the actual value (appears in the transcript)') },
-    async ({ name, reveal }: any) => {
+  t('secrets_get', 'Fetch one secret value. Masks by default (a JSON secret also lists its top-level KEYS — run-7 P1-10, enough to navigate shared account pools without reading values); prefer `$secret:<name>` interpolation in http_request so the value never enters the transcript. Run-39 §12.11: `reveal:true` prints the value into the transcript and is AUDITED — per-lane read scoping is not enforceable here (the MCP server sees one shared connection and self-declared owner names), so the audit trail is the detective control.',
+    {
+      name: z.string().describe('Secret name (without the CONSTELLATION_SECRET_ prefix)'),
+      reveal: z.boolean().optional().describe('Return the actual value (appears in the transcript; audited)'),
+      owner: z.string().optional().describe('Your agent name (audit identity for reveals)'),
+    },
+    async ({ name, reveal, owner }: any) => {
       const value = secretValue(name)
       if (value === undefined) return textResult(`no secret "${name}" — set CONSTELLATION_SECRET_${name.toUpperCase()} or DSH_SECRET_${name.toUpperCase()}`, true)
       if (reveal !== true) {
         const keys = jsonSecretKeys(value)
         return textResult(`"${name}": ***set (${value.length} chars)***${keys !== undefined ? ` — JSON keys: ${keys.join(', ')}` : ''} — pass reveal: true to print, use $secret:${name} inside http_request, or secrets_patch to edit server-side`)
       }
+      const who = owner === undefined || owner.trim() === '' ? 'unattributed' : owner.trim()
+      scope?.audit(`secret:${name}`, who, 'secrets_get', { allowed: true, reason: 'reveal — value entered the transcript' })
       return textResult(value)
     })
 

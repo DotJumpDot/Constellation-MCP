@@ -1258,6 +1258,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
             `${snap.tabs.length} tab${snap.tabs.length === 1 ? '' : 's'}`,
             selected === undefined ? '-' : hostOf(selected.url),
             ramFor(snap.owner) === undefined ? '-' : `${ramFor(snap.owner)}MB`,
+            `reqs ${snap.requestCount}`,
+            Object.keys(snap.extraHeaders).length > 0 ? `+${Object.keys(snap.extraHeaders).length} hdr` : '',
             snap.ramWarning === undefined ? '' : '⚠RAM',
             actionable > 0 ? `⚠${actionable} out-of-scope` : '',
           ].filter(part => part !== '').join(' · '))
@@ -1534,6 +1536,49 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         ...(actionable.length > 0 ? actionable.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`) : []),
         ...(plumbing.length > 0 ? [`page plumbing (last ${Math.min(plumbing.length, 10)}, NOT counted):`, ...plumbing.slice(-10).map(row => `  ${row.method} ${row.url.slice(0, 120)}`)] : []),
       ].join('\n'), actionable.length > 0)
+    })
+
+  t('browser_headers_set', 'Apply persistent extra HTTP headers to this owner\'s browser session (context-level, rides every request). Run-39 §12.14: a header set once through raw CDP persisted silently across navigations and contaminated a later CONTROL leg — set headers ONLY through this tool so they are recorded, listed by browser_headers_list, and cleared by browser_headers_clear / browser_reset. Merges into any headers already set via this tool.',
+    {
+      ...OWNER_FIELD,
+      headers: z.record(z.string()).describe('Header map to apply, e.g. {"X-Forwarded-Host": "target.example"}'),
+    },
+    async ({ owner, headers }: any) => {
+      const { session } = sessionOf(env, owner)
+      const context = await session.ensure()
+      const merged: Record<string, string> = { ...session.extraHeaders }
+      for (const [key, value] of Object.entries(headers as Record<string, string>)) {
+        if (value === '') delete merged[key]
+        else merged[key] = value
+      }
+      await context.setExtraHTTPHeaders(merged)
+      session.extraHeaders = merged
+      return textResult([
+        `Applied ${Object.keys(merged).length} extra header(s) to "${session.owner}"'s session: ${Object.entries(merged).map(([k, v]) => `${k}: ${v}`).join(', ') || '(none)'}`,
+        'These ride EVERY request until browser_headers_clear or browser_reset — a control leg later in the lane WILL inherit them; clear before controls.',
+      ].join('\n'))
+    })
+
+  t('browser_headers_list', 'List the persistent extra HTTP headers currently recorded for this owner\'s session (those set via browser_headers_set). Empty = none recorded. Headers injected through raw CDP inside browser_run_code_unsafe are invisible to this record — that is the reason the set/list/clear tools exist; use them instead.',
+    { ...OWNER_FIELD },
+    async ({ owner }: any) => {
+      const { session } = sessionOf(env, owner)
+      const entries = Object.entries(session.extraHeaders)
+      return textResult(entries.length === 0
+        ? `No extra headers recorded for "${session.owner}" (browser_headers_set applies them).`
+        : [`${entries.length} extra header(s) on "${session.owner}"'s session:`, ...entries.map(([k, v]) => `  ${k}: ${v}`)].join('\n'))
+    })
+
+  t('browser_headers_clear', 'Clear ALL persistent extra HTTP headers from this owner\'s session. Run this before CONTROL legs — inherited headers are the run-39 §12.14 defect (an X-Forwarded-Host set for one probe silently rode a later Moneytree control).',
+    { ...OWNER_FIELD },
+    async ({ owner }: any) => {
+      const { session } = sessionOf(env, owner)
+      const had = Object.keys(session.extraHeaders).length
+      if (session.context !== undefined) await session.context.setExtraHTTPHeaders({}).catch(() => undefined)
+      session.extraHeaders = {}
+      return textResult(had > 0
+        ? `Cleared ${had} extra header(s) from "${session.owner}"'s session — the next request rides clean.`
+        : `No extra headers were recorded for "${session.owner}" — already clean.`)
     })
 
   t('browser_reset', 'Close ONE owner\'s browser session — by default ONLY the caller named in `owner` (run-7 P1-6: a lane\'s end-of-run reset used to close every owner window mid-block). Closing other owners\' sessions requires `all: true` and is refused while those owners hold tab leases; `keep` names owners to spare (default ["shared"]).',

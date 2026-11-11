@@ -2442,3 +2442,60 @@ test('plain-launch: warm profile dir is stable per owner, fresh is unique', asyn
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('run-39 P2s: takeoverVerdict treats a fetch ERROR as unknown, never evidence (§12.9)', async () => {
+  const { takeoverVerdict } = await import('../src/tools/dns.js')
+  const chain = { chain: ['app.example.com', 'app.herokuapp.com'], terminal: 'app.herokuapp.com', hasCname: true, addresses: ['34.0.0.1'] }
+  const errored = takeoverVerdict({ chain, fetch: null, fetchError: 'https: fetch failed; http: ECONNREFUSED' })
+  assert.equal(errored.claimable, 'unknown')
+  assert.match(errored.why, /HTTP leg: ERROR/)
+  assert.match(errored.why, /NOT evidence/)
+  // a SUCCESSFUL fetch still classifies normally
+  const ok = takeoverVerdict({ chain, fetch: { status: 404, body: "No such app — There's nothing here, yet" } })
+  assert.equal(ok.claimable, 'true')
+  // un-fetched stays the honest unknown it was
+  const unfetched = takeoverVerdict({ chain })
+  assert.equal(unfetched.claimable, 'unknown')
+})
+
+test('run-39 P2s: takeHostHeader extracts and removes the override (§12.14)', async () => {
+  const { takeHostHeader } = await import('../src/tools/http.js')
+  const headers: Record<string, string> = { 'X-Test': '1', Host: 'evil.example' }
+  assert.equal(takeHostHeader(headers), 'evil.example')
+  assert.equal(Object.prototype.hasOwnProperty.call(headers, 'Host'), false)
+  assert.equal(headers['X-Test'], '1')
+  const lower: Record<string, string> = { host: 'lower.example' }
+  assert.equal(takeHostHeader(lower), 'lower.example')
+  assert.deepEqual(lower, {})
+  assert.equal(takeHostHeader({ 'X-Only': 'x' }), undefined)
+})
+
+test('run-39 P2s: http_request HONORS a caller Host header on the wire (§12.14)', async () => {
+  const { performRequest } = await import('../src/tools/http.js')
+  const { ScopeGuard } = await import('../src/scope.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hosthdr-'))
+  let sawHost = ''
+  const server = http.createServer((req, res) => {
+    sawHost = req.headers.host ?? ''
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`host received: ${req.headers.host}`)
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const port = (server.address() as { port: number }).port
+    const jars = new JarStore({ rootDir: dir } as never)
+    const scope = new ScopeGuard(path.join(dir, 'scope.json'), path.join(dir, 'audit.jsonl'), false)
+    const result = await performRequest(jars, scope, {
+      url: `http://127.0.0.1:${port}/probe`,
+      method: 'GET',
+      headers: { Host: 'target.example.com' },
+      redirect: 'manual',
+    }, 'lane-host', 'test')
+    assert.equal(result.status, 200)
+    assert.equal(sawHost, 'target.example.com') // the override REACHED the wire
+    assert.match(result.body, /host received: target\.example\.com/)
+  } finally {
+    server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

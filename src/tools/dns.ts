@@ -13,6 +13,7 @@
 import dnsDefault from 'node:dns/promises'
 import { z } from 'zod'
 import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '../browser/tools.js'
+import { performRequest } from './http.js'
 import type { ScopeGuard } from '../scope.js'
 import type { BudgetGuard } from './budget.js'
 
@@ -135,8 +136,10 @@ export interface TakeoverVerdict {
 /** The per-host verdict — pure so tests pin every branch. Claimable TRUE only
  *  when a fingerprint (NXDOMAIN at a takeoverable provider, or an unclaimed
  *  page fetched) actually says so; UNKNOWN keeps the lane honest when the
- *  signal needs a fetch that was not performed. */
-export function takeoverVerdict(input: { chain: CnameChain; fetch?: { status: number; body: string } | null }): TakeoverVerdict {
+ *  signal needs a fetch that was not performed — or FAILED: a transport
+ *  error is never evidence in either direction (run-39 §12.9: 8/8 hosts
+ *  reported "no HTTP listener" while http_request got a normal 302). */
+export function takeoverVerdict(input: { chain: CnameChain; fetch?: { status: number; body: string } | null; fetchError?: string }): TakeoverVerdict {
   const { chain, fetch } = input
   const provider = fingerprintForHost(chain.terminal)
   if (!chain.hasCname)
@@ -146,8 +149,16 @@ export function takeoverVerdict(input: { chain: CnameChain; fetch?: { status: nu
     return bodyMatch.takeoverable === 'yes'
       ? { claimable: 'true', provider: bodyMatch.provider, why: `fingerprint: ${bodyMatch.provider} unclaimed page (HTTP ${fetch!.status}, body matched) — ${bodyMatch.note}` }
       : { claimable: 'false', provider: bodyMatch.provider, why: `${bodyMatch.provider} serves its unclaimed page but is protected — ${bodyMatch.note}` }
-  if (provider !== undefined && provider.body !== undefined && fetch === undefined)
+  // Three states to keep apart: undefined (pure call, no fetch concept —
+  // advise re-run), null WITHOUT error (handler judged DNS-only — fall
+  // through to the NXDOMAIN/resolves rules), null WITH error (transport
+  // failed — never fold it into a verdict).
+  if (provider !== undefined && provider.body !== undefined
+    && (fetch === undefined || (fetch === null && input.fetchError !== undefined))) {
+    if (input.fetchError !== undefined)
+      return { claimable: 'unknown', provider: provider.provider, why: `HTTP leg: ERROR (${input.fetchError}) — transport failed, which is NOT evidence about ${chain.terminal}; the ${provider.provider} page must be read another way (http_request against the origin) before any verdict` }
     return { claimable: 'unknown', provider: provider.provider, why: `${chain.terminal} (${provider.provider}) resolves — its kind only betrays a dangling record in HTTP; re-run with fetch: true to confirm` }
+  }
   if (chain.addresses.length === 0) {
     if (provider === undefined)
       return { claimable: 'unknown', why: `${chain.terminal} is NXDOMAIN (${chain.aStop ?? 'no A record'}) but matches no provider in the fingerprint table — manual check` }
@@ -161,6 +172,9 @@ export function takeoverVerdict(input: { chain: CnameChain; fetch?: { status: nu
 export interface DnsToolEnv {
   scope: ScopeGuard
   budget: BudgetGuard
+  /** Shared jar store (the fetch leg rides performRequest with a dedicated
+   *  `dns-takeover` jar so parked-origin cookies never touch `default`). */
+  jars: import('./http.js').JarStore
   /** Injectable for offline tests. */
   dns?: DnsLike
 }
@@ -189,6 +203,7 @@ export function registerDnsTools(server: ToolRegistrar, env: DnsToolEnv): void {
         const host = hosts[at]!.toLowerCase().replace(/^https?:\/\//, '').split('/')[0]!
         const chain = await resolveTakeoverHost(host, dnsLike)
         let fetched: { status: number; body: string } | null = null
+        let fetchError: string | undefined
         let fetchNote = ''
         if (fetch === true && !rateLimited) {
           if (at > 0) await new Promise(resolve => setTimeout(resolve, 1_000))
@@ -198,35 +213,44 @@ export function registerDnsTools(server: ToolRegistrar, env: DnsToolEnv): void {
             fetchNote = ` — fetch skipped: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}`
           }
           if (fetchNote === '') {
-            const controller = new AbortController()
-            const timer = setTimeout(() => controller.abort(), 8_000)
+            // Run-39 §12.9: this leg rolled its own fetch and reported 8/8
+            // "no HTTP listener / TLS refused" while http_request got a normal
+            // 302 on the same hosts. Ride performRequest (the same client,
+            // timeouts and jar behavior as http_request) and surface the REAL
+            // error text — a transport failure is never evidence.
+            const leg = async (url: string) => performRequest(env.jars, env.scope, { url, method: 'GET', redirect: 'manual', timeout_ms: 15_000, max_body_bytes: 2_048, jar: 'dns-takeover' }, who, 'dns_takeover_check')
             try {
-              let response = await fetch(`https://${host}/`, { redirect: 'manual', signal: controller.signal })
-              if (response.type === 'opaqueredirect' || response.status === 0) {
-                response = await fetch(`http://${host}/`, { redirect: 'manual', signal: controller.signal })
+              let result = await leg(`https://${host}/`)
+              if (result.status >= 300 && result.status < 400) {
+                // http fallback only when the https hop points nowhere useful
+                // (same dual-scheme behavior the old leg had).
+                try { result = await leg(`http://${host}/`) } catch { /* keep the 3xx */ }
               }
-              if (response.status === 429 || response.status === 403) {
+              if (result.status === 429 || result.status === 403) {
                 rateLimited = true
-                fetchNote = ` — origin returned ${response.status}: further fetches stopped (remaining hosts are DNS-only)`
+                fetchNote = ` — origin returned ${result.status}: further fetches stopped (remaining hosts are DNS-only)`
               } else {
-                fetched = { status: response.status, body: (await response.text()).slice(0, 2_048) }
+                fetched = { status: result.status, body: result.body.slice(0, 2_048) }
               }
-            } catch {
+            } catch (error) {
+              const first = error instanceof Error ? error.message.split('\n')[0]! : String(error)
               try {
-                const response = await fetch(`http://${host}/`, { redirect: 'manual', signal: controller.signal })
-                if (response.status === 429 || response.status === 403) {
+                const result = await leg(`http://${host}/`)
+                if (result.status === 429 || result.status === 403) {
                   rateLimited = true
-                  fetchNote = ` — origin returned ${response.status}: further fetches stopped`
+                  fetchNote = ` — origin returned ${result.status}: further fetches stopped`
                 } else {
-                  fetched = { status: response.status, body: (await response.text()).slice(0, 2_048) }
+                  fetched = { status: result.status, body: result.body.slice(0, 2_048) }
                 }
-              } catch { fetchNote = ' — origin fetch failed (no HTTP listener / TLS refused); DNS-only verdict' }
-            } finally {
-              clearTimeout(timer)
+              } catch (error2) {
+                const second = error2 instanceof Error ? error2.message.split('\n')[0]! : String(error2)
+                fetchError = `https: ${first}; http: ${second}`.slice(0, 200)
+                fetchNote = ` — HTTP leg: ERROR (${fetchError}) — not evidence, verdict stays honest`
+              }
             }
           }
         }
-        const verdict = takeoverVerdict({ chain, fetch: fetched })
+        const verdict = takeoverVerdict({ chain, fetch: fetched, ...(fetchError === undefined ? {} : { fetchError }) })
         if (verdict.claimable === 'true') yes++
         else if (verdict.claimable === 'false') no++
         else unknown++

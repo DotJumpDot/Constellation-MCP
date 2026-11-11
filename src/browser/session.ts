@@ -155,6 +155,11 @@ export interface SessionSnapshot {
   /** RAM-guard warning set by the sweeper (run-39 RAM round); cleared when
    *  the chrome tree falls back under the threshold. */
   ramWarning?: string
+  /** Extra HTTP headers currently applied via browser_headers_set. */
+  extraHeaders: Record<string, string>
+  /** Total requests this session's browser has sent (per-owner unit counter,
+   *  run-39 §12.13 — the honest budget signal lanes read on browser_map). */
+  requestCount: number
   selected: number | null
   tabs: Array<{ index: number; id: number; title: string; url: string; openedBy: string; purpose?: string; leasedBy?: string; infoTab?: boolean }>
 }
@@ -283,6 +288,16 @@ export class BrowserSession {
    *  session's chrome.exe tree crossed the RAM threshold. Surfaced on
    *  browser_map/browser_tabs so the Lead sees hogs without Task Manager. */
   ramWarning?: string
+  /** Extra HTTP headers applied via browser_headers_set (run-39 §12.14:
+   *  CDP context headers persist silently across navigations and once
+   *  contaminated a later control leg). This record is what list/clear and
+   *  browser_reset act on — headers set through raw CDP in run_code are
+   *  invisible to it, which is exactly why lanes must use the tools. */
+  extraHeaders: Record<string, string> = {}
+  /** Every request that left this session's browser (wireNetwork) — the
+   *  per-owner unit counter budget advice §12.13 asked for: lanes read it
+   *  on browser_map before each card instead of nothing counting for them. */
+  requestCount = 0
   /** Taskbar badge number (user ask 2026-11-10): allocated on every LAUNCH of
    *  an owner window, freed on close, drawn on the taskbar icon as an overlay
    *  so the human can tell the lanes' Chromes apart at a glance. */
@@ -424,6 +439,7 @@ export class BrowserSession {
   /** Request/response ring + the scope observer, shared by launch and attach. */
   private wireNetwork(context: BrowserContext): void {
     context.on('request', request => {
+      this.requestCount += 1
       this.network.push({ method: request.method(), url: request.url(), resourceType: request.resourceType() })
       if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
       try { this.networkObserver?.(request.method(), request.url(), request.resourceType()) } catch { /* audit never breaks traffic */ }
@@ -782,6 +798,8 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
       ...(this.plainPid === undefined ? {} : { plainPid: this.plainPid }),
       ...(this.adoptedProfileDir === undefined ? {} : { adoptedProfileDir: this.adoptedProfileDir }),
       ...(this.ramWarning === undefined ? {} : { ramWarning: this.ramWarning }),
+      extraHeaders: { ...this.extraHeaders },
+      requestCount: this.requestCount,
       userDir: this.userDir,
       windowLabel: this.attached
         ? `attached over CDP (${this.cdpUrl ?? '?'}) — closing only disconnects, never closes the human's browser`
@@ -813,6 +831,8 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     }
     this.badgeWindows = 0
     this.ramWarning = undefined
+    this.extraHeaders = {}
+    this.requestCount = 0
     const context = this.context
     this.context = undefined
     this.tabs.clear()
