@@ -2499,3 +2499,34 @@ test('run-39 P2s: http_request HONORS a caller Host header on the wire (§12.14)
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('V1 wiring: sessionOf wires the scope observer for EVERY route (lead verification 2026-11-12)', async () => {
+  const { sessionOf } = await import('../src/browser/tools.js')
+  const { OwnerRegistry } = await import('../src/browser/registry.js')
+  const { defaultConfig } = await import('../src/config.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v1-wire-'))
+  try {
+    const config = { ...defaultConfig(), rootDir: dir, profilesRoot: path.join(dir, 'profiles'), scopeFile: path.join(dir, 'scope.json'), auditFile: path.join(dir, 'audit.jsonl') }
+    const registry = new OwnerRegistry(config)
+    const audits: string[] = []
+    const scope = {
+      check: (url: string) => ({ allowed: !url.includes('example.net'), reason: 'out of scope (test)' }),
+      audit: (url: string, who: string, tool: string) => audits.push(`${who}|${tool}|${url}`),
+      owners: () => [] as string[],
+    }
+    // A lazily created session (no launch/attach handler ran — the V1 hole):
+    // the observer must still be wired by sessionOf itself.
+    const { session } = sessionOf({ config, registry, scope } as never, 'v1-lane')
+    assert.ok(session.networkObserver !== undefined, 'observer wired by sessionOf, not by a launch/attach handler')
+    session.networkObserver!('GET', 'https://example.net/beacon', 'fetch')
+    session.networkObserver!('GET', 'https://example.net/pixel.png', 'image')
+    session.networkObserver!('GET', 'https://in-scope.example.com/page', 'document')
+    assert.equal(session.scopeViolations.length, 2, 'denied requests recorded on a LAUNCHED-style session')
+    assert.equal(session.scopeViolations.filter(r => r.resourceType === 'fetch').length, 1)
+    assert.equal(session.scopeViolations.filter(r => r.resourceType === 'image').length, 1)
+    assert.ok(audits.some(a => a.includes('example.net/beacon')), 'denied traffic audited')
+    assert.ok(audits.every(a => a.startsWith('v1-lane|')), 'audit rows carry the session owner')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

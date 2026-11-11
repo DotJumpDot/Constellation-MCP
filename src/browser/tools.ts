@@ -179,9 +179,26 @@ export function makeUserFn(code: string): (page: unknown, requireFn: NodeJS.Requ
   return fn as (page: unknown, requireFn: NodeJS.Require) => Promise<unknown>
 }
 
-function sessionOf(env: ToolEnv, ownerRaw: string | undefined): { session: BrowserSession; owner: string } {
+export function sessionOf(env: ToolEnv, ownerRaw: string | undefined): { session: BrowserSession; owner: string } {
   const owner = resolveOwner(ownerRaw)
-  return { session: env.registry.sessionFor(owner), owner }
+  const session = env.registry.sessionFor(owner)
+  // V1 (lead verification 2026-11-12): the scope observer used to be wired in
+  // exactly ONE place (the attach handler), so launched and plain-launched
+  // lanes kept an EMPTY violations list while their page traffic hit
+  // out-of-scope hosts — the optimistic direction that ships wrong reports.
+  // Wire it here instead: every route gets it the first time ANY tool touches
+  // the session, lazily-created sessions included.
+  if (session.networkObserver === undefined) {
+    session.networkObserver = (method, url, resourceType) => {
+      const decision = env.scope.check(url, session.owner)
+      if (!decision.allowed && !url.startsWith('chrome://') && !url.startsWith('devtools://')) {
+        session.scopeViolations.push({ ts: new Date().toISOString(), method, url, reason: decision.reason, ...(resourceType === undefined ? {} : { resourceType }) })
+        if (session.scopeViolations.length > 200) session.scopeViolations.shift()
+        env.scope.audit(url, session.owner, 'session-traffic', decision)
+      }
+    }
+  }
+  return { session, owner }
 }
 
 function resolveOwner(ownerRaw: string | undefined): string {
@@ -1358,17 +1375,9 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         session.adoptedProfileDir = resolved.userDir
         bindCdpEndpoint(port, who, { pid: resolved.pid })
       }
-      // Run-8 §5: the scope guard follows the ATTACHED browser — every request
-      // is checked against the owner's scope and violations are audited, so
-      // moving to CDP attach no longer means leaving the audit behind.
-      session.networkObserver = (method, url, resourceType) => {
-        const decision = env.scope.check(url, who)
-        if (!decision.allowed && !url.startsWith('chrome://') && !url.startsWith('devtools://')) {
-          session.scopeViolations.push({ ts: new Date().toISOString(), method, url, reason: decision.reason, ...(resourceType === undefined ? {} : { resourceType }) })
-          if (session.scopeViolations.length > 200) session.scopeViolations.shift()
-          env.scope.audit(url, who, 'attached-traffic', decision)
-        }
-      }
+      // Run-8 §5 + V1: the scope observer now comes from sessionOf() for every
+      // route (attach, launch, plain, lazily created) — this handler no longer
+      // wires its own copy.
       const pages = context.pages()
       return textResult([
         `Attached "${who}" to ${cdp_url} — ${pages.length} tab(s) adopted${resolved !== undefined ? `; adopted profile ${resolved.userDir} (pid ${resolved.pid})` : ' (profile dir not resolvable — the browser may be headless or already gone)'}; the existing tabs are theirs to drive (browser_tabs {action:'list', owner:"${who}"}).`,
@@ -1436,17 +1445,23 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const who = resolveOwner(owner)
       if (who === SHARED_OWNER) throw new Error('browser_kill needs a named owner')
       const existing = env.registry.sessionIfExists(who)
+      const hadRule = env.scope.owners().includes(who)
       if (existing !== undefined) {
         const userDir = existing.userDir
         await env.registry.close(who)
         const reaped = env.registry.lastReapCount
-        return textResult(`Closed and killed "${who}"'s browser (graceful close; profile preserved at ${userDir}${reaped > 0 ? `; exact-match sweep reaped ${reaped} stray chrome.exe process(es) the graceful close left behind` : ''}).`)
+        // V5 (lead verification 2026-11-12): 345 stale per-owner rules from
+        // dead runs accumulated because scope_clear is manual per owner — the
+        // rule dies with the session now.
+        if (hadRule) env.scope.clear(who)
+        return textResult(`Closed and killed "${who}"'s browser (graceful close; profile preserved at ${userDir}${reaped > 0 ? `; exact-match sweep reaped ${reaped} stray chrome.exe process(es) the graceful close left behind` : ''})${hadRule ? `; the owner's stale per-owner scope rule was cleared too` : ''}.`)
       }
+      if (hadRule) env.scope.clear(who)
       const userDir = path.join(env.config.profilesRoot, `plain-${who}`)
       const killed = await killChromeByProfile(userDir)
-      return textResult(killed > 0
+      return textResult((killed > 0
         ? `No live session for "${who}"; killed ${killed} orphaned chrome.exe process(es) whose --user-data-dir exactly matches ${userDir}.`
-        : `No live session and no orphaned Chrome for "${who}" (profile ${userDir}).`)
+        : `No live session and no orphaned Chrome for "${who}" (profile ${userDir}).`) + (hadRule ? ` Stale per-owner scope rule cleared.` : ''))
     })
 
   t('browser_profiles_reap', 'Reap OLD retained browser profiles on disk (run-39 disk round: 498 profile dirs / ~35 GB accumulated across runs 26-39). DRY-RUN by default — it only lists what would go. Deletes a profile dir only when its last write is older than `older_than_days` (default 14) AND no live session owns it AND no chrome.exe is running with it. Live-session dirs, the shared profile, and any profile younger than the threshold are never touched. Set dry_run:false to actually delete.',
@@ -1506,7 +1521,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Reaped ${deleted}/${victims.length} profile dir(s) older than ${days} day(s)${skippedLive.length > 0 ? `; skipped ${skippedLive.length} live dir(s)` : ''}.${errors.length > 0 ? `\n${errors.slice(0, 5).join('\n')}` : ''}`)
     })
 
-  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser (launched or CDP-attached; run-8 §5). Run-39 §12.5: rows are split into LANE-CONTROLLABLE (document/xhr/fetch — the types our tools initiate; these are the real violations) and PAGE PLUMBING (stylesheets/scripts/images/fonts the page itself loads — gstatic, recaptcha, CDNs; counted and shown, but they are NOT actionable and never mean "stop the lane"). `summary:true` returns counts by host instead of full rows.',
+  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser — on EVERY route (launched, plain, or CDP-attached; the observer is wired at session creation, not per-handler). What is ENFORCED vs OBSERVED (V3, stated plainly): tool-level navigation and http_request are DENIED before leaving; page-initiated JS (in-page fetch/XHR/beacons) is OBSERVED and AUDITED but NOT blocked — the browser loads what the page loads. Run-39 §12.5: rows are split into LANE-CONTROLLABLE (document/xhr/fetch — the types our tools can initiate) and PAGE PLUMBING (stylesheets/scripts/images/fonts the page itself loads — gstatic, recaptcha, CDNs; shown but NOT actionable, never a "stop the lane"). `summary:true` returns counts by host instead of full rows.',
     {
       ...OWNER_FIELD,
       summary: z.boolean().optional().describe('Counts by host + top examples instead of full rows'),
@@ -1514,7 +1529,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
     async ({ owner, summary }: any) => {
       const { session } = sessionOf(env, owner)
       const rows = session.scopeViolations
-      if (rows.length === 0) return textResult(`No out-of-scope TRAFFIC observed from "${session.owner}" — this lists only requests that actually left the browser (a scope-DENIED navigation never leaves, so it never appears here; denied attempts are in scope_audit).`, true)
+      if (rows.length === 0) return textResult(`No out-of-scope TRAFFIC observed from "${session.owner}". Enforcement notes (V4, measured 2026-11-12): a tool-level navigation to a denied URL is audited and the tab reset, but the request may already have left ONCE before the reset — the audit row is the record, not a guarantee the byte never crossed; denied attempts are in scope_audit.`, true)
       const actionable = rows.filter(row => !isPagePlumbing(row.resourceType))
       const plumbing = rows.filter(row => isPagePlumbing(row.resourceType))
       const head = actionable.length > 0
@@ -1590,10 +1605,14 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
     async ({ owner, all, keep }: any) => {
       if (all === true) {
         const { closed, refused } = await env.registry.resetAll(keep ?? [SHARED_OWNER])
+        // V5: closed owners' per-owner scope rules die with their sessions.
+        const rulesCleared = closed.filter(name => env.scope.owners().includes(name))
+        for (const name of rulesCleared) env.scope.clear(name)
         const refusedLines = refused.map(row =>
           `REFUSED "${row.owner}": tabs leased (${row.leases.map(l => `#${l.tabId} by ${l.leasedBy}${l.purpose ? ` (${l.purpose})` : ''}`).join(', ')}) — resolve the leases first (tab_release) or have those owners close their own sessions`)
         return textResult([
           ...(closed.length === 0 ? ['Nothing to close.'] : [`Closed sessions: ${closed.join(', ')}`]),
+          ...(rulesCleared.length > 0 ? [`Cleared stale per-owner scope rules: ${rulesCleared.join(', ')}`] : []),
           ...refusedLines,
         ].join('\n'), refusedLines.length > 0)
       }
@@ -1601,7 +1620,9 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         return textResult(`browser_reset closes only ONE session now — pass owner: "<your-name>" to close your own (or all: true, keep: [...] to close every lane's session). Nothing was closed.`, true)
       const who = resolveOwner(owner)
       const closed = await env.registry.close(who)
-      return textResult(closed ? `Closed session for "${who}" (profile preserved; attached sessions only DISCONNECT — the human's browser stays open).` : `No running session for "${who}".`)
+      const hadRule = env.scope.owners().includes(who)
+      if (closed && hadRule) env.scope.clear(who)
+      return textResult(closed ? `Closed session for "${who}" (profile preserved; attached sessions only DISCONNECT — the human's browser stays open)${hadRule ? '; the owner\'s per-owner scope rule was cleared' : ''}.` : `No running session for "${who}".`)
     })
 
   t('browser_close', 'Close one owner\'s browser session (profile on disk is preserved for next time).',
