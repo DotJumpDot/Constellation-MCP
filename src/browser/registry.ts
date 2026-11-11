@@ -2,9 +2,16 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { SHARED_OWNER, BrowserSession, type SessionSnapshot } from './session.js'
+import { chromeProcessCensus } from './plain-launch.js'
 import type { ConstellationConfig } from '../config.js'
 
 const exec = promisify(execFile)
+
+/** Compare profile paths the way Windows does (case-insensitive, either
+ * slash, no trailing separator). Pure; tested. */
+export function normalizeDir(dir: string): string {
+  return dir.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase()
+}
 
 export class OwnerRegistry {
   private sessions = new Map<string, BrowserSession>()
@@ -35,6 +42,19 @@ export class OwnerRegistry {
    * never fabricates one). */
   sessionIfExists(owner: string): BrowserSession | undefined {
     return this.sessions.get(owner)
+  }
+
+  /** Whether another LIVE session already owns this profile dir (run-39
+   * §11.2: attach must not adopt another lane's window through a recycled
+   * port). Path comparison is case-insensitive, slash- and trailing-slash-
+   * tolerant — the census and PS layers hand us every variant. */
+  liveOwnerOfUserDir(userDir: string, exceptOwner: string): string | undefined {
+    const want = normalizeDir(userDir)
+    for (const [owner, session] of this.sessions) {
+      if (owner === exceptOwner || session.context === undefined) continue
+      if (normalizeDir(session.userDir) === want) return owner
+    }
+    return undefined
   }
 
   /** Attach mode (run-7 P0-2): adopt a running browser over CDP as an owner
@@ -81,13 +101,20 @@ export class OwnerRegistry {
     return out
   }
 
+  /** Close a session; `reaped` = stray chrome.exe processes the exact-match
+   *  profile sweep killed after the graceful close (run-39 §12.8). */
   async close(owner: string): Promise<boolean> {
     const session = this.sessions.get(owner)
     if (!session) return false
-    await session.close()
+    const { reaped } = await session.close()
+    this.lastReapCount = reaped
     if (owner !== SHARED_OWNER) this.sessions.delete(owner)
     return true
   }
+
+  /** Stray-process count from the most recent close (surfaced by
+   *  browser_kill so the Lead sees zombie reaping, not silence). */
+  lastReapCount = 0
 
   /** Run-7 P1-6: reset closes ONLY the caller's session. Closing others needs
    *  `{all: true}` and is refused while those owners hold tab leases. */
@@ -134,6 +161,11 @@ export class OwnerRegistry {
   startIdleSweeper(): void {
     if (this.config.idleTimeoutMin <= 0 || this.sweeper) return
     const limitMs = this.config.idleTimeoutMin * 60_000
+    // RAM guard cadence (run-39 RAM round): a census every 5 minutes is
+    // one short CIM sweep — cheap next to a 13-lane hunt, and it is what
+    // turns "Task Manager says 10 GB" into a warning the Lead can see.
+    const ramGuardMs = 5 * 60_000
+    let nextRamCheck = 0
     this.sweeper = setInterval(() => {
       const now = Date.now()
       for (const [owner, session] of this.sessions) {
@@ -141,8 +173,47 @@ export class OwnerRegistry {
         if (session.context === undefined) continue
         if (now - session.lastUsed > limitMs) void this.close(owner)
       }
+      if (this.config.ramGuardMb > 0 && now >= nextRamCheck) {
+        nextRamCheck = now + ramGuardMs
+        void this.ramGuardSweep().catch(() => undefined)
+      }
     }, 60_000)
     this.sweeper.unref()
+  }
+
+  /** One RAM-guard pass: sum each live session's chrome.exe working set by
+   *  profile dir; over `ramGuardMb` the session gets `ramWarning` (shown on
+   *  browser_map/browser_tabs), and with `ramAutoPark` it is closed instead —
+   *  the run-39 mtree2a case (a single renderer ballooning past 10 GB while
+   *  "active") must never again need the human's Task Manager to notice. */
+  async ramGuardSweep(): Promise<Array<{ owner: string, mb: number, parked: boolean }>> {
+    const census = await chromeProcessCensus()
+    const out: Array<{ owner: string, mb: number, parked: boolean }> = []
+    for (const [owner, session] of this.sessions) {
+      if (session.context === undefined) continue
+      const dirs = [session.userDir, session.adoptedProfileDir]
+        .filter((dir): dir is string => dir !== undefined && !dir.startsWith('(attached)'))
+        .map(normalizeDir)
+      let total = 0
+      for (const [udd, stats] of census) {
+        if (dirs.includes(normalizeDir(udd))) total += stats.totalWsBytes
+      }
+      const mb = Math.round(total / 1_048_576)
+      if (mb <= this.config.ramGuardMb) {
+        if (session.ramWarning !== undefined) session.ramWarning = undefined
+        continue
+      }
+      const warn = `chrome at ${mb} MB (RAM guard ${this.config.ramGuardMb} MB) — close unused tabs or browser_kill {owner:"${owner}"}`
+      if (this.config.ramAutoPark && owner !== SHARED_OWNER) {
+        out.push({ owner, mb, parked: true })
+        session.ramWarning = warn
+        await this.close(owner)
+      } else {
+        session.ramWarning = warn
+        out.push({ owner, mb, parked: false })
+      }
+    }
+    return out
   }
 
   async disposeAll(): Promise<void> {

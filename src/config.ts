@@ -54,6 +54,17 @@ export interface ConstellationConfig {
    *  the foreground (it always does, at window creation), hand it back via
    *  AttachThreadInput (run-9 focus advice §4, verified by the human). */
   focusGuard: boolean
+  /** RAM guard (run-39 RAM round): a live session whose chrome.exe tree sums
+   *  above this many MB gets `ramWarning` on browser_map/browser_tabs. 0 =
+   * off. CONSTELLATION_RAM_GUARD_MB (default 2500 — the run-39 mtree2a lane
+   * ballooned a single renderer past 10 GB while "active" and nothing
+   * surfaced it until the human opened Task Manager). */
+  ramGuardMb: number
+  /** true (CONSTELLATION_RAM_AUTOPARK=1): the RAM guard CLOSES an
+   *  over-threshold session instead of only warning (profile preserved —
+   *  browser_launch_plain relaunches warm). Off by default: a live lane's
+   *  browser dying mid-card is a decision for the Lead, not a default. */
+  ramAutoPark: boolean
 }
 
 function env(name: string): string | undefined {
@@ -92,6 +103,8 @@ export function defaultConfig(): ConstellationConfig {
     windowParkWidth: int('WINDOW_PARK_WIDTH', 945),
     windowParkHeight: int('WINDOW_PARK_HEIGHT', 1012),
     focusGuard: env('FOCUS_GUARD') !== '0' && env('FOCUS_GUARD') !== 'false',
+    ramGuardMb: int('RAM_GUARD_MB', 2500),
+    ramAutoPark: env('RAM_AUTOPARK') === '1' || env('RAM_AUTOPARK') === 'true',
   }
 }
 

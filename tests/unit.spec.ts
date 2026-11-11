@@ -2352,15 +2352,64 @@ test('repo_commit: a git-mv rename commits from the NEW path alone (#4)', async 
 test('plain-launch: bindCdpEndpoint refuses another owner, accepts rebind (advice D2)', async () => {
   const { bindCdpEndpoint, releaseCdpBinding, cdpEndpointOwner } = await import('../src/browser/plain-launch.js')
   const port = 40000 + Math.floor(Math.random() * 20000)
-  bindCdpEndpoint(port, 'lane-a', 'guid-1')
+  bindCdpEndpoint(port, 'lane-a', { browserGuid: 'guid-1', pid: 4242 })
   assert.throws(() => bindCdpEndpoint(port, 'lane-b'), /owned by "lane-a"/)
   // same owner rebinds (relaunch on the same port)
-  bindCdpEndpoint(port, 'lane-a', 'guid-2')
+  bindCdpEndpoint(port, 'lane-a', { browserGuid: 'guid-2' })
   assert.equal(cdpEndpointOwner(`http://127.0.0.1:${port}`).owner, 'lane-a')
+  assert.equal(cdpEndpointOwner(`http://127.0.0.1:${port}`).browserGuid, 'guid-2')
   releaseCdpBinding(port)
   // released endpoint is free again
   bindCdpEndpoint(port, 'lane-c')
   releaseCdpBinding(port)
+})
+
+test('run-39 fixes: portOfCdpUrl + parseCensusLine + isPagePlumbing + unixSecondsFromSqlite + normalizeDir', async () => {
+  const { portOfCdpUrl, parseCensusLine } = await import('../src/browser/plain-launch.js')
+  const { isPagePlumbing } = await import('../src/browser/session.js')
+  const { unixSecondsFromSqlite } = await import('../src/browser/cookies.js')
+  const { normalizeDir } = await import('../src/browser/registry.js')
+  assert.equal(portOfCdpUrl('http://127.0.0.1:9333'), 9333)
+  assert.equal(portOfCdpUrl('http://localhost:9222/'), 9222)
+  assert.equal(portOfCdpUrl('not a url'), 0)
+  // census line: pid\tws\ttype\tport\tudd — main has empty type, empty port tolerated
+  const main = parseCensusLine('33268\t2607697920\t\t9333\tc:\\users\\j\\appdata\\local\\constellation\\cdp-x')
+  assert.equal(main?.pid, 33268); assert.equal(main?.type, 'main'); assert.equal(main?.port, 9333)
+  const renderer = parseCensusLine('35124\t6679420928\trenderer\t\tc:\\users\\j\\appdata\\local\\constellation\\cdp-x')
+  assert.equal(renderer?.type, 'renderer'); assert.equal(renderer?.port, 0)
+  assert.equal(parseCensusLine('garbage line'), undefined)
+  assert.equal(parseCensusLine('0\t100\tmain\t1\tx'), undefined)
+  // plumbing vs controllable (run-39 §12.5)
+  assert.equal(isPagePlumbing('script'), true)
+  assert.equal(isPagePlumbing('stylesheet'), true)
+  assert.equal(isPagePlumbing('image'), true)
+  assert.equal(isPagePlumbing('document'), false)
+  assert.equal(isPagePlumbing('xhr'), false)
+  assert.equal(isPagePlumbing('fetch'), false)
+  assert.equal(isPagePlumbing(undefined), false)
+  // cookie expiry: SQLite-side seconds → unix; session cookies and the old
+  // µs overflow shape both resolve instead of throwing (run-39 §10.1). The
+  // lane's raw value 13469083033000000 µs-since-1601 = year ~2027.
+  assert.equal(unixSecondsFromSqlite(0), -1)
+  assert.equal(unixSecondsFromSqlite(-5), -1)
+  const rawMicros = 13469083033000000
+  assert.ok(rawMicros > Number.MAX_SAFE_INTEGER) // the shape that killed node:sqlite reads
+  const seconds = Math.floor(rawMicros / 1_000_000)
+  const unix = unixSecondsFromSqlite(seconds)
+  assert.ok(unix > 1_700_000_000 && unix < 2_000_000_000) // ~2023-2033: converted, did not overflow
+  // dir normalization (census vs session paths)
+  assert.equal(normalizeDir('C:\\A\\B\\'), normalizeDir('c:/a/b'))
+  assert.equal(normalizeDir('C:\\A\\B'), normalizeDir('c:\\a\\b\\'))
+})
+
+test('http: detectSignedOut flags login redirects and password forms (run-39 §12.7)', async () => {
+  const { detectSignedOut } = await import('../src/tools/http.js')
+  assert.equal(detectSignedOut('https://app.example.com/login?next=/api', undefined, ''), true)
+  assert.equal(detectSignedOut('https://accounts.google.com/o/oauth2/auth', undefined, ''), true)
+  assert.equal(detectSignedOut('https://app.example.com/api/data.json', 'application/json', '{"ok":true}'), false)
+  assert.equal(detectSignedOut('https://app.example.com/', 'text/html', '<form><input type="password" name="pw"></form>'), true)
+  assert.equal(detectSignedOut('https://app.example.com/', 'text/html', '<h1>Dashboard</h1><p>welcome back, here is your data</p>'), false)
+  assert.equal(detectSignedOut('https://app.example.com/blog/logging-in-tips', 'text/html', '<article>logging in tips</article>'), false)
 })
 
 test('plain-launch: detectChallenge classifies CF managed vs interactive vs captcha (StarCodex markers)', async () => {

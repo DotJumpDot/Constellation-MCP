@@ -53,6 +53,18 @@ export function chromiumTimeToUnixSeconds(expiresUtc: number): number {
   return Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : -1
 }
 
+/** Unix seconds from SQLite-side pre-divided `expires_utc / 1000000` (µs → s).
+ * Run-39 §10.1: reading the RAW µs column made node:sqlite throw "Value is
+ * too large" on far-future cookies (1.3e16 µs > 2^53) and killed the whole
+ * import; dividing INSIDE SQLite keeps every value in safe-integer range
+ * (seconds since 1601 ≈ 1.3e10) and the epoch shift is a small subtraction.
+ * `expiresSeconds` ≤ 0 = session cookie. Pure; tested. */
+export function unixSecondsFromSqlite(expiresSeconds: number): number {
+  if (!Number.isFinite(expiresSeconds) || expiresSeconds <= 0) return -1
+  const unix = expiresSeconds - 11_644_473_600
+  return unix > 0 ? Math.floor(unix) : -1
+}
+
 /** Host part of a cookie domain (leading dot stripped, lowercased). */
 export function cookieHost(domain: string): string {
   return domain.replace(/^\./, '').toLowerCase()
@@ -251,9 +263,12 @@ export async function readProfileCookies(profileDir: string, domainFilter?: stri
     const key = await loadChromiumCookieKey(layout.stateDir)
     const db = new DatabaseSync(tempDb, { readOnly: true })
     try {
+      // expires_utc is divided to SECONDS inside SQLite (run-39 §10.1): the
+      // raw µs column overflows node:sqlite's safe-integer range on far-future
+      // cookies and threw "Value is too large", killing every profile import.
       const rows = db.prepare(
-        'SELECT host_key, name, encrypted_value, path, expires_utc, is_secure, is_httponly, samesite FROM cookies',
-      ).all() as Array<{ host_key: string; name: string; encrypted_value: Uint8Array; path: string; expires_utc: number; is_secure: number; is_httponly: number; samesite?: number | null }>
+        'SELECT host_key, name, encrypted_value, path, CAST(expires_utc / 1000000 AS INTEGER) AS expires_s, is_secure, is_httponly, samesite FROM cookies',
+      ).all() as Array<{ host_key: string; name: string; encrypted_value: Uint8Array; path: string; expires_s: number; is_secure: number; is_httponly: number; samesite?: number | null }>
       for (const row of rows) {
         if (!cookieMatchesAnyDomain(row.host_key, domainFilter)) continue
         const decrypted = decryptCookieValue(Buffer.from(row.encrypted_value), key, row.host_key)
@@ -262,7 +277,7 @@ export async function readProfileCookies(profileDir: string, domainFilter?: stri
           continue
         }
         const secure = row.is_secure === 1
-        const expires = chromiumTimeToUnixSeconds(row.expires_utc)
+        const expires = unixSecondsFromSqlite(row.expires_s)
         const sameSite = mapSameSite(row.samesite, secure)
         cookies.push({
           name: row.name,

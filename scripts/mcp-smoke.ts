@@ -24,6 +24,7 @@ async function main(): Promise<void> {
     'browser_navigate', 'browser_network_bodies', 'browser_network_requests', 'browser_owner_info', 'browser_paste', 'browser_press_key',
     'browser_reset', 'browser_run_code_unsafe', 'browser_select_option', 'browser_set_files', 'browser_snapshot',
     'browser_take_screenshot', 'browser_tabs', 'browser_type', 'browser_upload', 'browser_wait_for',
+    'browser_kill', 'browser_launch_plain', 'browser_profiles_reap',
     'browser_scope_violations',
     'budget_raise', 'budget_set',
     'cell_ledger', 'cell_register', 'cell_run', 'cell_status',

@@ -94,7 +94,13 @@ public static class PL {
     si.dwFlags = 0x00000001; // STARTF_USESHOWWINDOW
     si.wShowWindow = 4;      // SW_SHOWNOACTIVATE
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(app, "\"" + app + "\" " + args, IntPtr.Zero, IntPtr.Zero, false, 0x04000000 /*CREATE_DEFAULT_ERROR_MODE*/, IntPtr.Zero, null, ref si, out pi))
+    // NOTE: this C# lives inside a TS template literal — backslash escapes
+    // COLLAPSE before PowerShell sees them, which produced the invalid C#
+    // token (three quotes + ' + app + ' + two quotes) and broke EVERY plain
+    // launch in run 39. Quote with CHAR literals instead: no backslashes, no
+    // escaping, at any layer (run-39 advice 12.1).
+    string quoted = '"' + app + '"';
+    if (!CreateProcessW(app, quoted + " " + args, IntPtr.Zero, IntPtr.Zero, false, 0x04000000 /*CREATE_DEFAULT_ERROR_MODE*/, IntPtr.Zero, null, ref si, out pi))
       throw new Exception("CreateProcessW failed: " + Marshal.GetLastWin32Error());
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return pi.dwProcessId;
@@ -189,6 +195,9 @@ export interface CdpBinding {
   owner: string
   port: number
   browserGuid?: string
+  /** Browser-main pid when known — lets a refusal heal itself once the bound
+   *  Chrome dies (a stale binding must not block the port's next user). */
+  pid?: number
   since: string
 }
 
@@ -199,12 +208,18 @@ const cdpBindings = new Map<number, CdpBinding>()
 /** Bind an endpoint to an owner, REFUSING an endpoint another owner holds
  *  (advice D2: cross-owner browser contamination is the worst failure this
  *  harness can produce). */
-export function bindCdpEndpoint(port: number, owner: string, browserGuid?: string): CdpBinding {
+export function bindCdpEndpoint(port: number, owner: string, identity?: { browserGuid?: string, pid?: number }): CdpBinding {
   const existing = cdpBindings.get(port)
   if (existing !== undefined && existing.owner !== owner) {
     throw new Error(`cdp ${port} is owned by "${existing.owner}" since ${existing.since} — pick another port / let browser_launch_plain allocate one (bindCdpEndpoint refused)`)
   }
-  const binding: CdpBinding = { owner, port, ...(browserGuid === undefined ? {} : { browserGuid }), since: new Date().toISOString() }
+  const binding: CdpBinding = {
+    owner,
+    port,
+    ...(identity?.browserGuid === undefined ? {} : { browserGuid: identity.browserGuid }),
+    ...(identity?.pid === undefined ? {} : { pid: identity.pid }),
+    since: new Date().toISOString(),
+  }
   cdpBindings.set(port, binding)
   return binding
 }
@@ -214,14 +229,110 @@ export function cdpBindingFor(port: number): CdpBinding | undefined {
   return cdpBindings.get(port)
 }
 
+/** Loopback port of a CDP url, 0 when unparseable. Pure; tested. */
+export function portOfCdpUrl(cdpUrl: string): number {
+  return Number(/:(\d+)\/?$/.exec(cdpUrl)?.[1] ?? 0)
+}
+
 /** Who owns this endpoint, for browser_attach's D2 refusal. */
 export function cdpEndpointOwner(cdpUrl: string): CdpBinding | undefined {
-  const port = Number(/:(\d+)\/?$/.exec(cdpUrl)?.[1] ?? 0)
+  const port = portOfCdpUrl(cdpUrl)
   return port > 0 ? cdpBindings.get(port) : undefined
 }
 
 export function releaseCdpBinding(port: number): void {
   cdpBindings.delete(port)
+}
+
+// ── Live-Chrome census (run-39 RAM investigation + advice §12.6/§12.8) ─────
+
+export interface ChromeProfileStats {
+  /** Summed working set of every chrome.exe process on this profile, bytes. */
+  totalWsBytes: number
+  procs: number
+  /** Browser-main pid (no --type flag), when seen. */
+  mainPid?: number
+  /** Its --remote-debugging-port, when present. */
+  debugPort?: number
+}
+
+/** Parse one census line "pid<TAB>ws<TAB>type<TAB>port<TAB>udd" (the PS
+ *  census format below). Pure; tested. */
+export function parseCensusLine(line: string): { pid: number, ws: number, type: string, port: number, udd: string } | undefined {
+  const cols = line.replace(/\r$/, '').split('\t')
+  if (cols.length !== 5) return undefined
+  const pid = Number(cols[0]), ws = Number(cols[1]), port = Number(cols[3])
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(ws) || cols[4] === '') return undefined
+  return { pid, ws, type: cols[2] === '' ? 'main' : cols[2]!, port: Number.isInteger(port) && port > 0 ? port : 0, udd: cols[4]!.toLowerCase() }
+}
+
+function runEncoded(script: string, timeoutMs: number): Promise<string> {
+  return exec(
+    'powershell.exe',
+    ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+    { windowsHide: true, timeout: timeoutMs },
+  ).then(({ stdout }) => stdout).catch(() => '')
+}
+
+/** One CIM sweep: group every chrome.exe process by its --user-data-dir with
+ *  summed working set. This is what turned the run-39 "10 GB Chrome" hunt
+ *  from Task Manager archaeology into a tool call (browser_map RAM column +
+ *  the sweeper's RAM guard). */
+export async function chromeProcessCensus(): Promise<Map<string, ChromeProfileStats>> {
+  const script =
+    `$ErrorActionPreference = 'SilentlyContinue'\n` +
+    `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object {\n` +
+    `  $cl = [string]$_.CommandLine\n` +
+    `  $udd = ''\n` +
+    `  if ($cl -match '--user-data-dir=(?:"([^"]+)"|([^ ]+))') { $udd = $Matches[1]; if (-not $udd) { $udd = $Matches[2] } }\n` +
+    `  $port = ''\n` +
+    `  if ($cl -match '--remote-debugging-port=([0-9]+)') { $port = $Matches[1] }\n` +
+    `  $type = ''\n` +
+    `  if ($cl -match '--type=([a-z-]+)') { $type = $Matches[1] }\n` +
+    `  if ($udd -ne '') {\n` +
+    `    $tabs = [char]9\n` +
+    `    Write-Output ($_.ProcessId.ToString() + $tabs + [string]$_.WorkingSetSize + $tabs + $type + $tabs + $port + $tabs + $udd.ToLower())\n` +
+    `  }\n` +
+    `}`
+  const stdout = await runEncoded(script, 20_000)
+  const out = new Map<string, ChromeProfileStats>()
+  for (const line of stdout.split('\n')) {
+    const parsed = parseCensusLine(line)
+    if (parsed === undefined) continue
+    const stats = out.get(parsed.udd) ?? { totalWsBytes: 0, procs: 0 }
+    stats.totalWsBytes += parsed.ws
+    stats.procs += 1
+    if (parsed.type === 'main') {
+      stats.mainPid = parsed.pid
+      if (parsed.port > 0) stats.debugPort = parsed.port
+    }
+    out.set(parsed.udd, stats)
+  }
+  return out
+}
+
+/** Resolve a running debug Chrome by its port: browser-main pid + its
+ *  --user-data-dir. browser_attach's cross-owner guard resolves the browser
+ *  it is about to adopt BEFORE connecting (run-39 §11.2: a lane adopted
+ *  another lane's window through a recycled port and nothing refused). */
+export async function resolveChromeByDebugPort(port: number): Promise<{ pid: number, userDir: string } | undefined> {
+  const marker = `__PORT${port}__`
+  const script =
+    `$ErrorActionPreference = 'SilentlyContinue'\n` +
+    `$want = '(?:^| )--remote-debugging-port=${port}(?: |$|"|/)'\n` +
+    `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {\n` +
+    `  $_.CommandLine -match $want -and $_.CommandLine -notmatch '--type='\n` +
+    `} | ForEach-Object {\n` +
+    `  $udd = ''\n` +
+    `  if ($_.CommandLine -match '--user-data-dir=(?:"([^"]+)"|([^ ]+))') { $udd = $Matches[1]; if (-not $udd) { $udd = $Matches[2] } }\n` +
+    `  $tabs = [char]9\n` +
+    `  Write-Output ($_.ProcessId.ToString() + $tabs + $udd.ToLower())\n` +
+    `} | Select-Object -First 1`
+  const stdout = await runEncoded(script, 12_000)
+  const cols = stdout.trim().split('\t')
+  const pid = Number(cols[0])
+  if (!Number.isInteger(pid) || pid <= 0 || cols[1] === undefined || cols[1] === '') return undefined
+  return { pid, userDir: cols[1] }
 }
 
 // ── Challenge detection (StarCodex heuristics) ─────────────────────────────

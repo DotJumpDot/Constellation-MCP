@@ -18,6 +18,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "node --import tsx/esm --test tests/*.spec.ts",
     "smoke": "node --import tsx/esm scripts/smoke.ts",
+    "plain-selftest": "node --import tsx/esm scripts/plain-selftest.ts",
     "verify": "npm run build && npm run test && npm run mcp-smoke",
     "mcp-smoke": "node --import tsx/esm scripts/mcp-smoke.ts"
   },

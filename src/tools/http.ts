@@ -453,11 +453,39 @@ export function isBinaryContentType(contentType: string | undefined): boolean {
   return true
 }
 
+/** Login-path pattern for signed-out detection (run-39 §12.7): half the
+ * human walls were found by downloading a JSON endpoint and getting a 30 KB
+ * HTML login page instead. Pure; tested. */
+const LOGIN_PATH_RE = /\/(login|signin|sign-in|log-in|sign_in|log_in|sso|auth)(?:\/|$|\?)/i
+
+/** Whether a response is almost certainly an UNAUTHENTICATED surface: the
+ * final URL landed on a login path, or an HTML body carries a password form.
+ * Deliberately conservative — a `true` here tells the lane "this is not the
+ * data you asked for; do not parse selectors out of it". */
+export function detectSignedOut(urlFinal: string, contentType: string | undefined, bodySample: string): boolean {
+  try {
+    const url = new URL(urlFinal)
+    // An IdP host with a consent/accounts path is the classic silent redirect.
+    if (LOGIN_PATH_RE.test(url.pathname)) return true
+    if (/^accounts?\./i.test(url.host)) return true
+  } catch { /* relative or odd URL — fall through to the body check */ }
+  const ct = contentType?.toLowerCase() ?? ''
+  if (ct.includes('html')) {
+    if (/<input[^>]+type=["']password["']/i.test(bodySample)) return true
+    if (/(sign in|log in|sign-in|login)\s*(to|to your|·|—|-|<)/i.test(bodySample.slice(0, 2000)) && /<form/i.test(bodySample)) return true
+  }
+  return false
+}
+
 export function formatResult(r: RequestResult): string {
   const headerLines = Object.entries(r.headers).map(([k, v]) => `  ${k}: ${v}`).join('\n')
   const binary = isBinaryContentType(r.headers['content-type'])
+  const signedOut = detectSignedOut(r.url_final, r.headers['content-type'], r.body.slice(0, 4000))
   return [
     `HTTP ${r.status} ${r.statusText} (${r.timing_ms} ms) — final URL: ${r.url_final}${r.redirect_hops !== undefined ? ` (${r.redirect_hops} redirect hop(s) followed, each scope-checked)` : ''}`,
+    ...(signedOut
+      ? ['⚠ SESSION LOOKS SIGNED OUT — the final URL/body is a login page, not the authenticated surface you asked for (run-39 §12.7). Re-authenticate (browser_attach / cookie handoff) before parsing anything out of this body.']
+      : []),
     `body sha256: ${r.body_sha256}${r.set_cookies > 0 ? ` — ${r.set_cookies} Set-Cookie stored in jar` : ''}`,
     `headers:\n${headerLines}`,
     binary

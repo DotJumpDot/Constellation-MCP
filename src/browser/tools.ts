@@ -8,9 +8,11 @@ import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
-import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, type BrowserSession } from './session.js'
+import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, type BrowserSession } from './session.js'
 import {
   detectChallenge, challengeAdvice, killChromeByProfile, plainProfileDir, cdpEndpointOwner,
+  portOfCdpUrl, resolveChromeByDebugPort, bindCdpEndpoint, releaseCdpBinding, pidAlive,
+  chromeProcessCensus,
   type ChallengeDetection,
 } from './plain-launch.js'
 import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
@@ -1194,63 +1196,116 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`could not bring "${who}"'s window to the foreground (exit ${result.code}) — it may be minimized to the tray`, true)
     })
 
-  t('browser_map', 'Ownership map: browser sessions, window labels, tabs, leases, retained (closed) profiles on disk, plus scope status. Default shows EVERY owner (the Lead\'s view); pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
-    { owner: z.string().optional().describe('Your owner name: scopes the map to your session + shared') },
-    async ({ owner }: any) => {
+  t('browser_map', 'Ownership map. DEFAULT (run-39 §12.3/§12.6) is a compact monitoring table — owner · state · taskbar badge · tabs · current host · chrome RAM MB — one line per live session, cheap enough to call between waits at 12+ lanes. `detail:true` = the full per-tab view (URLs, leases, window labels); `history:true` adds the retained (closed) profiles on disk. Pass `owner` to see only your own session + the shared one (teammates should — the global view exposes other lanes\' URLs).',
+    {
+      owner: z.string().optional().describe('Your owner name: scopes the map to your session + shared'),
+      detail: z.boolean().optional().describe('Full per-tab view (the pre-run-40 default output)'),
+      history: z.boolean().optional().describe('List retained (closed) profile dirs on disk too'),
+    },
+    async ({ owner, detail, history }: any) => {
       const who = owner === undefined ? undefined : resolveOwner(owner)
       const all = await env.registry.snapshot()
       const snaps = who === undefined ? all : all.filter(snap => snap.owner === who || snap.owner === SHARED_OWNER)
       const scopeRule = env.scope.current(who)
       const perOwners = env.scope.owners()
-      const lines = snaps.length === 0 ? ['(no live sessions — retained profiles below, if any)'] : snaps.map(snap => {
-        const badgePart = snap.taskbarBadge === undefined ? '' : ` — taskbar badge ${snap.taskbarBadge}`
-        const head = snap.owner === SHARED_OWNER
-          ? `shared (human session, no label prefix)${badgePart} — profile: ${snap.userDir}`
-          : `${snap.owner} — own window, titles prefixed "[${snap.owner}]"${badgePart} — profile: ${snap.userDir}`
-        const tabs = snap.tabs.map(tab => {
-          const marks = [snap.selected === tab.id ? '▶' : ' ', tab.infoTab === true ? 'ℹ' : '', tab.leasedBy ? `leased:${tab.leasedBy}${tab.purpose ? `(${tab.purpose})` : ''}` : '', tab.openedBy !== SHARED_OWNER && tab.openedBy !== snap.owner ? `openedBy:${tab.openedBy}` : ''].filter(Boolean).join(' ')
-          return `   ${marks} [${tab.index}] ${tab.title} — ${tab.url}`
-        })
-        return [head, ...(tabs.length === 0 ? ['   (no tabs)'] : tabs)].join('\n')
-      })
-      // Retained profiles (run-4 advice §8h): after a restart browser_map said
-      // "no sessions launched yet" while owner labels and profiles persisted
-      // on disk — the Lead could not see what exists for cleanup. A profile
-      // dir with no live session reads as one "(closed)" line with its label
-      // and the directory's last-modified time as a last-use approximation.
-      // Run-7 P2-13: the line also reads PROCESS state — a "(closed)" profile
-      // whose chrome.exe still runs (restart, crashed server) says so instead
-      // of silently disagreeing with reality.
-      const live = new Set(snaps.map(snap => snap.owner))
-      const runningDirs = await env.registry.runningProfileDirs()
-      const isProfileRunning = (dir: string): boolean =>
-        runningDirs.has(dir.toLowerCase()) || [...runningDirs].some(r => dir.toLowerCase().endsWith(r) || r.endsWith(dir.toLowerCase()))
-      const labels = loadOwnerLabels(env.config.rootDir)
-      const retained: string[] = []
-      try {
-        for (const entry of fs.readdirSync(env.config.profilesRoot, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue
-          // A stray non-owner directory must not sink the whole map.
-          if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(entry.name)) continue
-          const profileOwner = entry.name
-          if (live.has(profileOwner) || (who !== undefined && profileOwner !== who && profileOwner !== SHARED_OWNER)) continue
-          const stat = fs.statSync(path.join(env.config.profilesRoot, entry.name))
-          const label = labels[profileOwner]
-          const described = label === undefined ? '' : ` — ${[label.job, label.engagement].filter(Boolean).join(' · ')}`
-          const dir = path.join(env.config.profilesRoot, entry.name)
-          const state = isProfileRunning(dir)
-            ? 'chrome.exe ALIVE with this profile (close it via owner re-open + browser_close, or browser_attach to adopt it)'
-            : 'closed'
-          retained.push(`(${state}) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`)
+      // RAM column (run-39 RAM round): one CIM census, summed per profile dir,
+      // matched to sessions by userDir / adoptedProfileDir. This is the line
+      // that would have caught a 10 GB lane renderer without Task Manager.
+      const census = await chromeProcessCensus()
+      const censusKey = (dir: string): string => dir.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase()
+      const ramFor = (snapOwner: string): number | undefined => {
+        const session = env.registry.sessionIfExists(snapOwner)
+        if (session === undefined) return undefined
+        const dirs = [session.userDir, session.adoptedProfileDir]
+          .filter((dir): dir is string => dir !== undefined && !dir.startsWith('(attached)'))
+          .map(censusKey)
+        if (dirs.length === 0) return undefined
+        let total = 0, seen = false
+        for (const [udd, stats] of census) {
+          if (dirs.includes(censusKey(udd))) { total += stats.totalWsBytes; seen = true }
         }
-      } catch { /* profiles dir absent = no retained profiles */ }
+        return seen ? Math.round(total / 1_048_576) : undefined
+      }
+      const hostOf = (url: string): string => {
+        try { return new URL(url).host } catch { return url.slice(0, 40) }
+      }
+      const lines: string[] = []
+      if (detail === true) {
+        if (snaps.length === 0) lines.push('(no live sessions)')
+        for (const snap of snaps) {
+          const badgePart = snap.taskbarBadge === undefined ? '' : ` — taskbar badge ${snap.taskbarBadge}`
+          const ramPart = ramFor(snap.owner) === undefined ? '' : ` — chrome RAM ${ramFor(snap.owner)} MB`
+          const head = snap.owner === SHARED_OWNER
+            ? `shared (human session, no label prefix)${badgePart}${ramPart} — profile: ${snap.userDir}`
+            : `${snap.owner} — own window, titles prefixed "[${snap.owner}]"${badgePart}${ramPart} — profile: ${snap.userDir}${snap.adoptedProfileDir === undefined ? '' : ` (adopted ${snap.adoptedProfileDir})`}`
+          const tabs = snap.tabs.map(tab => {
+            const marks = [snap.selected === tab.id ? '▶' : ' ', tab.infoTab === true ? 'ℹ' : '', tab.leasedBy ? `leased:${tab.leasedBy}${tab.purpose ? `(${tab.purpose})` : ''}` : '', tab.openedBy !== SHARED_OWNER && tab.openedBy !== snap.owner ? `openedBy:${tab.openedBy}` : ''].filter(Boolean).join(' ')
+            return `   ${marks} [${tab.index}] ${tab.title} — ${tab.url}`
+          })
+          lines.push([head, ...(tabs.length === 0 ? ['   (no tabs)'] : tabs)].join('\n'))
+        }
+      } else {
+        if (snaps.length === 0) lines.push('(no live sessions — call with history:true for retained profiles)')
+        for (const snap of snaps) {
+          const selected = snap.tabs.find(tab => tab.id === snap.selected) ?? snap.tabs.find(tab => tab.infoTab !== true)
+          const session = env.registry.sessionIfExists(snap.owner)
+          const actionable = session === undefined ? 0 : session.scopeViolations.filter(row => !isPagePlumbing(row.resourceType)).length
+          const state = snap.attached ? 'attached' : snap.plainOwned ? 'plain' : snap.running ? 'live' : 'down'
+          lines.push([
+            snap.owner === SHARED_OWNER ? 'shared' : snap.owner,
+            state,
+            snap.taskbarBadge === undefined ? '-' : `#${snap.taskbarBadge}`,
+            `${snap.tabs.length} tab${snap.tabs.length === 1 ? '' : 's'}`,
+            selected === undefined ? '-' : hostOf(selected.url),
+            ramFor(snap.owner) === undefined ? '-' : `${ramFor(snap.owner)}MB`,
+            snap.ramWarning === undefined ? '' : '⚠RAM',
+            actionable > 0 ? `⚠${actionable} out-of-scope` : '',
+          ].filter(part => part !== '').join(' · '))
+        }
+        lines.push('(compact view — detail:true for tabs/URLs/leases, history:true for closed profiles)')
+      }
+      // Retained profiles (run-4 advice §8h) — behind history:true since
+      // run-39 §12.6 (200 closed profiles made the map 31 KB). Run-7 P2-13:
+      // the line still reads PROCESS state — a "(closed)" profile whose
+      // chrome.exe still runs (restart, crashed server) says so instead of
+      // silently disagreeing with reality.
+      const retained: string[] = []
+      if (history === true) {
+        const live = new Set(snaps.map(snap => snap.owner))
+        const runningDirs = await env.registry.runningProfileDirs()
+        const isProfileRunning = (dir: string): boolean =>
+          runningDirs.has(dir.toLowerCase()) || [...runningDirs].some(r => dir.toLowerCase().endsWith(r) || r.endsWith(dir.toLowerCase()))
+        const labels = loadOwnerLabels(env.config.rootDir)
+        try {
+          for (const entry of fs.readdirSync(env.config.profilesRoot, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue
+            // A stray non-owner directory must not sink the whole map.
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(entry.name)) continue
+            const profileOwner = entry.name
+            if (live.has(profileOwner) || (who !== undefined && profileOwner !== who && profileOwner !== SHARED_OWNER)) continue
+            const stat = fs.statSync(path.join(env.config.profilesRoot, entry.name))
+            const label = labels[profileOwner]
+            const described = label === undefined ? '' : ` — ${[label.job, label.engagement].filter(Boolean).join(' · ')}`
+            const dir = path.join(env.config.profilesRoot, entry.name)
+            const state = isProfileRunning(dir)
+              ? 'chrome.exe ALIVE with this profile (close it via owner re-open + browser_close, or browser_attach to adopt it)'
+              : 'closed'
+            retained.push(`(${state}) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`)
+          }
+        } catch { /* profiles dir absent = no retained profiles */ }
+      }
       if (retained.length > 0) lines.push(...retained)
-      // Run-8 §5: surface attach/launch traffic violations right on the map.
+      // Run-8 §5 + run-39 §12.5: violations on the map count only
+      // LANE-CONTROLLABLE requests; page plumbing is noted, never a STOP.
       for (const snap of snaps) {
         const session = env.registry.sessionFor(snap.owner)
-        if (session.scopeViolations.length > 0) {
-          lines.push(`⚠ ${snap.owner}: ${session.scopeViolations.length} out-of-scope request(s) observed — browser_scope_violations {owner:"${snap.owner}"}`)
-        }
+        if (session === undefined || session.scopeViolations.length === 0) continue
+        const actionable = session.scopeViolations.filter(row => !isPagePlumbing(row.resourceType))
+        const plumbing = session.scopeViolations.length - actionable.length
+        if (actionable.length > 0)
+          lines.push(`⚠ ${snap.owner}: ${actionable.length} out-of-scope request(s) observed — browser_scope_violations {owner:"${snap.owner}"}`)
+        if (plumbing > 0)
+          lines.push(`ℹ ${snap.owner}: ${plumbing} page-plumbing request(s) (assets the page itself loaded — NOT counted, no action)`)
       }
       const scopeLine = scopeRule === null
         ? `scope: UNRESTRICTED (call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules: ${trimOwnerNames(perOwners)}` : ''}`
@@ -1270,30 +1325,51 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         throw new Error('cdp_url must be a loopback endpoint (http://127.0.0.1:PORT or http://localhost:PORT)')
       // Advice D2 (2026-11-11): two owners adopting the same endpoint
       // cross-contaminated browsers — the worst failure this harness can
-      // produce. An endpoint this server bound to another owner is refused.
+      // produce. An endpoint this server bound to another owner is refused;
+      // a binding whose browser has died is stale and self-clears (run-39
+      // §12.3: the guard must not outlive the chrome it protects).
+      const port = portOfCdpUrl(cdp_url)
       const binding = cdpEndpointOwner(cdp_url)
-      if (binding !== undefined && binding.owner !== who)
-        throw new Error(`cdp endpoint ${cdp_url} is bound to owner "${binding.owner}" since ${binding.since} — attaching as "${who}" would adopt their browser. Launch your own (browser_launch_plain allocates a free port) or pick another port.`)
+      if (binding !== undefined && binding.owner !== who) {
+        const stillLive = binding.pid !== undefined ? await pidAlive(binding.pid) : true
+        if (stillLive)
+          throw new Error(`cdp endpoint ${cdp_url} is bound to owner "${binding.owner}" since ${binding.since} (browser pid ${binding.pid ?? '?'} alive) — attaching as "${who}" would adopt their browser. Launch your own (browser_launch_plain allocates a free port) or pick another port.`)
+        releaseCdpBinding(port)
+      }
+      // Run-39 §11.2: resolve WHICH browser this port serves BEFORE adopting —
+      // a recycled port handed a lane another lane's authenticated window and
+      // nothing refused. The profile dir comes from the browser process's own
+      // command line, so a warm orphan is identified even with no binding.
+      const resolved = port > 0 ? await resolveChromeByDebugPort(port) : undefined
+      if (resolved !== undefined) {
+        const holder = env.registry.liveOwnerOfUserDir(resolved.userDir, who)
+        if (holder !== undefined)
+          throw new Error(`the Chrome on port ${port} runs profile ${resolved.userDir}, which belongs to LIVE owner "${holder}" — attaching as "${who}" would drive their window. Pick your own port/profile (browser_launch_plain) or have "${holder}" browser_close first.`)
+      }
       env.scope.audit(cdp_url, who, 'browser_attach', {
         allowed: true,
-        reason: `adopting a running browser over CDP as owner "${who}"`,
+        reason: `adopting a running browser over CDP as owner "${who}"${resolved !== undefined ? ` (profile ${resolved.userDir}, pid ${resolved.pid})` : ''}`,
       })
       const session = env.registry.attachFor(who, cdp_url)
       const context = await session.ensure()
+      if (resolved !== undefined) {
+        session.adoptedProfileDir = resolved.userDir
+        bindCdpEndpoint(port, who, { pid: resolved.pid })
+      }
       // Run-8 §5: the scope guard follows the ATTACHED browser — every request
       // is checked against the owner's scope and violations are audited, so
       // moving to CDP attach no longer means leaving the audit behind.
-      session.networkObserver = (method, url) => {
+      session.networkObserver = (method, url, resourceType) => {
         const decision = env.scope.check(url, who)
         if (!decision.allowed && !url.startsWith('chrome://') && !url.startsWith('devtools://')) {
-          session.scopeViolations.push({ ts: new Date().toISOString(), method, url, reason: decision.reason })
-          if (session.scopeViolations.length > 100) session.scopeViolations.shift()
+          session.scopeViolations.push({ ts: new Date().toISOString(), method, url, reason: decision.reason, ...(resourceType === undefined ? {} : { resourceType }) })
+          if (session.scopeViolations.length > 200) session.scopeViolations.shift()
           env.scope.audit(url, who, 'attached-traffic', decision)
         }
       }
       const pages = context.pages()
       return textResult([
-        `Attached "${who}" to ${cdp_url} — ${pages.length} tab(s) adopted; the existing tabs are theirs to drive (browser_tabs {action:'list', owner:"${who}"}).`,
+        `Attached "${who}" to ${cdp_url} — ${pages.length} tab(s) adopted${resolved !== undefined ? `; adopted profile ${resolved.userDir} (pid ${resolved.pid})` : ' (profile dir not resolvable — the browser may be headless or already gone)'}; the existing tabs are theirs to drive (browser_tabs {action:'list', owner:"${who}"}).`,
         'closing this session (browser_close/browser_reset) only DISCONNECTS; the human\'s browser keeps running.',
         ...(await session.snapshot()).tabs.map(tab => `  [${tab.index}] ${tab.title} — ${tab.url}`),
       ].join('\n'))
@@ -1314,8 +1390,17 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         reason: `persistent launch on explicit user-data-dir${extra_args !== undefined ? ` with ${extra_args.length} extra arg(s)` : ''}`,
       })
       const session = env.registry.launchFor(who, user_data_dir, extra_args)
-      await session.ensure()
-      return textResult(`Launched "${who}" on ${user_data_dir} (automation flag suppressed${extra_args !== undefined && extra_args.length > 0 ? `, args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.${badgeNote(session)}`)
+      const context = await session.ensure()
+      // Run-39 §12.2: the old result CLAIMED "automation flag suppressed"
+      // while lanes measured navigator.webdriver=true. Verify from a real
+      // page and print the measurement — lanes must not re-measure a claim
+      // the tool makes about itself.
+      let webdriverLine = 'navigator.webdriver: (could not verify — no page)'
+      try {
+        const page = context.pages()[0]
+        if (page !== undefined) webdriverLine = `navigator.webdriver = ${await page.evaluate('navigator.webdriver')} (measured, not assumed)`
+      } catch { /* never fail a launch on the verification */ }
+      return textResult(`Launched "${who}" on ${user_data_dir} (${webdriverLine}${extra_args !== undefined && extra_args.length > 0 ? `; args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.${badgeNote(session)}`)
     })
 
   t('browser_launch_plain', 'Launch THIS owner\'s plain Chrome — the anti-bot route (advice D12 + Maki_Live/StarCodex research 2026-11-11). We spawn the installed chrome.exe ourselves with ZERO automation flags (no Playwright launch, navigator.webdriver stays false — the only route measured to pass Cloudflare/reCAPTCHA-class edges), the window NEVER steals your focus, the debug port is allocated for you (no port collisions), the profile is WARM by default (cookies incl. any solved cf_clearance persist across runs — clearance is bound to this machine+Chrome+IP and stays valid) and popups are suppressed (no save-password, no restore-pages). Idempotent: a live plain session for the owner is reused, a dead one relaunches on the same profile. Prefer this over hand-rolled Start-Process + browser_attach.',
@@ -1350,8 +1435,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (who === SHARED_OWNER) throw new Error('browser_kill needs a named owner')
       const existing = env.registry.sessionIfExists(who)
       if (existing !== undefined) {
+        const userDir = existing.userDir
         await env.registry.close(who)
-        return textResult(`Closed and killed "${who}"'s browser (graceful close; profile preserved at ${existing.userDir}).`)
+        const reaped = env.registry.lastReapCount
+        return textResult(`Closed and killed "${who}"'s browser (graceful close; profile preserved at ${userDir}${reaped > 0 ? `; exact-match sweep reaped ${reaped} stray chrome.exe process(es) the graceful close left behind` : ''}).`)
       }
       const userDir = path.join(env.config.profilesRoot, `plain-${who}`)
       const killed = await killChromeByProfile(userDir)
@@ -1360,16 +1447,93 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         : `No live session and no orphaned Chrome for "${who}" (profile ${userDir}).`)
     })
 
-  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser (launched or CDP-attached; run-8 §5): the attach-mode audit keeps the scope guard a property of what goes out. Violations were already audited — this lists them so a lane can stop and re-scope.',
-    { ...OWNER_FIELD },
-    async ({ owner }: any) => {
+  t('browser_profiles_reap', 'Reap OLD retained browser profiles on disk (run-39 disk round: 498 profile dirs / ~35 GB accumulated across runs 26-39). DRY-RUN by default — it only lists what would go. Deletes a profile dir only when its last write is older than `older_than_days` (default 14) AND no live session owns it AND no chrome.exe is running with it. Live-session dirs, the shared profile, and any profile younger than the threshold are never touched. Set dry_run:false to actually delete.',
+    {
+      older_than_days: z.number().int().min(1).optional().describe('Age threshold on last write (default 14)'),
+      dry_run: z.boolean().optional().describe('false = actually delete (default true = list only)'),
+      include_cdp_dirs: z.boolean().optional().describe('Also reap lane-recipe cdp-* dirs under %LOCALAPPDATA%\\Constellation (default false)'),
+    },
+    async ({ older_than_days, dry_run, include_cdp_dirs }: any) => {
+      const days = older_than_days ?? 14
+      const cutoff = Date.now() - days * 86_400_000
+      const roots: Array<{ root: string, label: string }> = [
+        { root: env.config.profilesRoot, label: 'owner profiles' },
+      ]
+      if (include_cdp_dirs === true) {
+        const cdpRoot = path.join(path.dirname(env.config.rootDir), 'Constellation')
+        if (fs.existsSync(cdpRoot)) roots.push({ root: cdpRoot, label: 'cdp-* lane dirs' })
+      }
+      const liveDirs = new Set<string>()
+      for (const snap of await env.registry.snapshot()) {
+        const session = env.registry.sessionIfExists(snap.owner)
+        for (const dir of [session?.userDir, session?.adoptedProfileDir]) {
+          if (dir !== undefined && !dir.startsWith('(attached)')) liveDirs.add(dir.toLowerCase())
+        }
+      }
+      const runningDirs = await env.registry.runningProfileDirs()
+      const victims: Array<{ dir: string, lastWrite: Date }> = []
+      const skippedLive: string[] = []
+      for (const { root, label } of roots) {
+        let entries: fs.Dirent[]
+        try { entries = fs.readdirSync(root, { withFileTypes: true }) } catch { continue }
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue
+          if (entry.name === 'shared-profile' || entry.name === 'plain-shared') continue
+          const dir = path.join(root, entry.name)
+          if (liveDirs.has(dir.toLowerCase())) { skippedLive.push(entry.name); continue }
+          if ([...runningDirs].some(r => dir.toLowerCase().endsWith(r) || r.endsWith(dir.toLowerCase()))) { skippedLive.push(entry.name); continue }
+          let mtime: Date
+          try { mtime = fs.statSync(dir).mtime } catch { continue }
+          if (mtime.getTime() < cutoff) victims.push({ dir, lastWrite: mtime })
+          void label
+        }
+      }
+      if (victims.length === 0) return textResult(`Nothing older than ${days} day(s) to reap${skippedLive.length > 0 ? ` (${skippedLive.length} dir(s) skipped: live session or chrome.exe still running)` : ''}.`)
+      if (dry_run !== false) {
+        return textResult([
+          `DRY RUN — ${victims.length} profile dir(s) older than ${days} day(s) would be DELETED (call again with dry_run:false):`,
+          ...victims.slice(0, 40).map(v => `  ${v.lastWrite.toISOString().slice(0, 10)}  ${v.dir}`),
+          ...(victims.length > 40 ? [`  … +${victims.length - 40} more`] : []),
+        ].join('\n'), true)
+      }
+      let deleted = 0
+      const errors: string[] = []
+      for (const victim of victims) {
+        try { fs.rmSync(victim.dir, { recursive: true, force: true }); deleted++ } catch (error) { errors.push(`${victim.dir}: ${error instanceof Error ? error.message : String(error)}`) }
+      }
+      return textResult(`Reaped ${deleted}/${victims.length} profile dir(s) older than ${days} day(s)${skippedLive.length > 0 ? `; skipped ${skippedLive.length} live dir(s)` : ''}.${errors.length > 0 ? `\n${errors.slice(0, 5).join('\n')}` : ''}`)
+    })
+
+  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser (launched or CDP-attached; run-8 §5). Run-39 §12.5: rows are split into LANE-CONTROLLABLE (document/xhr/fetch — the types our tools initiate; these are the real violations) and PAGE PLUMBING (stylesheets/scripts/images/fonts the page itself loads — gstatic, recaptcha, CDNs; counted and shown, but they are NOT actionable and never mean "stop the lane"). `summary:true` returns counts by host instead of full rows.',
+    {
+      ...OWNER_FIELD,
+      summary: z.boolean().optional().describe('Counts by host + top examples instead of full rows'),
+    },
+    async ({ owner, summary }: any) => {
       const { session } = sessionOf(env, owner)
       const rows = session.scopeViolations
       if (rows.length === 0) return textResult(`No out-of-scope TRAFFIC observed from "${session.owner}" — this lists only requests that actually left the browser (a scope-DENIED navigation never leaves, so it never appears here; denied attempts are in scope_audit).`, true)
+      const actionable = rows.filter(row => !isPagePlumbing(row.resourceType))
+      const plumbing = rows.filter(row => isPagePlumbing(row.resourceType))
+      const head = actionable.length > 0
+        ? `${actionable.length} LANE-CONTROLLABLE out-of-scope request(s) from "${session.owner}" (audited; STOP the lane and fix the scope)${plumbing.length > 0 ? ` + ${plumbing.length} page-plumbing request(s) (not actionable — the page loaded them itself)` : ''}:`
+        : `${plumbing.length} page-plumbing request(s) from "${session.owner}" — the page loaded these itself (gstatic/recaptcha/CDN assets); NOTHING is lane-controllable, do NOT stop the lane. (Run-39 §12.5: this used to read as a 100-row STOP banner.)`
+      if (summary === true) {
+        const byHost = new Map<string, number>()
+        for (const row of rows) {
+          try { const host = new URL(row.url).host; byHost.set(host, (byHost.get(host) ?? 0) + 1) } catch { /* keep going */ }
+        }
+        return textResult([
+          head,
+          'counts by host:',
+          ...[...byHost.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([host, count]) => `  ${String(count).padStart(4)}  ${host}${isPagePlumbing(rows.find(row => { try { return new URL(row.url).host === host } catch { return false } })?.resourceType) ? '  (plumbing)' : ''}`),
+        ].join('\n'), actionable.length > 0)
+      }
       return textResult([
-        `${rows.length} out-of-scope request(s) from "${session.owner}" (audited; STOP the lane and fix the scope):`,
-        ...rows.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`),
-      ].join('\n'), true)
+        head,
+        ...(actionable.length > 0 ? actionable.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`) : []),
+        ...(plumbing.length > 0 ? [`page plumbing (last ${Math.min(plumbing.length, 10)}, NOT counted):`, ...plumbing.slice(-10).map(row => `  ${row.method} ${row.url.slice(0, 120)}`)] : []),
+      ].join('\n'), actionable.length > 0)
     })
 
   t('browser_reset', 'Close ONE owner\'s browser session — by default ONLY the caller named in `owner` (run-7 P1-6: a lane\'s end-of-run reset used to close every owner window mid-block). Closing other owners\' sessions requires `all: true` and is refused while those owners hold tab leases; `keep` names owners to spare (default ["shared"]).',

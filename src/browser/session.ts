@@ -75,6 +75,21 @@ export interface NetworkCapture extends NetworkRecord {
 const CONSOLE_RING = 300
 const NET_RING = 200
 
+/** Resource types a PAGE loads by itself when it renders (run-39 §12.5): a
+ *  login page pulling gstatic/recaptcha/fonts/typekit showed up as 83-100
+ *  "out-of-scope violations" the lane could not act on. These are counted as
+ *  page PLUMBING, never against the STOP threshold — only document/xhr/fetch
+ *  (the types our tools can initiate) count. Undefined = unknown → count it
+ *  (fail safe). Pure; tested. */
+const PAGE_PLUMBING_TYPES = new Set([
+  'stylesheet', 'script', 'image', 'font', 'media', 'manifest', 'eventsource',
+  'websocket', 'other', 'prefetch', 'ping', 'csp-report', 'timing', 'early-hints',
+])
+export function isPagePlumbing(resourceType: string | undefined): boolean {
+  if (resourceType === undefined || resourceType === '') return false
+  return PAGE_PLUMBING_TYPES.has(resourceType)
+}
+
 /** Owner info-label persistence (DST-Comet P3, build-session advice): labels
  *  were in-memory only, so a browser_reset or server restart brought the
  *  window back as "no job set". They now live in `<rootDir>/owner-labels.json`
@@ -133,6 +148,13 @@ export interface SessionSnapshot {
    *  the number drawn on the taskbar icon's overlay — absent for attached
    *  sessions (the human's own browser), the shared session and headless. */
   taskbarBadge?: number
+  /** Profile dir of an ATTACHED browser, resolved from its process at attach
+   *  time (run-39 §11.2 — the map and cross-owner guard need to see WHICH
+   *  window was adopted, not just the port). */
+  adoptedProfileDir?: string
+  /** RAM-guard warning set by the sweeper (run-39 RAM round); cleared when
+   *  the chrome tree falls back under the threshold. */
+  ramWarning?: string
   selected: number | null
   tabs: Array<{ index: number; id: number; title: string; url: string; openedBy: string; purpose?: string; leasedBy?: string; infoTab?: boolean }>
 }
@@ -248,10 +270,19 @@ export class BrowserSession {
   plainPid?: number
   /** Attach-mode traffic audit (run-8 §5): set by the attach tool so every
    *  request an adopted browser makes is scope-checked — the guard becomes a
-   *  property of what goes out, not how the browser was launched. */
-  networkObserver?: (method: string, url: string) => void
+   *  property of what goes out, not how the browser was launched. The
+   *  resourceType feeds the page-plumbing classification (run-39 §12.5). */
+  networkObserver?: (method: string, url: string, resourceType?: string) => void
   /** Out-of-scope requests observed from this session (audit lines). */
-  scopeViolations: Array<{ ts: string; method: string; url: string; reason: string }> = []
+  scopeViolations: Array<{ ts: string; method: string; url: string; reason: string, resourceType?: string }> = []
+  /** Profile dir of an ATTACHED browser, resolved from the browser process at
+   *  attach time (run-39 §11.2 — the map and the cross-owner guard must see
+   *  WHICH window was adopted, not just the port). */
+  adoptedProfileDir?: string
+  /** Set by the sweeper's RAM guard (run-39 RAM round): non-empty means this
+   *  session's chrome.exe tree crossed the RAM threshold. Surfaced on
+   *  browser_map/browser_tabs so the Lead sees hogs without Task Manager. */
+  ramWarning?: string
   /** Taskbar badge number (user ask 2026-11-10): allocated on every LAUNCH of
    *  an owner window, freed on close, drawn on the taskbar icon as an overlay
    *  so the human can tell the lanes' Chromes apart at a glance. */
@@ -322,7 +353,7 @@ export class BrowserSession {
     })
     this.plainPid = spawned.pid
     const version = await waitForCdp(port, 20_000)
-    bindCdpEndpoint(port, this.owner, version.browserGuid)
+    bindCdpEndpoint(port, this.owner, { browserGuid: version.browserGuid, pid: spawned.pid })
     this.plainPort = port
     this.cdpUrl = `http://127.0.0.1:${port}`
     const browser = await chromium.connectOverCDP(this.cdpUrl, { timeout: 15_000 })
@@ -395,7 +426,7 @@ export class BrowserSession {
     context.on('request', request => {
       this.network.push({ method: request.method(), url: request.url(), resourceType: request.resourceType() })
       if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
-      try { this.networkObserver?.(request.method(), request.url()) } catch { /* audit never breaks traffic */ }
+      try { this.networkObserver?.(request.method(), request.url(), request.resourceType()) } catch { /* audit never breaks traffic */ }
     })
     context.on('response', response => {
       this.network.push({ method: response.request().method(), url: response.url(), status: response.status() })
@@ -454,6 +485,13 @@ export class BrowserSession {
       '--hide-crash-restore-bubble',
       '--no-first-run',
       '--no-default-browser-check',
+      // Run-39 §12.2 (measured, 4 lanes): a playwright-core launch reports
+      // navigator.webdriver=TRUE even without --enable-automation — the flag
+      // comes from the AutomationControlled blink feature. THIS switch is the
+      // one that flips it to false (A/B/C probe 2026-11-12: default true,
+      // ignoreDefaultArgs alone still true, this arg false). Only the
+      // launchNoAutomationFlag ("normal-looking window") path wants it.
+      ...(this.launchNoAutomationFlag ? ['--disable-blink-features=AutomationControlled'] : []),
       ...(this.config.windowPosition !== undefined
         ? [`--window-position=${cascadeWindowPosition(this.config.windowPosition, this.owner)}`]
         : []),
@@ -742,6 +780,8 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
       plainOwned: this.plainOwned,
       ...(this.plainPort === undefined ? {} : { plainPort: this.plainPort }),
       ...(this.plainPid === undefined ? {} : { plainPid: this.plainPid }),
+      ...(this.adoptedProfileDir === undefined ? {} : { adoptedProfileDir: this.adoptedProfileDir }),
+      ...(this.ramWarning === undefined ? {} : { ramWarning: this.ramWarning }),
       userDir: this.userDir,
       windowLabel: this.attached
         ? `attached over CDP (${this.cdpUrl ?? '?'}) — closing only disconnects, never closes the human's browser`
@@ -760,7 +800,10 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     return dir
   }
 
-  async close(): Promise<void> {
+  /** How many stray chrome.exe processes an exact-match profile sweep reaped
+   *  on the last close (run-39 §12.8: 20-30 zombie renderers survived kills
+   *  because the sweep only ran when the MAIN pid was still alive). */
+  async close(): Promise<{ reaped: number }> {
     // Free the badge SYNCHRONOUSLY and first: launchFor() replaces a
     // session with `void close()` (not awaited), so a later free could race
     // the new session's allocation and hand the same number to two windows.
@@ -769,6 +812,7 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
       this.taskbarBadge = undefined
     }
     this.badgeWindows = 0
+    this.ramWarning = undefined
     const context = this.context
     this.context = undefined
     this.tabs.clear()
@@ -783,7 +827,6 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
       const browser = this.attachedBrowser
       this.attachedBrowser = undefined
       this.plainOwned = false
-      const pid = this.plainPid
       const userDir = this.userDir
       const port = this.plainPort
       this.plainPid = undefined
@@ -796,21 +839,29 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
           await new Promise(resolve => setTimeout(resolve, 2500))
         }
       } catch { /* fall through to the exact kill */ }
-      if (pid !== undefined && await pidAlive(pid)) {
-        await killChromeByProfile(userDir)
-      }
+      // Run-39 §12.8: sweep UNCONDITIONALLY, not only when the main pid
+      // survived — the main dying first is exactly how orphaned renderer and
+      // utility children outlive the kill. The sweep is exact-path and
+      // idempotent, so it is free when nothing is left.
+      const reaped = await killChromeByProfile(userDir)
       if (browser) { try { await browser.close() } catch { /* already gone */ } }
-      return
+      return { reaped }
     }
     if (this.attached) {
       // An attached browser belongs to the human: closing only DISCONNECTS.
       const browser = this.attachedBrowser
       this.attachedBrowser = undefined
       this.attached = false
+      this.adoptedProfileDir = undefined
       if (browser) { try { await browser.close() } catch { /* already gone */ } }
-      return
+      return { reaped: 0 }
     }
+    // Playwright-launched (owner or explicit-dir) session: context.close()
+    // reaps the tree, but the same unconditional exact-match sweep catches
+    // anything Chrome left behind (run-39 §12.8).
     if (context) { try { await context.close() } catch { /* already gone */ } }
+    const reaped = this.owner === SHARED_OWNER ? 0 : await killChromeByProfile(this.userDir)
+    return { reaped }
   }
 
   /** Tab leases held in this session (any holder) — reset safety (P1-6). */
