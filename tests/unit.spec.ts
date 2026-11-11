@@ -2346,3 +2346,50 @@ test('repo_commit: a git-mv rename commits from the NEW path alone (#4)', async 
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── plain-launch round (2026-11-11): D2 bindings, challenge detection ──────
+
+test('plain-launch: bindCdpEndpoint refuses another owner, accepts rebind (advice D2)', async () => {
+  const { bindCdpEndpoint, releaseCdpBinding, cdpEndpointOwner } = await import('../src/browser/plain-launch.js')
+  const port = 40000 + Math.floor(Math.random() * 20000)
+  bindCdpEndpoint(port, 'lane-a', 'guid-1')
+  assert.throws(() => bindCdpEndpoint(port, 'lane-b'), /owned by "lane-a"/)
+  // same owner rebinds (relaunch on the same port)
+  bindCdpEndpoint(port, 'lane-a', 'guid-2')
+  assert.equal(cdpEndpointOwner(`http://127.0.0.1:${port}`).owner, 'lane-a')
+  releaseCdpBinding(port)
+  // released endpoint is free again
+  bindCdpEndpoint(port, 'lane-c')
+  releaseCdpBinding(port)
+})
+
+test('plain-launch: detectChallenge classifies CF managed vs interactive vs captcha (StarCodex markers)', async () => {
+  const { detectChallenge } = await import('../src/browser/plain-launch.js')
+  const managed = detectChallenge('Just a moment...', '<body>checking your browser<span>challenge-platform</span></body>')
+  assert.equal(managed?.kind, 'cloudflare-managed')
+  const interactive = detectChallenge('Attention Required! | Cloudflare', 'please verify you are human (turnstile)')
+  assert.equal(interactive?.kind, 'cloudflare-interactive')
+  const recaptcha = detectChallenge('Sign up', '<div class="g-recaptcha" data-sitekey="x"></div>')
+  assert.equal(recaptcha?.kind, 'recaptcha')
+  const empty403 = detectChallenge('', '', 403)
+  assert.equal(empty403?.kind, 'cloudflare-managed')
+  const clean = detectChallenge('Dashboard - Bugcrowd', 'welcome back, here is your data')
+  assert.equal(clean, undefined)
+})
+
+test('plain-launch: warm profile dir is stable per owner, fresh is unique', async () => {
+  const { plainProfileDir } = await import('../src/browser/plain-launch.js')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'plainprof-'))
+  try {
+    const warmA = plainProfileDir(root, 'w-klaviyo', false)
+    const warmA2 = plainProfileDir(root, 'w-klaviyo', false)
+    assert.equal(warmA, warmA2)
+    assert.ok(warmA.includes(path.join('plain-w-klaviyo')))
+    const freshA = plainProfileDir(root, 'w-klaviyo', true)
+    const freshB = plainProfileDir(root, 'w-klaviyo', true)
+    assert.notEqual(freshA, freshB)
+    assert.ok(freshA.includes('constellation-plain-w-klaviyo-'))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

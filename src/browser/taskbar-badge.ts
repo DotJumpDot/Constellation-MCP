@@ -246,7 +246,17 @@ export function ensureBadgeIcon(rootDir: string, badge: number): string {
  *  application — same rules as the focus guard: no backticks anywhere, only
  *  ' needs doubling inside PS single-quoted strings, backslashes stay raw
  *  (doubling them corrupts the path needle — proven against a live chrome.exe
- *  command line). */
+ *  command line).
+ *
+ *  Taskbar identity (2026-11-11, user report "badge applied but the taskbar
+ *  still shows the plain Chrome icon"): every chrome.exe window shares
+ *  Chrome's AppUserModelID, so Constellation's windows GROUP with the human's
+ *  own Chrome into one taskbar button — SetOverlayIcon returns S_OK but the
+ *  group button shows only the active window's state and the badge drowns.
+ *  Fix: before badging, give each matched window its own AUMID
+ *  (DotJumpDot.ConstellationMCP.ChromeN<n>, unique per badge number) via the
+ *  window property store, so each lane Chrome gets its own taskbar button
+ *  with the number on it. */
 const TASKBAR_BADGE_PS = `
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type @"
@@ -260,6 +270,7 @@ public static class TB {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadImage(IntPtr hInst, string name, uint type, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
   [StructLayout(LayoutKind.Sequential)] public struct THUMBBUTTON { public uint dwMask; public uint iId; public uint iBitmap; public IntPtr hIcon; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szTip; public uint dwFlags; }
   [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   public interface ITaskbarList3 {
@@ -272,7 +283,7 @@ public static class TB {
     void SetProgressValue(IntPtr hWnd, ulong ullCompleted, ulong ullTotal);
     void SetProgressState(IntPtr hWnd, int tbpFlags);
     void RegisterTab(IntPtr hwndTab, IntPtr hwndMDI);
-    void UnregisterTab(IntPtr hwndTab);
+    void UnregisterTab(IntPtr hwndTab, IntPtr hwndMDI);
     void SetTabOrder(IntPtr hwndTab, IntPtr hwndInsertBefore);
     void SetTabActive(IntPtr hwndTab, IntPtr hwndMDI, uint dwReserved);
     void ThumbBarAddButtons(IntPtr hWnd, uint cButtons, ref THUMBBUTTON pButtons);
@@ -280,14 +291,29 @@ public static class TB {
     void ThumbBarSetImageList(IntPtr hWnd, IntPtr himl);
     void SetOverlayIcon(IntPtr hWnd, IntPtr hIcon, [MarshalAs(UnmanagedType.LPWStr)] string pszDescription);
   }
+  [StructLayout(LayoutKind.Sequential)] public struct PROPERTYKEY { public Guid fmtid; public int pid; }
+  [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IPropertyStore {
+    void GetCount(out uint cProps);
+    void GetAt(uint iProp, out PROPERTYKEY pkey);
+    void GetValue(ref PROPERTYKEY key, out object value);
+    void SetValue(ref PROPERTYKEY key, ref object value);
+    void Commit();
+  }
+  [DllImport("shell32.dll", PreserveSig=false)] public static extern void SHGetPropertyStoreForWindow(IntPtr hwnd, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore ppv);
   [DllImport("ole32.dll", PreserveSig=false)] public static extern void CoCreateInstance([In] ref Guid rclsid, IntPtr pUnkOuter, uint dwClsContext, [In] ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out ITaskbarList3 ppv);
-  public static int Badge(uint[] pids, string icoPath, string desc) {
+  public static int Badge(uint[] pids, string icoPath, string desc, string aumid) {
     Guid clsid = new Guid("56FDF344-FD6D-11d0-958A-006097C9A090");
     Guid iid = new Guid("56FDF342-FD6D-11d0-958A-006097C9A090");
+    Guid psIid = new Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99");
+    PROPERTYKEY aumidKey;
+    aumidKey.fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+    aumidKey.pid = 5;
     ITaskbarList3 tb;
     CoCreateInstance(ref clsid, IntPtr.Zero, 1, ref iid, out tb);
     tb.HrInit();
     IntPtr hIcon = LoadImage(IntPtr.Zero, icoPath, 1, 32, 32, 0x10);
+    IntPtr hIconSmall = LoadImage(IntPtr.Zero, icoPath, 1, 16, 16, 0x10);
     if (hIcon == IntPtr.Zero) return -1;
     int count = 0;
     EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
@@ -297,7 +323,25 @@ public static class TB {
       StringBuilder sb = new StringBuilder(64);
       GetClassName(hWnd, sb, 64);
       if (sb.ToString() != "Chrome_WidgetWin_1") return true;
-      try { tb.SetOverlayIcon(hWnd, hIcon, desc); count++; } catch {}
+      try {
+        if (aumid != null && aumid.Length > 0) {
+          IPropertyStore ps;
+          SHGetPropertyStoreForWindow(hWnd, ref psIid, out ps);
+          object val = aumid;
+          ps.SetValue(ref aumidKey, ref val);
+          ps.Commit();
+          Marshal.ReleaseComObject(ps);
+        }
+        // WM_SETICON first (live-verified 2026-11-11 with the user: this
+        // Windows 11 build never paints foreign-process overlays, but it
+        // renders a replaced window icon immediately — the button BECOMES
+        // the number). ICON_SMALL then ICON_BIG; the 32px PNG ico works,
+        // a BMP-format ico did NOT render in the same A/B test.
+        PostMessage(hWnd, 0x0080, (IntPtr)1, hIconSmall);
+        PostMessage(hWnd, 0x0080, (IntPtr)0, hIcon);
+        tb.SetOverlayIcon(hWnd, hIcon, desc);
+        count++;
+      } catch {}
       return true;
     }, IntPtr.Zero);
     return count;
@@ -315,7 +359,7 @@ while ((Get-Date) -lt $deadline -and $badged -le 0) {
     Where-Object { $_.CommandLine -ne $null -and $_.CommandLine.IndexOf($udd, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
     ForEach-Object { [uint32]$_.ProcessId })
   if ($chromePids.Count -gt 0) {
-    $badged = [TB]::Badge($chromePids, $ico, ("Chrome taskbar badge " + $n))
+    $badged = [TB]::Badge($chromePids, $ico, ("Chrome taskbar badge " + $n), ("DotJumpDot.ConstellationMCP.ChromeN" + $n))
     if ($badged -gt 0) { break }
   }
   Start-Sleep -Milliseconds 500

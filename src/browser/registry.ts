@@ -31,6 +31,12 @@ export class OwnerRegistry {
     return session
   }
 
+  /** The owner's live session, if any (browser_kill and map state lines:
+   * never fabricates one). */
+  sessionIfExists(owner: string): BrowserSession | undefined {
+    return this.sessions.get(owner)
+  }
+
   /** Attach mode (run-7 P0-2): adopt a running browser over CDP as an owner
    *  session. Re-attaching an owner replaces its previous session. */
   attachFor(owner: string, cdpUrl: string): BrowserSession {
@@ -49,6 +55,22 @@ export class OwnerRegistry {
     const session = new BrowserSession(owner, userDir, this.config)
     if (extraArgs !== undefined && extraArgs.length > 0) session.launchExtraArgs = extraArgs
     session.launchNoAutomationFlag = true
+    this.sessions.set(owner, session)
+    return session
+  }
+
+  /** Plain launch (advice D12, 2026-11-11): spawn our own chrome.exe (no
+   *  automation flags — the only route measured to pass Cloudflare-class
+   *  edges), no-activate, free debug port, adopted over CDP and owned by the
+   *  harness (label, badge, graceful close). Idempotent: a live plain session
+   *  for the owner is returned as-is instead of relaunching. */
+  plainFor(owner: string, userDir: string, extraArgs?: string[]): BrowserSession {
+    const existing = this.sessions.get(owner)
+    if (existing !== undefined && existing.plainOwned && existing.userDir === userDir) return existing
+    void existing?.close().catch(() => undefined)
+    const session = new BrowserSession(owner, userDir, this.config)
+    if (extraArgs !== undefined && extraArgs.length > 0) session.launchExtraArgs = extraArgs
+    session.plainOwned = true
     this.sessions.set(owner, session)
     return session
   }

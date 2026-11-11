@@ -3,8 +3,18 @@ import { errorResult, textResult, type ToolResult, type ToolRegistrar } from '..
 import type { ScopeGuard } from '../scope.js'
 
 /** The agent-facing arm of the scope guard: scope_set arms a rule (optionally
- *  per owner/lane — a 10-lane run spans 10 engagements), scope_get prints it,
- *  scope_clear drops stale rules, scope_audit replays the allow/deny log. */
+ * per owner/lane — a 10-lane run spans 10 engagements), scope_get prints it,
+ * scope_clear drops stale rules, scope_audit replays the allow/deny log. */
+
+/** Owner-name list trimmed for tool output (2026-11-11 token round): the run-33
+ *  export measured the full per-owner list at ~2.9 KB × ~70 calls per session
+ *  ≈ 200 KB of transcript context that named nothing actionable. First 8 + a
+ *  count. */
+function trimOwners(perOwners: string[]): string {
+  if (perOwners.length <= 8) return perOwners.join(', ')
+  return `${perOwners.slice(0, 8).join(', ')} … +${perOwners.length - 8} more`
+}
+
 export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, requireScope: boolean): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
@@ -39,14 +49,14 @@ export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, req
       if (rule === null) {
         const perOwners = scope.owners()
         return textResult(requireScope
-          ? `scope: LOCKED — no scope set and CONSTELLATION_REQUIRE_SCOPE=1, so every non-local request is denied. Call scope_set first.${perOwners.length > 0 ? ` (per-owner rules exist for: ${perOwners.join(', ')})` : ''}`
-          : `scope: UNRESTRICTED (no scope set — call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules exist for: ${perOwners.join(', ')}` : ''}`)
+          ? `scope: LOCKED — no scope set and CONSTELLATION_REQUIRE_SCOPE=1, so every non-local request is denied. Call scope_set first.${perOwners.length > 0 ? ` (per-owner rules exist for: ${trimOwners(perOwners)})` : ''}`
+          : `scope: UNRESTRICTED (no scope set — call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules exist for: ${trimOwners(perOwners)}` : ''}`)
       }
       return textResult([
         `scope: ${rule.engagement}${mine && owner !== undefined ? ` (owner "${owner}")` : owner !== undefined ? ` (no owner rule for "${owner}" — showing the global fallback)` : ''}`,
         `in_scope:  ${rule.in_scope.join(', ')}`,
         `out_scope: ${rule.out_scope.join(', ') || '∅'}`,
-        ...(scope.owners().length > 0 ? [`per-owner rules: ${scope.owners().join(', ')}`] : []),
+        ...(scope.owners().length > 0 ? [`per-owner rules: ${trimOwners(scope.owners())}`] : []),
       ].join('\n'))
     })
 
@@ -56,7 +66,7 @@ export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, req
       scope.clear(owner)
       return textResult(owner === undefined
         ? 'scope CLEARED (global + all per-owner rules). Requests are unrestricted again (unless CONSTELLATION_REQUIRE_SCOPE=1).'
-        : `scope CLEARED for owner "${owner}". Remaining per-owner rules: ${scope.owners().join(', ') || '∅'}.`)
+        : `scope CLEARED for owner "${owner}". Remaining per-owner rules: ${trimOwners(scope.owners()) || '∅'}.`)
     })
 
   t('scope_audit', 'Replay the scope decision log (newest first): every allowed/denied request with owner, tool, host, reason.',

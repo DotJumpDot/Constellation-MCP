@@ -9,6 +9,10 @@ import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
 import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, type BrowserSession } from './session.js'
+import {
+  detectChallenge, challengeAdvice, killChromeByProfile, plainProfileDir, cdpEndpointOwner,
+  type ChallengeDetection,
+} from './plain-launch.js'
 import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
@@ -22,6 +26,48 @@ export interface ToolEnv {
 }
 
 export type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
+
+/** Owner-name list trimmed for tool output (2026-11-11 token round): the
+ *  live run carries 100+ per-owner scope rules and EVERY browser_map printed
+ *  all of them — ~2.9 KB per call, ~70 calls per session ≈ 200 KB of context
+ *  that named nothing the caller can act on. First 8 + a count. */
+function trimOwnerNames(perOwners: string[]): string {
+  if (perOwners.length <= 8) return perOwners.join(', ')
+  return `${perOwners.slice(0, 8).join(', ')} … +${perOwners.length - 8} more (scope_get {owner:"<name>"} sees one owner's rule)`
+}
+
+/** An error thrown by EVALUATED user code (browser_run_code_unsafe /
+ *  browser_evaluate): keep the first lines (the error + the user's own
+ *  frame), drop the long Node/CDP tail. 2026-11-11: a raw URIError stack ran
+ *  10 playwright-core frames into the transcript. */
+function trimUserCodeError(error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  const lines = error.message.split('\n')
+  if (lines.length <= 3) return error
+  const trimmed = new Error(`${lines.slice(0, 3).join('\n')}\n(${lines.length - 3} stack line(s) trimmed — raised by the evaluated code; check its inputs, e.g. decodeURIComponent on malformed input)`)
+  trimmed.name = error.name
+  return trimmed
+}
+
+/** Classify the current page as a bot-challenge interstitial (cheap: title +
+ *  visible text head + a document markup slice, no snapshot). Best effort —
+ *  a page that cannot be read simply reports no challenge. */
+async function detectChallengeOnPage(page: Page, status?: number): Promise<ChallengeDetection | undefined> {
+  try {
+    const title = await page.title().catch(() => '')
+    const sample = (await page.evaluate(() => {
+      const doc: { querySelectorAll(selector: string): any[] } = document
+      const text: string = document.body?.innerText ?? ''
+      const srcs: string[] = []
+      for (const el of doc.querySelectorAll('script')) srcs.push(String((el as { src?: unknown }).src ?? ''))
+      for (const el of doc.querySelectorAll('iframe')) srcs.push(String((el as { src?: unknown }).src ?? ''))
+      return `${text.slice(0, 2_000)}\n${srcs.join(' ').slice(0, 2_000)}`
+    }).catch(() => '')) as string
+    return detectChallenge(title, sample, status)
+  } catch {
+    return undefined
+  }
+}
 
 export function textResult(text: string, isError = false): ToolResult {
   return { content: [{ type: 'text', text }], ...(isError ? { isError: true } : {}) }
@@ -380,7 +426,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       }
     })
 
-  t('browser_navigate', 'Navigate the owner\'s current tab to a URL and return the accessibility snapshot. Scope-guarded.',
+  t('browser_navigate', 'Navigate the owner\'s current tab to a URL and return the accessibility snapshot. Scope-guarded. Detects bot-challenge interstitials (Cloudflare managed/interactive/Turnstile, reCAPTCHA, hCaptcha) and says what to do about them instead of returning a confusing empty page.',
     { url: z.string().describe('URL to navigate to'), ...OWNER_FIELD, ...TAB_FIELD },
     async ({ url, owner, tab }: any) => {
       const { session, owner: who } = sessionOf(env, owner)
@@ -390,9 +436,28 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         throw new Error('tab 0 is the ownership-label info tab — it stays on the owner label. Open your own tab first (browser_tabs new / tab_open).')
       env.scope.assert(url, who, 'browser_navigate')
       env.budget.spend(who)
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
       await assertLandedInScope(env, page, who, url, 'browser_navigate')
-      return textResult(await afterActionResult(page))
+      // Challenge interstitials (2026-11-11 round): classify before reporting
+      // — a lane that sees an "empty" page burns its budget flailing at
+      // selectors on a challenge frame. Managed Cloudflare challenges usually
+      // self-clear, so poll briefly (StarCodex pattern) before declaring it.
+      let detection = await detectChallengeOnPage(page, response?.status())
+      if (detection?.kind === 'cloudflare-managed') {
+        for (let probe = 0; probe < 8; probe += 1) {
+          await page.waitForTimeout(750)
+          const again = await detectChallengeOnPage(page)
+          if (again === undefined) { detection = undefined; break }
+          if (again.kind !== 'cloudflare-managed') { detection = again; break }
+        }
+      }
+      const body = await afterActionResult(page)
+      if (detection === undefined) return textResult(body)
+      return textResult([
+        `⚠ CHALLENGE (${detection.kind}) — markers: ${detection.markers.slice(0, 4).join(', ')}`,
+        `Advice: ${challengeAdvice(detection)}`,
+        '', body,
+      ].join('\n'), true)
     })
 
   t('browser_snapshot', 'Accessibility snapshot (YAML) of the owner\'s current tab. Password-field values are masked as •••••• — never paste credentials into automation fields you do not own.',
@@ -1188,8 +1253,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         }
       }
       const scopeLine = scopeRule === null
-        ? `scope: UNRESTRICTED (call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
-        : `scope${who === undefined ? '' : ` (${who})`}: ${scopeRule.engagement ?? '(unnamed)'} — in: ${scopeRule.in_scope.join(', ') || '∅'} — out: ${scopeRule.out_scope.join(', ') || '∅'}${perOwners.length > 0 ? `; per-owner rules: ${perOwners.join(', ')}` : ''}`
+        ? `scope: UNRESTRICTED (call scope_set before engaging a target)${perOwners.length > 0 ? `; per-owner rules: ${trimOwnerNames(perOwners)}` : ''}`
+        : `scope${who === undefined ? '' : ` (${who})`}: ${scopeRule.engagement ?? '(unnamed)'} — in: ${scopeRule.in_scope.join(', ') || '∅'} — out: ${scopeRule.out_scope.join(', ') || '∅'}${perOwners.length > 0 ? `; per-owner rules: ${trimOwnerNames(perOwners)}` : ''}`
       return textResult([...lines, '', scopeLine].join('\n'))
     })
 
@@ -1203,6 +1268,12 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (who === SHARED_OWNER) throw new Error('browser_attach needs a named owner — the shared session is a launched profile')
       if (!/^https?:\/\/127\.0\.0\.1:|^https?:\/\/localhost:/i.test(cdp_url))
         throw new Error('cdp_url must be a loopback endpoint (http://127.0.0.1:PORT or http://localhost:PORT)')
+      // Advice D2 (2026-11-11): two owners adopting the same endpoint
+      // cross-contaminated browsers — the worst failure this harness can
+      // produce. An endpoint this server bound to another owner is refused.
+      const binding = cdpEndpointOwner(cdp_url)
+      if (binding !== undefined && binding.owner !== who)
+        throw new Error(`cdp endpoint ${cdp_url} is bound to owner "${binding.owner}" since ${binding.since} — attaching as "${who}" would adopt their browser. Launch your own (browser_launch_plain allocates a free port) or pick another port.`)
       env.scope.audit(cdp_url, who, 'browser_attach', {
         allowed: true,
         reason: `adopting a running browser over CDP as owner "${who}"`,
@@ -1245,6 +1316,48 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const session = env.registry.launchFor(who, user_data_dir, extra_args)
       await session.ensure()
       return textResult(`Launched "${who}" on ${user_data_dir} (automation flag suppressed${extra_args !== undefined && extra_args.length > 0 ? `, args: ${extra_args.join(' ')}` : ''}). The window looks like a normal Chrome.${badgeNote(session)}`)
+    })
+
+  t('browser_launch_plain', 'Launch THIS owner\'s plain Chrome — the anti-bot route (advice D12 + Maki_Live/StarCodex research 2026-11-11). We spawn the installed chrome.exe ourselves with ZERO automation flags (no Playwright launch, navigator.webdriver stays false — the only route measured to pass Cloudflare/reCAPTCHA-class edges), the window NEVER steals your focus, the debug port is allocated for you (no port collisions), the profile is WARM by default (cookies incl. any solved cf_clearance persist across runs — clearance is bound to this machine+Chrome+IP and stays valid) and popups are suppressed (no save-password, no restore-pages). Idempotent: a live plain session for the owner is reused, a dead one relaunches on the same profile. Prefer this over hand-rolled Start-Process + browser_attach.',
+    {
+      owner: z.string().describe('Owner name for the window'),
+      purpose: z.string().optional().describe('Job label (shown in browser_map; same as browser_owner_info job)'),
+      profile: z.enum(['warm', 'fresh']).optional().describe('warm (default): persistent per-owner profile reused across runs; fresh: throwaway dir'),
+      extra_args: z.array(z.string()).optional().describe('Extra Chrome args'),
+    },
+    async ({ owner, purpose, profile, extra_args }: any) => {
+      const who = resolveOwner(owner)
+      if (who === SHARED_OWNER) throw new Error('browser_launch_plain needs a named owner — the shared session uses its own configured profile')
+      const userDir = plainProfileDir(env.config.profilesRoot, who, profile === 'fresh')
+      env.scope.audit(`launch-plain:${userDir}`, who, 'browser_launch_plain', {
+        allowed: true,
+        reason: `plain chrome.exe spawn (no automation flags, no-activate, warm profile)${profile === 'fresh' ? ' [fresh]' : ''}`,
+      })
+      const session = env.registry.plainFor(who, userDir, extra_args)
+      await session.ensure()
+      if (purpose !== undefined) session.infoJob = purpose
+      return textResult([
+        `Plain Chrome launched for "${who}" — cdp ${session.cdpUrl ?? '?'}${session.plainPid !== undefined ? `, pid ${session.plainPid}` : ''}, profile ${userDir} (${profile === 'fresh' ? 'fresh' : 'warm — reused across runs'}), window parked, focus untouched.`,
+        'navigator.webdriver is FALSE on this route; drive it with the normal browser_* tools.',
+        `Close with browser_kill {owner:"${who}"} (graceful — no restore-pages bubble next run).${badgeNote(session)}`,
+      ].join('\n'))
+    })
+
+  t('browser_kill', 'Kill THIS owner\'s plain/launched Chrome — FIRST gracefully (CDP Browser.close, so the profile records a clean exit and never shows the "Restore pages?" bubble), then by exact --user-data-dir match if grace fails (advice D11: never hand-roll a substring taskkill — a run-37 lane\'s "*mkt-36*" filter killed 61 pids including two siblings\' browsers). Also kills an orphaned Chrome whose profile dir matches the owner when no session is live.',
+    { ...OWNER_FIELD },
+    async ({ owner }: any) => {
+      const who = resolveOwner(owner)
+      if (who === SHARED_OWNER) throw new Error('browser_kill needs a named owner')
+      const existing = env.registry.sessionIfExists(who)
+      if (existing !== undefined) {
+        await env.registry.close(who)
+        return textResult(`Closed and killed "${who}"'s browser (graceful close; profile preserved at ${existing.userDir}).`)
+      }
+      const userDir = path.join(env.config.profilesRoot, `plain-${who}`)
+      const killed = await killChromeByProfile(userDir)
+      return textResult(killed > 0
+        ? `No live session for "${who}"; killed ${killed} orphaned chrome.exe process(es) whose --user-data-dir exactly matches ${userDir}.`
+        : `No live session and no orphaned Chrome for "${who}" (profile ${userDir}).`)
     })
 
   t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser (launched or CDP-attached; run-8 §5): the attach-mode audit keeps the scope guard a property of what goes out. Violations were already audited — this lists them so a lane can stop and re-scope.',
@@ -1389,7 +1502,11 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         ].join('\n'), true)
       }
       unsafeRuns.delete(who)
-      if (outcome.kind === 'error') throw outcome.error
+      // 2026-11-11: a throwing user expression surfaced its FULL Node+CDP
+      // stack (10+ playwright-core frames) into the transcript — token fat
+      // and the exact blob the torn-frame round saw ghosting across the TUI.
+      // Keep the informative head (the error + the user's own frame).
+      if (outcome.kind === 'error') throw trimUserCodeError(outcome.error)
       const sweptNote = outcome.swept.length === 0
         ? ''
         : `[harness] closed ${outcome.swept.length} extra browser context(s)/window(s) created by this code — use tabs in the owner context (browser_tabs new / tab_open), never a new browser context. Closed pages: ${JSON.stringify(outcome.swept)}\n`

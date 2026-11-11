@@ -7,6 +7,10 @@ import type { BrowserContext, Page, Request, Response } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { armFocusGuard, type FocusGuard } from './focus.js'
 import { badgePoolFor, ensureBadgeIcon, applyTaskbarBadge } from './taskbar-badge.js'
+import {
+  resolveChromeExecutable, allocateDebugPort, spawnPlainChrome, waitForCdp,
+  bindCdpEndpoint, releaseCdpBinding, pidAlive, killChromeByProfile,
+} from './plain-launch.js'
 
 const { chromium } = pwCore
 const exec = promisify(execFile)
@@ -116,6 +120,13 @@ export interface SessionSnapshot {
   running: boolean
   /** True when the browser was adopted over CDP instead of launched. */
   attached: boolean
+  /** True when we spawned chrome.exe ourselves and adopted it over CDP
+   *  (browser_launch_plain — we own it: label, badge, graceful close). */
+  plainOwned: boolean
+  /** The plain launch's debug port / browser pid (browser_map state lines,
+   *  advice D9/D11). */
+  plainPort?: number
+  plainPid?: number
   userDir: string
   windowLabel: string
   /** Taskbar badge number of a LAUNCHED owner window (user ask 2026-11-10):
@@ -228,6 +239,13 @@ export class BrowserSession {
    *  non-automation-flagged window. */
   launchExtraArgs?: string[]
   launchNoAutomationFlag = false
+  /** Plain-launch mode (advice D12, 2026-11-11): we spawned chrome.exe
+   *  ourselves with zero automation flags (the only route measured to pass
+   *  Cloudflare-class edges) and adopted it over CDP. We OWN the browser —
+   *  info tab, badge and a GRACEFUL close apply — unlike attach mode. */
+  plainOwned = false
+  plainPort?: number
+  plainPid?: number
   /** Attach-mode traffic audit (run-8 §5): set by the attach tool so every
    *  request an adopted browser makes is scope-checked — the guard becomes a
    *  property of what goes out, not how the browser was launched. */
@@ -275,9 +293,73 @@ export class BrowserSession {
       return this.context
     }
     if (!this.launching) {
-      this.launching = (this.attached ? this.connectOverCdp() : this.launch()).finally(() => { this.launching = undefined })
+      this.launching = (this.plainOwned
+        ? this.launchPlainAndAdopt()
+        : this.attached ? this.connectOverCdp() : this.launch()).finally(() => { this.launching = undefined })
     }
     return this.launching
+  }
+
+  /** Plain launch (advice D12): spawn our own chrome.exe — no automation
+   *  flags at all, no-activate so the human's focus never moves — then adopt
+   *  it over CDP. Everything the Playwright launch path grants (ownership
+   *  label, network audit, park, taskbar badge, info tab) applies, and close()
+   *  ends the browser GRACEFULLY (exit_type Normal — no "Restore pages?"
+   *  bubble next run; the Maki_Live finding). Idempotent: the registry reuses
+   *  a live session, and a dead one relaunches on the same warm profile. */
+  private async launchPlainAndAdopt(): Promise<BrowserContext> {
+    fs.mkdirSync(this.userDir, { recursive: true })
+    this.writeSuppressionPrefs()
+    const chromePath = resolveChromeExecutable()
+    const port = await allocateDebugPort()
+    const spawned = await spawnPlainChrome({
+      chromePath,
+      userDir: this.userDir,
+      port,
+      ...(this.config.windowPosition !== undefined
+        ? { windowPosition: cascadeWindowPosition(this.config.windowPosition, this.owner) }
+        : {}),
+    })
+    this.plainPid = spawned.pid
+    const version = await waitForCdp(port, 20_000)
+    bindCdpEndpoint(port, this.owner, version.browserGuid)
+    this.plainPort = port
+    this.cdpUrl = `http://127.0.0.1:${port}`
+    const browser = await chromium.connectOverCDP(this.cdpUrl, { timeout: 15_000 })
+    const context = browser.contexts()[0]
+    if (context === undefined) {
+      await browser.close().catch(() => undefined)
+      throw new Error(`plain Chrome on ${this.cdpUrl} exposes no browser context`)
+    }
+    this.attachedBrowser = browser
+    this.attached = false // we own this browser; label/badge/close all apply
+    const labelScript = this.labelScript()
+    if (labelScript !== '') await context.addInitScript(labelScript)
+    context.on('page', page => { this.registerPage(page, this.owner) })
+    this.wireNetwork(context)
+    for (const page of context.pages()) this.registerPage(page, this.owner)
+    this.context = context
+    if (!this.config.startMinimized) {
+      await this.parkWindow(context).catch(() => undefined)
+    }
+    if (!this.config.headless && this.owner !== SHARED_OWNER && this.taskbarBadge === undefined) {
+      const badge = badgePoolFor(this.config.rootDir).alloc()
+      if (badge !== undefined) this.taskbarBadge = badge
+    }
+    if (this.owner !== SHARED_OWNER) {
+      try { await this.openInfoTab() } catch { /* never block a launch on the label */ }
+      this.selected = null
+    }
+    if (this.taskbarBadge !== undefined) {
+      const applied = await applyTaskbarBadge({
+        userDir: this.userDir,
+        channel: this.config.channel,
+        icoPath: ensureBadgeIcon(this.config.rootDir, this.taskbarBadge),
+        badge: this.taskbarBadge,
+      }).catch(() => undefined)
+      this.badgeWindows = applied?.windows ?? 0
+    }
+    return context
   }
 
   /** Adopt a browser the human is already driving (run-7 P0-2). DBSC binds
@@ -657,10 +739,15 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
       owner: this.owner,
       running: this.context !== undefined,
       attached: this.attached,
+      plainOwned: this.plainOwned,
+      ...(this.plainPort === undefined ? {} : { plainPort: this.plainPort }),
+      ...(this.plainPid === undefined ? {} : { plainPid: this.plainPid }),
       userDir: this.userDir,
       windowLabel: this.attached
         ? `attached over CDP (${this.cdpUrl ?? '?'}) — closing only disconnects, never closes the human's browser`
-        : this.windowLabel === '' ? 'shared profile (no label prefix)' : `${this.windowLabel.trim()} window`,
+        : this.plainOwned
+          ? `plain Chrome (cdp ${this.cdpUrl ?? '?'}${this.plainPid !== undefined ? `, pid ${this.plainPid}` : ''}) — browser_kill closes it gracefully`
+          : this.windowLabel === '' ? 'shared profile (no label prefix)' : `${this.windowLabel.trim()} window`,
       ...(this.taskbarBadge === undefined ? {} : { taskbarBadge: this.taskbarBadge }),
       selected: this.selected,
       tabs,
@@ -674,7 +761,7 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
   }
 
   async close(): Promise<void> {
-    // Free the badge SYNCHRONONOUSLY and first: launchFor() replaces a
+    // Free the badge SYNCHRONOUSLY and first: launchFor() replaces a
     // session with `void close()` (not awaited), so a later free could race
     // the new session's allocation and hand the same number to two windows.
     if (this.taskbarBadge !== undefined) {
@@ -688,6 +775,33 @@ Window opened: ${esc(this.infoOpenedAt ?? new Date().toISOString())}</p>
     this.selected = null
     this.focusGuard?.stop()
     this.focusGuard = undefined
+    if (this.plainOwned) {
+      // We own this browser: close it GRACEFULLY (CDP Browser.close) so the
+      // profile records a clean exit — the "Restore pages?" bubble never
+      // appears on the next launch (imagef2 2026-11-11, Maki_Live finding).
+      // Exact-match kill is the fallback, never the first move.
+      const browser = this.attachedBrowser
+      this.attachedBrowser = undefined
+      this.plainOwned = false
+      const pid = this.plainPid
+      const userDir = this.userDir
+      const port = this.plainPort
+      this.plainPid = undefined
+      this.plainPort = undefined
+      if (port !== undefined) releaseCdpBinding(port)
+      try {
+        if (browser) {
+          const cdp = await browser.newBrowserCDPSession().catch(() => undefined)
+          if (cdp) await cdp.send('Browser.close').catch(() => undefined)
+          await new Promise(resolve => setTimeout(resolve, 2500))
+        }
+      } catch { /* fall through to the exact kill */ }
+      if (pid !== undefined && await pidAlive(pid)) {
+        await killChromeByProfile(userDir)
+      }
+      if (browser) { try { await browser.close() } catch { /* already gone */ } }
+      return
+    }
     if (this.attached) {
       // An attached browser belongs to the human: closing only DISCONNECTS.
       const browser = this.attachedBrowser
