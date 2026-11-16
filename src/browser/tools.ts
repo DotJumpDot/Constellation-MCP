@@ -15,7 +15,7 @@ import {
   chromeProcessCensus,
   type ChallengeDetection,
 } from './plain-launch.js'
-import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, partitionCookieRows, readProfileCookies } from './cookies.js'
+import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, normalizeHostInput, partitionCookieRows, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
 import { appendChainEntry } from '../tools/evidence.js'
@@ -752,7 +752,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           : 'Disarmed. Bodies are back to lazy best-effort (they die when the page navigates away).')
     })
 
-  t('browser_fetch', 'Fetch a URL INSIDE this owner\'s page context (run-42 §1: the guarded "session-fetch") — the request rides the page\'s own credential state (cookies, client certs, service-worker-visible identity) with NO token ever entering the transcript. This is the cookie-vs-BEARER mismatch tool: when http_request {browser:"owner"} comes back 401 because the host wants headers the browser session cannot supply out-of-page, this call is the same-origin answer. Boundaries, stated plainly: (1) it is subject to the PAGE\'s CORS rules — same-origin APIs just work, cross-origin APIs answer only if they send CORS headers; (2) a Bearer token the app injects via its own JS wrappers does NOT ride automatically — if the API needs one, capture the app\'s own call instead (browser_network_record before the click, then browser_network_bodies); (3) any header value you PASS here is in the transcript — pass nothing sensitive. Scope-asserted and budget-spent like every leg.',
+  t('browser_fetch', 'Fetch a URL INSIDE this owner\'s page context (run-42 §1: the guarded "session-fetch") — the request rides the page\'s own credential state (cookies, client certs, service-worker-visible identity) with NO token ever entering the transcript. This is the cookie-vs-BEARER mismatch tool: when http_request {browser:"owner"} comes back 401 because the host wants headers the browser session cannot supply out-of-page, this call is the same-origin answer. Boundaries, stated plainly: (1) it is subject to the PAGE\'s CORS rules — same-origin APIs just work, cross-origin APIs answer only if they send CORS headers; (2) a Bearer token the app injects via its own JS wrappers does NOT ride automatically — if the API needs one, capture the app\'s own call instead (browser_network_record before the click, then browser_network_bodies); (3) any header value you PASS here is in the transcript — pass nothing sensitive; (4) the INITIAL url is scope-asserted before the fetch leaves, but REDIRECTS follow the page\'s rules (not per-hop asserted like http_request) — the final URL is audited after the fact and an out-of-scope landing is flagged loudly in the result, never silently.',
     {
       url: z.string().describe('Absolute URL — scope-guarded'),
       method: z.string().optional().describe('HTTP method (default GET)'),
@@ -788,8 +788,18 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         return textResult(`in-page fetch FAILED (${timing} ms): ${result.error.slice(0, 300)}\nIf this is a CORS/type error, the page\'s origin is not allowed to read that API cross-origin — same-origin calls or CORS-enabled hosts only (check the tool description for the Bearer boundary).`, true)
       const bytes = Buffer.from(result.body, 'utf8')
       const sha = createHash('sha256').update(bytes).digest('hex')
+      // Redirects inside the page follow the PAGE's rules, so only the
+      // initial URL was assertable — audit where the chain actually LANDED
+      // and flag an out-of-scope landing loudly (verification round
+      // 2026-11-16: "scope-asserted like every leg" overstated this).
+      const landing = env.scope.check(result.url, who)
+      if (!landing.allowed)
+        env.scope.audit(result.url, who, 'browser_fetch(landing)', landing)
       const lines: string[] = [
         `HTTP ${result.status} ${result.statusText} — in-page fetch from ${page.url()} (${timing} ms; rode the page's own credentials)`,
+        ...(!landing.allowed
+          ? [`⚠ REDIRECT LEFT THE SCOPE: the chain landed on ${result.url} (${landing.reason}) — audited; the request already left, do NOT follow up out of scope. Re-arm scope_set if this host is legitimately part of the engagement.`]
+          : []),
         `content-type: ${result.headers['content-type'] ?? '(none)'}`,
         `body sha256: ${sha} — ${bytes.length} byte(s)`,
       ]
@@ -1186,7 +1196,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ].join('\n'))
     })
 
-  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session. `skip_bad_rows: true` (default since run-44 §8 — one malformed row used to abort the WHOLE import with "Invalid cookie fields") drops unimportable rows with a named reason instead; trivially fixable fields (empty sameSite, None-without-secure) are fixed in place and noted.',
+  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session. Bad rows are SKIPPED with named reasons by DEFAULT (run-44 §8: one malformed row used to abort the WHOLE import with "Invalid cookie fields"); trivially fixable fields (empty sameSite, None-without-secure) are fixed in place and noted; pass `strict: true` for the old abort-everything behaviour.',
     {
       owner: z.string().describe('Owner whose browser receives the cookies'),
       handoff_id: z.string().optional().describe('Handoff id from browser_cookies_export'),
@@ -1267,16 +1277,19 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
     async ({ owner, domain, digest_domains }: any) => {
       const { session } = sessionOf(env, owner)
       const context = await session.ensure()
-      const urls = domain === undefined ? undefined : [/^https?:\/\//i.test(domain) ? domain : `https://${domain}/`]
+      // Verification round 2026-11-16 #1: every caller-supplied domain goes
+      // through normalizeHostInput — scheme/port/path used to match nothing.
+      const wantedHost = domain === undefined ? undefined : normalizeHostInput(domain)
       const allCookies = (await context.cookies()) as unknown as Array<Record<string, unknown>>
-      const cookies = urls === undefined ? allCookies : allCookies.filter(c => cookieMatchesAnyDomain(String(c.domain), urls.map(u => u.replace(/^https?:\/\//i, '').replace(/\/$/, ''))))
+      const cookies = wantedHost === undefined || wantedHost === '' ? allCookies : allCookies.filter(c => cookieMatchesAnyDomain(String(c.domain), [wantedHost]))
       if (digest_domains !== undefined && digest_domains.length > 0) {
         // DBSC per-origin scan (same primitive as export warnings): a hit is
         // decisive, a miss is a hint. Only owned profiles have a readable
         // store; attached browsers say "unknown".
         const canScan = session.userDir !== undefined && !session.userDir.startsWith('(attached)')
         const lines: string[] = []
-        for (const wanted of digest_domains) {
+        for (const raw of digest_domains) {
+          const wanted = normalizeHostInput(raw)
           const jar = allCookies.filter(c => cookieMatchesAnyDomain(String(c.domain), [wanted]))
           const sessionCount = jar.filter(c => !(typeof c.expires === 'number' && c.expires > 0)).length
           const persistent = jar.length - sessionCount
@@ -1291,7 +1304,13 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           }
           lines.push(`${wanted}: ${jar.length} cookie(s) — ${sessionCount} session (die with the browser) · ${persistent} persistent (survive a crash on disk) — DBSC: ${dbsc}`)
         }
-        return textResult(['sessions digest:', ...lines, '', 'full preview (no values):', cookiePreview(cookies.length > 0 ? cookies : allCookies)].join('\n'))
+        // Preview follows the domain filter only — a digest alone does not
+        // dump the whole jar (unrelated domains stayed out of the transcript
+        // before; they still do).
+        return textResult([
+          'sessions digest:', ...lines, '',
+          ...(cookies.length > 0 ? ['full preview (no values):', cookiePreview(cookies)] : (wantedHost === undefined ? ['full preview (no values):', cookiePreview(allCookies)] : [`(no cookies match ${wantedHost} — the owner has no session for this domain)`])),
+        ].join('\n'))
       }
       if (cookies.length === 0) return textResult('(no cookies match — the owner has no session for this domain)')
       return textResult(cookiePreview(cookies))
@@ -1663,7 +1682,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Reaped ${deleted}/${victims.length} profile dir(s) older than ${days} day(s)${skippedLive.length > 0 ? `; skipped ${skippedLive.length} live dir(s)` : ''}.${errors.length > 0 ? `\n${errors.slice(0, 5).join('\n')}` : ''}`)
     })
 
-  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser — on EVERY route (launched, plain, or CDP-attached; the observer is wired at session creation, not per-handler). What is ENFORCED vs OBSERVED (V3, stated plainly): tool-level navigation and http_request are DENIED before leaving; page-initiated JS (in-page fetch/XHR/beacons) is OBSERVED and AUDITED but NOT blocked — the browser loads what the page loads. IMPORTANT (run-43 §1 + run-44 §3): every row here is PAGE-INITIATED (tool legs are asserted before leaving and never reach this list), so rows classify as PAGE-SCRIPT (the page\'s own app JS calling a host your scope does not cover — the fix is scope_set the host or navigate away, NOT stopping the lane), VENDOR-PLATFORM (app-framework plumbing: Atlassian Connect/API/cookie hosts, statuspage — NOT actionable), or PAGE PLUMBING (stylesheets/scripts/images/fonts — NOT actionable). This report is a normal RESULT, never an error — the error channel is reserved for tool failures (run-43 §2). `summary:true` returns counts by host.',
+  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser — on EVERY route (launched, plain, or CDP-attached; the observer is wired at session creation, not per-handler). What is ENFORCED vs OBSERVED (V3, stated plainly): tool-level navigation and http_request are DENIED before leaving; page-initiated JS (in-page fetch/XHR/beacons) is OBSERVED and AUDITED but NOT blocked — the browser loads what the page loads. IMPORTANT (run-43 §1 + run-44 §3): rows here are normally PAGE-INITIATED (tool legs are scope-asserted before leaving — per V4 a denied navigation may still leave ONCE before the tab reset — and denied attempts belong in scope_audit), so rows classify as PAGE-SCRIPT (the page\'s own app JS calling a host your scope does not cover — the fix is scope_set the host or navigate away, NOT stopping the lane), VENDOR-PLATFORM (app-framework plumbing: Atlassian Connect/API/cookie hosts, statuspage — NOT actionable), or PAGE PLUMBING (stylesheets/scripts/images/fonts — NOT actionable). This report is a normal RESULT, never an error — the error channel is reserved for tool failures (run-43 §2). `summary:true` returns counts by host.',
     {
       ...OWNER_FIELD,
       summary: z.boolean().optional().describe('Counts by host + class instead of full rows'),
@@ -1680,6 +1699,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         ? `${pageScript.length} out-of-scope PAGE-SCRIPT request(s) from "${session.owner}" — the page's own JS called hosts the scope does not cover. Decide: scope_set the host (it is part of the app) or navigate away. Do NOT stop the lane for this.`
         : `Nothing lane-driven is out of scope. Observed from "${session.owner}": ${platform.length} vendor-platform + ${plumbing.length} page-plumbing request(s) — all page-initiated plumbing, NOT actionable.`
       if (summary === true) {
+        // Host tag rank: a host with ANY page-script row reads page-script
+        // (the class a reader must act on), then platform, then plumbing —
+        // first-seen order used to let a platform row mask a page-script one.
+        const rankOf = (kind: ScopeRowClass): number => kind === 'page-script' ? 3 : kind === 'platform' ? 2 : 1
         const byHost = new Map<string, { count: number; kind: ScopeRowClass }>()
         for (const row of rows) {
           try {
@@ -1687,7 +1710,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
             const kind = classifyScopeRow(row)
             const slot = byHost.get(host)
             if (slot === undefined) byHost.set(host, { count: 1, kind })
-            else { slot.count += 1; if (slot.kind === 'plumbing' && kind !== 'plumbing') slot.kind = kind }
+            else { slot.count += 1; if (rankOf(kind) > rankOf(slot.kind)) slot.kind = kind }
           } catch { /* keep going */ }
         }
         return textResult([

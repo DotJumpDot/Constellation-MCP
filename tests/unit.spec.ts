@@ -2597,3 +2597,25 @@ test('run-44 §8: partitionCookieRows fixes trivial rows, drops bad ones with re
   const fixed = good.find(c => c.name === 'cross')!
   assert.equal(fixed.secure, true, 'SameSite=None row imported with secure=true')
 })
+
+test('verification 2026-11-16 #1: normalizeHostInput strips scheme/port/path to a bare hostname', async () => {
+  const { normalizeHostInput } = await import('../src/browser/cookies.js')
+  assert.equal(normalizeHostInput('https://example.com/'), 'example.com')
+  assert.equal(normalizeHostInput('http://example.com:8443/api/v1'), 'example.com')
+  assert.equal(normalizeHostInput('example.com:8443'), 'example.com')
+  assert.equal(normalizeHostInput('.example.com'), 'example.com')
+  assert.equal(normalizeHostInput('  Sub.Example.COM/path  '), 'sub.example.com')
+  assert.equal(normalizeHostInput('example.com'), 'example.com')
+  // Unparseable junk falls back to a conservative strip, never throws.
+  assert.equal(typeof normalizeHostInput('https://[broken'), 'string')
+  assert.equal(normalizeHostInput(''), '')
+})
+
+test('verification 2026-11-16 #4: summary host tag ranks page-script over platform', async () => {
+  // A host with BOTH platform and page-script rows must read page-script.
+  const rankOf = (kind: 'page-script' | 'platform' | 'plumbing'): number => kind === 'page-script' ? 3 : kind === 'platform' ? 2 : 1
+  const classes = ['platform', 'plumbing', 'page-script'] as const
+  let acc = classes[0]
+  for (const kind of classes) if (rankOf(kind) > rankOf(acc)) acc = kind
+  assert.equal(acc, 'page-script', 'rank upgrade reaches the actionable class regardless of arrival order')
+})

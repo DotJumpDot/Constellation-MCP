@@ -231,6 +231,26 @@ function mapSameSite(samesite: number | null | undefined, secure: boolean): Impo
   return undefined
 }
 
+/** Normalize a caller-supplied domain input to a bare lowercase hostname
+ *  (verification round 2026-11-16, defect #1: digest_domains/domain accepted
+ *  "https://host/path", "host:8443", ".host" verbatim — the domain matcher
+ *  and the DBSC store scan both compare bare hostnames, so anything with a
+ *  scheme/port/path silently matched NOTHING and read as "0 cookies, not
+ *  bound"). Pure; tested. */
+export function normalizeHostInput(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed === '') return ''
+  try {
+    // new URL keeps a leading dot (".example.com" is a legal hostname to it);
+    // cookie matching wants the bare host either way.
+    return new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`).hostname.toLowerCase().replace(/^\.+/, '')
+  } catch {
+    // Not URL-parseable even with a scheme prepended (bare IPv6 etc.) — fall
+    // back to a conservative strip: no scheme, no port, no path, no dots.
+    return trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0]!.split(':')[0]!.toLowerCase().replace(/^\.+/, '')
+  }
+}
+
 /** Partition imported cookie rows for browser_cookies_import (run-44 §8):
  *  Playwright's addCookies aborts the WHOLE batch on the first malformed row
  *  ("Invalid cookie fields"), so one stray row cost lanes a 3-failure tax and
