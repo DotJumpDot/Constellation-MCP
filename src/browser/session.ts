@@ -70,6 +70,11 @@ export interface NetworkCapture extends NetworkRecord {
   status: number
   request: Request
   response: Response
+  /** Eagerly materialized response body (run-42 §1.2, browser_network_record):
+   *  present when this response arrived while capture was armed — the lazy
+   *  handle dies on navigation, these bytes do not. */
+  bodyBytes?: Buffer
+  bodyError?: string
 }
 
 const CONSOLE_RING = 300
@@ -88,6 +93,40 @@ const PAGE_PLUMBING_TYPES = new Set([
 export function isPagePlumbing(resourceType: string | undefined): boolean {
   if (resourceType === undefined || resourceType === '') return false
   return PAGE_PLUMBING_TYPES.has(resourceType)
+}
+
+/** Vendor APP-PLATFORM hosts (run-43 §1, run-44 §3): a marketplace app's own
+ *  framework plumbing — Atlassian Connect iframes calling as/api/xp.atlassian.com,
+ *  per-install cdn.prod.atlassian-dev.net hosts, atlassian-cookies.*, statuspage —
+ *  is xhr/fetch from the PAGE's JS, so the type-based classifier called it
+ *  "lane-controllable" and a lane that did not know better stopped to "fix the
+ *  scope" 75 times in one dashboard load. Same treatment as page plumbing:
+ *  observed, audited, NEVER actionable. Extended per-run as new venues show
+ *  their platform hosts. Pure. */
+const VENDOR_PLATFORM_HOST_RE = [
+  /(^|\.)atlassian\.com$/,            // as./api./xp. — app-framework + tenant APIs
+  /(^|\.)atlassian-dev\.net$/,        // *.cdn.prod.atlassian-dev.net Connect iframes
+  /^atlassian-cookies\./,             // cookie-partition hosts
+  /(^|\.)statuspage\.io$/,            // status widget
+  /(^|\.)hCaptcha\.com$/i,            // hCaptcha framework (same family as challenges.cloudflare.com)
+]
+export function isVendorPlatformHost(url: string): boolean {
+  let host = url
+  try { host = new URL(url).hostname.toLowerCase() } catch { /* raw host string */ }
+  return VENDOR_PLATFORM_HOST_RE.some(re => re.test(host))
+}
+
+/** Three-way classification of an observed out-of-scope row (run-43 §1 +
+ *  run-44 §3): the page observer only ever sees PAGE-INITIATED traffic
+ *  (tool navigations are scope-asserted BEFORE leaving and tool http legs go
+ *  through context.request, which fires no page events) — so xhr/fetch rows
+ *  are the page's own JS, not lane-driven requests, and the old
+ *  "LANE-CONTROLLABLE" label was a misread waiting to happen. */
+export type ScopeRowClass = 'platform' | 'plumbing' | 'page-script'
+export function classifyScopeRow(row: { url: string; resourceType?: string }): ScopeRowClass {
+  if (isVendorPlatformHost(row.url)) return 'platform'
+  if (isPagePlumbing(row.resourceType)) return 'plumbing'
+  return 'page-script'
 }
 
 /** Owner info-label persistence (DST-Comet P3, build-session advice): labels
@@ -298,6 +337,12 @@ export class BrowserSession {
    *  per-owner unit counter budget advice §12.13 asked for: lanes read it
    *  on browser_map before each card instead of nothing counting for them. */
   requestCount = 0
+  /** Armed body capture (run-42 §1.2): > 0 = the next N responses get their
+   *  body materialized EAGERLY into the capture ring, so a navigation away
+   *  (which disposes Playwright's lazy body) cannot lose the decisive call.
+   *  browser_network_record arms/disarms; the counter self-drains. */
+  armedBodyCapture = 0
+  armedBy?: string
   /** Taskbar badge number (user ask 2026-11-10): allocated on every LAUNCH of
    *  an owner window, freed on close, drawn on the taskbar icon as an overlay
    *  so the human can tell the lanes' Chromes apart at a glance. */
@@ -449,14 +494,24 @@ export class BrowserSession {
       if (this.network.length > NET_RING) this.network.splice(0, this.network.length - NET_RING)
       // Keep the live handle (advice 2026-11-06 #1) — the ring holds the last
       // NET_RING responses of the session for lazy body retrieval.
-      this.netCaptures.push({
+      const capture: NetworkCapture = {
         method: response.request().method(),
         url: response.url(),
         status: response.status(),
         ...(response.request().resourceType() === undefined ? {} : { resourceType: response.request().resourceType() }),
         request: response.request(),
         response,
-      })
+      }
+      // Armed capture (run-42 §1.2): materialize the body NOW, before the
+      // page navigates away and Playwright disposes it. Fire-and-forget —
+      // the row records the bytes or the honest reason.
+      if (this.armedBodyCapture > 0) {
+        this.armedBodyCapture -= 1
+        void response.body()
+          .then(bytes => { capture.bodyBytes = bytes })
+          .catch(error => { capture.bodyError = error instanceof Error ? error.message : String(error) })
+      }
+      this.netCaptures.push(capture)
       if (this.netCaptures.length > NET_RING) this.netCaptures.splice(0, this.netCaptures.length - NET_RING)
     })
   }

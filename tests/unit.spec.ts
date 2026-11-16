@@ -2530,3 +2530,70 @@ test('V1 wiring: sessionOf wires the scope observer for EVERY route (lead verifi
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('run-43 §1 / run-44 §3: scope rows classify platform / plumbing / page-script', async () => {
+  const { classifyScopeRow, isVendorPlatformHost } = await import('../src/browser/session.js')
+  // Atlassian app-framework plumbing (run-43: 75 false "lane-controllable" rows)
+  assert.equal(classifyScopeRow({ url: 'https://as.atlassian.com/event', resourceType: 'fetch' }), 'platform')
+  assert.equal(classifyScopeRow({ url: 'https://xyz.cdn.prod.atlassian-dev.net/frame', resourceType: 'xhr' }), 'platform')
+  assert.equal(classifyScopeRow({ url: 'https://api.atlassian.com/me', resourceType: 'xhr' }), 'platform')
+  assert.equal(classifyScopeRow({ url: 'https://test.statuspage.io/widget', resourceType: 'fetch' }), 'platform')
+  assert.equal(classifyScopeRow({ url: 'https://atlassian-cookies.ingest.io/x', resourceType: 'ping' }), 'platform')
+  // The app's OWN backend on an armed host is page-script (scope decision, not noise)
+  assert.equal(classifyScopeRow({ url: 'https://cloud.stonikbyte.com/api/x', resourceType: 'xhr' }), 'page-script')
+  // Assets the page loads stay plumbing
+  assert.equal(classifyScopeRow({ url: 'https://gstatic.com/font.woff', resourceType: 'font' }), 'plumbing')
+  assert.ok(isVendorPlatformHost('xp.atlassian.com'))
+  assert.ok(!isVendorPlatformHost('notatlassian.com.evil.io'))
+})
+
+test('run-43 §4 + run-42 §1.3: formatResult compact headers + 401 auth-scheme hint', async () => {
+  const { formatResult } = await import('../src/tools/http.js')
+  const base = {
+    status: 200, statusText: 'OK', url_final: 'https://x.example.com/api', body: '{"ok":true}', body_sha256: 'a'.repeat(64),
+    timing_ms: 12, set_cookies: 0,
+    headers: {
+      'content-type': 'application/json', 'content-length': '13',
+      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' (plus 1.3 KB more)",
+      'strict-transport-security': 'max-age=63072000; includeSubDomains; preload',
+      'x-request-id': 'req-42',
+    },
+  } as never
+  const compact = formatResult(base as never)
+  assert.ok(compact.includes('x-request-id'), 'card-relevant header kept')
+  assert.ok(!compact.includes('content-security-policy'), 'CSP suppressed in compact mode (run-43: ~1.4 KB/call for zero information)')
+  assert.ok(compact.includes('compact, 3 of 5'), 'compact names what is hidden and the escape')
+  const full = formatResult(base as never, true)
+  assert.ok(full.includes('content-security-policy'), 'headers_full:true restores the whole block')
+  // 401 with a non-login body draws the header-token hint (run-42: a JSON
+  // ログインしてください body on a cookie replay read as "tool weirdness")
+  const denied = formatResult({ ...base, status: 401, statusText: 'Unauthorized', headers: { 'content-type': 'application/json', 'www-authenticate': 'Bearer' } } as never)
+  assert.ok(denied.includes('header token') && denied.includes('browser_fetch'), '401 hint names the cookie-vs-header mismatch and the tool that works')
+  const loginPage = formatResult({ ...base, status: 401, url_final: 'https://x.example.com/login', body: '<form><input type=password>', headers: { 'content-type': 'text/html' } } as never)
+  assert.ok(!loginPage.includes('auth-scheme'), 'a real login page keeps the signed-out warning, not the token hint')
+})
+
+test('run-44 §8: partitionCookieRows fixes trivial rows, drops bad ones with reasons', async () => {
+  const { partitionCookieRows } = await import('../src/browser/cookies.js')
+  const { good, dropped, notes } = partitionCookieRows([
+    { name: 'sid', value: 'v', domain: 'example.com', path: '/' },                 // clean
+    { name: 'old', value: 'v', domain: 'example.com', sameSite: '' },              // empty sameSite → dropped field
+    { name: 'jar', value: 'v', domain: 'example.com', sameSite: 1 },               // SQLite int → Lax
+    { name: 'cross', value: 'v', domain: 'example.com', sameSite: 'None' },        // None without secure → forced
+    { name: '', value: 'v', domain: 'example.com' },                               // no name → dropped
+    { name: 'broken', domain: 'example.com' },                                     // no value → dropped
+    { name: 'nodom', value: 'v' },                                                 // no domain → dropped
+    { name: 'weird', value: 'v', domain: 'example.com', expires: 'soon' },         // bad expires → fixed
+  ])
+  assert.equal(good.length, 5, 'five importable rows survive (sid, old, jar, cross, weird)')
+  assert.equal(dropped.length, 3, 'the three unimportable rows are named')
+  assert.ok(dropped.some(d => d.includes('"broken"') && d.includes('value')))
+  assert.ok(dropped.some(d => d.includes('(unnamed)') && d.includes('no name')))
+  assert.ok(dropped.some(d => d.includes('"nodom"') && d.includes('no domain')))
+  assert.ok(notes.some(n => n.includes('"old"') && n.includes('empty sameSite')))
+  assert.ok(notes.some(n => n.includes('"jar"') && n.includes('→ Lax')))
+  assert.ok(notes.some(n => n.includes('"cross"') && n.includes('secure forced')))
+  assert.ok(notes.some(n => n.includes('"weird"') && n.includes('expires')))
+  const fixed = good.find(c => c.name === 'cross')!
+  assert.equal(fixed.secure, true, 'SameSite=None row imported with secure=true')
+})

@@ -8,14 +8,14 @@ import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
-import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, type BrowserSession } from './session.js'
+import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, classifyScopeRow, type ScopeRowClass, type BrowserSession } from './session.js'
 import {
   detectChallenge, challengeAdvice, killChromeByProfile, plainProfileDir, cdpEndpointOwner,
   portOfCdpUrl, resolveChromeByDebugPort, bindCdpEndpoint, releaseCdpBinding, pidAlive,
   chromeProcessCensus,
   type ChallengeDetection,
 } from './plain-launch.js'
-import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, readProfileCookies } from './cookies.js'
+import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, partitionCookieRows, readProfileCookies } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
 import { appendChainEntry } from '../tools/evidence.js'
@@ -710,15 +710,17 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         let resNote: string
         let preview = ''
         try {
-          const body = await row.response.body()
+          // Armed captures (browser_network_record) carry materialized bytes —
+          // read those FIRST: they survive navigation, the lazy handle does not.
+          const body = row.bodyBytes ?? await row.response.body()
           const bytes = body.subarray(0, cap)
           const ext = bodyExtension(row.response.headers()['content-type'])
           const file = path.join(dir, `${num}.res${ext}`)
           fs.writeFileSync(file, bytes)
-          resNote = `response body: ${body.length} bytes${body.length > cap ? ` (only the first ${cap} written)` : ''} — ${num}.res${ext} — sha256 ${shaOf(bytes).slice(0, 16)}…`
+          resNote = `response body: ${body.length} bytes${body.length > cap ? ` (only the first ${cap} written)` : ''} — ${num}.res${ext} — sha256 ${shaOf(bytes).slice(0, 16)}…${row.bodyBytes !== undefined ? ' (armed capture — survived navigation)' : ''}`
           preview = truncate(redactSecrets(body.toString('utf8').slice(0, 200)).replace(/\s+/g, ' ').trim(), 200)
         } catch (error) {
-          resNote = `response body: UNAVAILABLE — ${describeErrorChain(error).slice(0, 160)} (bodies die when the page navigates; re-drive the flow and call this immediately after)`
+          resNote = `response body: UNAVAILABLE — ${describeErrorChain(error).slice(0, 160)}${row.bodyError !== undefined ? ` (armed capture failed: ${row.bodyError.slice(0, 120)})` : ''} (bodies die when the page navigates; arm browser_network_record BEFORE the click that matters)`
         }
         lines.push(
           `[${num}] ${row.status} ${row.method} ${row.url}`,
@@ -728,6 +730,82 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         )
       }
       lines.push('', `headers: ${rows.length}.req.headers.txt file(s) (redacted); chain one with evidence_file when it becomes a finding`)
+      return textResult(lines.join('\n'))
+    })
+
+  t('browser_network_record', 'Arm EAGER body capture for the NEXT N responses of this owner\'s browser (run-42 §1.2: best-effort retroactive capture lost the decisive request on a heavy Angular page — Playwright disposes response bodies when the page navigates away). Arm it BEFORE the click that matters; each armed response gets its body materialized into the capture ring immediately, so browser_network_bodies finds it even after navigation. `arm: 0` disarms; status shows the remaining count.',
+    {
+      arm: z.number().int().min(0).max(200).optional().describe('Arm capture for the next N responses (0 = disarm)'),
+      ...OWNER_FIELD,
+    },
+    async ({ arm, owner }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      if (arm !== undefined) {
+        session.armedBodyCapture = arm
+        session.armedBy = who
+      }
+      const remaining = session.armedBodyCapture
+      return textResult(arm === undefined
+        ? `body capture: ${remaining > 0 ? `ARMED — next ${remaining} response(s) get materialized bytes (armed by ${session.armedBy ?? who})` : 'off'}`
+        : remaining > 0
+          ? `ARMED — the next ${remaining} response(s) will keep their bodies through navigation. Trigger the flow now, then browser_network_bodies {url_contains: "…"} reads it back whole.`
+          : 'Disarmed. Bodies are back to lazy best-effort (they die when the page navigates away).')
+    })
+
+  t('browser_fetch', 'Fetch a URL INSIDE this owner\'s page context (run-42 §1: the guarded "session-fetch") — the request rides the page\'s own credential state (cookies, client certs, service-worker-visible identity) with NO token ever entering the transcript. This is the cookie-vs-BEARER mismatch tool: when http_request {browser:"owner"} comes back 401 because the host wants headers the browser session cannot supply out-of-page, this call is the same-origin answer. Boundaries, stated plainly: (1) it is subject to the PAGE\'s CORS rules — same-origin APIs just work, cross-origin APIs answer only if they send CORS headers; (2) a Bearer token the app injects via its own JS wrappers does NOT ride automatically — if the API needs one, capture the app\'s own call instead (browser_network_record before the click, then browser_network_bodies); (3) any header value you PASS here is in the transcript — pass nothing sensitive. Scope-asserted and budget-spent like every leg.',
+    {
+      url: z.string().describe('Absolute URL — scope-guarded'),
+      method: z.string().optional().describe('HTTP method (default GET)'),
+      headers: z.record(z.string()).optional().describe('Extra headers (values enter the transcript — keep them inert, e.g. content-type)'),
+      body: z.string().optional().describe('Request body (string)'),
+      max_bytes: z.number().int().optional().describe('Body preview cap (default 2000; full body always saved to the owner artifacts with sha256)'),
+      ...OWNER_FIELD, ...TAB_FIELD,
+    },
+    async ({ url, method, headers, body, max_bytes, owner, tab }: any) => {
+      const { session, owner: who } = sessionOf(env, owner)
+      const page = await tabFor(session, who, tab)
+      // Same guard discipline as every leg: assert BEFORE the request can
+      // leave, spend budget, then evaluate in-page.
+      env.scope.assert(url, who, 'browser_fetch')
+      env.budget.spend(who)
+      const cap = Math.max(256, Math.min(50_000, max_bytes ?? 2_000))
+      const started = Date.now()
+      const result = await page.evaluate(async ({ fetchUrl, fetchMethod, fetchHeaders, fetchBody }) => {
+        try {
+          const res = await fetch(fetchUrl, { method: fetchMethod, headers: fetchHeaders, body: fetchBody, credentials: 'include' })
+          const text = await res.text()
+          const picked: Record<string, string> = {}
+          for (const name of ['content-type', 'content-length', 'location', 'www-authenticate', 'retry-after', 'x-request-id']) {
+            const v = res.headers.get(name); if (v !== null) picked[name] = v
+          }
+          return { ok: true as const, status: res.status, statusText: res.statusText, url: res.url, headers: picked, body: text }
+        } catch (error) {
+          return { ok: false as const, error: String(error) }
+        }
+      }, { fetchUrl: url, fetchMethod: method ?? 'GET', fetchHeaders: headers ?? {}, fetchBody: body })
+      const timing = Date.now() - started
+      if (!result.ok)
+        return textResult(`in-page fetch FAILED (${timing} ms): ${result.error.slice(0, 300)}\nIf this is a CORS/type error, the page\'s origin is not allowed to read that API cross-origin — same-origin calls or CORS-enabled hosts only (check the tool description for the Bearer boundary).`, true)
+      const bytes = Buffer.from(result.body, 'utf8')
+      const sha = createHash('sha256').update(bytes).digest('hex')
+      const lines: string[] = [
+        `HTTP ${result.status} ${result.statusText} — in-page fetch from ${page.url()} (${timing} ms; rode the page's own credentials)`,
+        `content-type: ${result.headers['content-type'] ?? '(none)'}`,
+        `body sha256: ${sha} — ${bytes.length} byte(s)`,
+      ]
+      if (result.status === 401)
+        lines.push('⚠ 401 through the page\'s own credentials — if this host uses a Bearer-style header token the app injects in JS, this tool cannot supply it: browser_network_record the app\'s own call instead.')
+      // Full body always lands on disk (the preview stays lean).
+      try {
+        const ct = (result.headers['content-type'] ?? '').toLowerCase()
+        const ext = ct.includes('json') ? '.json' : ct.includes('html') ? '.html' : ct.includes('xml') ? '.xml' : '.txt'
+        const dir = path.join(session.artifactDir(), 'responses')
+        fs.mkdirSync(dir, { recursive: true })
+        const file = path.join(dir, `${sha}${ext}`)
+        if (!fs.existsSync(file)) fs.writeFileSync(file, bytes)
+        lines.push(`body_file: ${file} (full ${bytes.length} bytes)`)
+      } catch { /* best effort */ }
+      lines.push('body preview:', bytes.length > cap ? bytes.subarray(0, cap).toString('utf8') + `\n…[${bytes.length} bytes total — body_file has it whole]` : result.body)
       return textResult(lines.join('\n'))
     })
 
@@ -1061,7 +1139,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
   // transcript). Values now stay server-side behind a short-lived handoff id;
   // the transcript only ever sees the redacted preview.
   const cookieHandoffs = new Map<string, { id: string; fromOwner: string; domain: string; expiresAt: number; cookies: Array<Record<string, unknown>> }>()
-  const HANDOFF_TTL_MS = 10 * 60_000
+  // Run-48 §2: a spawned lane boots its browser, reads its method files, and
+  // only then imports — 10 minutes expired exactly the lanes that read the
+  // most before acting (two re-exports in one night). 30 covers boot + read.
+  const HANDOFF_TTL_MS = 30 * 60_000
   const sweepHandoffs = (): void => {
     const now = Date.now()
     for (const [id, handoff] of cookieHandoffs) if (handoff.expiresAt < now) cookieHandoffs.delete(id)
@@ -1105,15 +1186,16 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ].join('\n'))
     })
 
-  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session.',
+  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session. `skip_bad_rows: true` (default since run-44 §8 — one malformed row used to abort the WHOLE import with "Invalid cookie fields") drops unimportable rows with a named reason instead; trivially fixable fields (empty sameSite, None-without-secure) are fixed in place and noted.',
     {
       owner: z.string().describe('Owner whose browser receives the cookies'),
       handoff_id: z.string().optional().describe('Handoff id from browser_cookies_export'),
       profile_dir: z.string().optional().describe('Absolute path to an external Chrome/Edge user-data-dir or profile directory (reads its Cookies store)'),
       domain_filter: z.array(z.string()).min(1).optional().describe('Only import cookies for these domains (both-direction subdomain match, host-only included)'),
       domain_override: z.string().optional().describe('Rewrite the cookies onto a different host (e.g. staging)'),
+      strict: z.boolean().optional().describe('true = abort on the first bad row (the pre-run-44 behaviour); default false = skip bad rows with reasons'),
     },
-    async ({ owner, handoff_id, profile_dir, domain_filter, domain_override }: any) => {
+    async ({ owner, handoff_id, profile_dir, domain_filter, domain_override, strict }: any) => {
       sweepHandoffs()
       const { session, owner: who } = sessionOf(env, owner)
       let cookies: Array<Record<string, unknown>>
@@ -1151,26 +1233,66 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         }
       }
       const context = await session.ensure()
-      const finalCookies = cookies.map(cookie => ({ ...cookie, ...(domain_override === undefined ? {} : { domain: domain_override }) }))
+      const finalCookies: Array<Record<string, unknown>> = cookies.map(cookie => ({ ...cookie, ...(domain_override === undefined ? {} : { domain: domain_override }) }))
       if (finalCookies.length === 0) {
         return textResult([...(extraLines.length > 0 ? extraLines : []), 'no importable cookies matched — see the warnings above (app-bound v20 rows cannot be imported out-of-process; use browser_attach for that identity)'].join('\n'), true)
       }
-      await context.addCookies(finalCookies as never)
+      // Run-44 §8: Playwright's addCookies aborts the WHOLE batch on the first
+      // malformed row ("Invalid cookie fields") — one stray row cost lanes a
+      // 3-failure tax. Partition instead (pure helper, tested): fix trivial
+      // field problems in place, drop the unimportable with a named reason
+      // (strict:true keeps the old abort-everything behaviour).
+      const { good, dropped, notes } = partitionCookieRows(finalCookies)
+      if (strict === true && dropped.length > 0)
+        throw new Error(`strict import: ${dropped.length} bad row(s), nothing imported — first: ${dropped[0]}. Re-run without strict:true to skip bad rows.`)
+      if (good.length === 0)
+        return textResult([...extraLines, `no importable cookies — every row was malformed:`, ...dropped.slice(0, 10)].join('\n'), true)
+      await context.addCookies(good as never)
       return textResult([
-        `Imported ${finalCookies.length} cookie(s) into "${who}"'s browser.`,
+        `Imported ${good.length} of ${finalCookies.length} cookie(s) into "${who}"'s browser.`,
         ...extraLines,
+        ...(dropped.length > 0 ? [`skipped ${dropped.length} malformed row(s) (strict:true aborts instead):`, ...dropped.slice(0, 10).map(line => `  ✗ ${line}`)] : []),
+        ...(notes.length > 0 ? ['fixed in place:', ...notes.slice(0, 10).map(line => `  ↻ ${line}`)] : []),
         'preview (no values):',
-        cookiePreview(finalCookies),
+        cookiePreview(good),
       ].join('\n'))
     })
 
-  t('browser_cookies_list', 'Redacted cookie preview for one owner\'s browser — reason about which sessions are alive without ever seeing values.',
-    { owner: z.string().describe('Owner whose cookies are listed'), domain: z.string().optional() },
-    async ({ owner, domain }: any) => {
+  t('browser_cookies_list', 'Redacted cookie preview for one owner\'s browser — reason about which sessions are alive without ever seeing values. `digest_domains: [...]` (run-48 §1) adds the crash-triage surface the Lead needs at relaunch: per domain, how many cookies are SESSION (die with the browser process — an ungraceful Chrome death loses exactly these) vs PERSISTENT (survived on disk), plus whether the profile\'s Device-Bound-Sessions store matches that origin (a DBSC-bound session dies with the browser INSTANCE even when its cookies persist). One call answers "which logins survived the crash" before a lane discovers it at a login wall.',
+    {
+      owner: z.string().describe('Owner whose cookies are listed'),
+      domain: z.string().optional(),
+      digest_domains: z.array(z.string()).min(1).optional().describe('Per-domain digest: session vs persistent counts + DBSC binding (the sessions-survived surface)'),
+    },
+    async ({ owner, domain, digest_domains }: any) => {
       const { session } = sessionOf(env, owner)
       const context = await session.ensure()
       const urls = domain === undefined ? undefined : [/^https?:\/\//i.test(domain) ? domain : `https://${domain}/`]
-      const cookies = (await context.cookies(urls)) as unknown as Array<Record<string, unknown>>
+      const allCookies = (await context.cookies()) as unknown as Array<Record<string, unknown>>
+      const cookies = urls === undefined ? allCookies : allCookies.filter(c => cookieMatchesAnyDomain(String(c.domain), urls.map(u => u.replace(/^https?:\/\//i, '').replace(/\/$/, ''))))
+      if (digest_domains !== undefined && digest_domains.length > 0) {
+        // DBSC per-origin scan (same primitive as export warnings): a hit is
+        // decisive, a miss is a hint. Only owned profiles have a readable
+        // store; attached browsers say "unknown".
+        const canScan = session.userDir !== undefined && !session.userDir.startsWith('(attached)')
+        const lines: string[] = []
+        for (const wanted of digest_domains) {
+          const jar = allCookies.filter(c => cookieMatchesAnyDomain(String(c.domain), [wanted]))
+          const sessionCount = jar.filter(c => !(typeof c.expires === 'number' && c.expires > 0)).length
+          const persistent = jar.length - sessionCount
+          let dbsc = 'unknown (attached browser — the store is not ours to read)'
+          if (canScan) {
+            try {
+              const hit = deviceBoundSessionsFor(session.userDir!, 'Default', [wanted])
+              dbsc = hit === null ? 'unknown (store unreadable — possibly locked)'
+                : hit.length > 0 ? `BOUND (dies with the browser instance; cookie replay will be revoked — browser_attach is the route)`
+                : 'not bound (plain cookie replay should hold)'
+            } catch { dbsc = 'unknown (scan failed)' }
+          }
+          lines.push(`${wanted}: ${jar.length} cookie(s) — ${sessionCount} session (die with the browser) · ${persistent} persistent (survive a crash on disk) — DBSC: ${dbsc}`)
+        }
+        return textResult(['sessions digest:', ...lines, '', 'full preview (no values):', cookiePreview(cookies.length > 0 ? cookies : allCookies)].join('\n'))
+      }
       if (cookies.length === 0) return textResult('(no cookies match — the owner has no session for this domain)')
       return textResult(cookiePreview(cookies))
     })
@@ -1266,7 +1388,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         for (const snap of snaps) {
           const selected = snap.tabs.find(tab => tab.id === snap.selected) ?? snap.tabs.find(tab => tab.infoTab !== true)
           const session = env.registry.sessionIfExists(snap.owner)
-          const actionable = session === undefined ? 0 : session.scopeViolations.filter(row => !isPagePlumbing(row.resourceType)).length
+          const actionable = session === undefined ? 0 : session.scopeViolations.filter(row => classifyScopeRow(row) === 'page-script').length
           const state = snap.attached ? 'attached' : snap.plainOwned ? 'plain' : snap.running ? 'live' : 'down'
           lines.push([
             snap.owner === SHARED_OWNER ? 'shared' : snap.owner,
@@ -1295,6 +1417,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         const isProfileRunning = (dir: string): boolean =>
           runningDirs.has(dir.toLowerCase()) || [...runningDirs].some(r => dir.toLowerCase().endsWith(r) || r.endsWith(dir.toLowerCase()))
         const labels = loadOwnerLabels(env.config.rootDir)
+        // Run-43 §7: ~300 retained profiles made a history dump multi-thousand
+        // lines. Cap at the newest 40 by last-write and say how much spilled.
+        const HISTORY_CAP = 40
+        const entries: Array<{ line: string; mtime: number }> = []
         try {
           for (const entry of fs.readdirSync(env.config.profilesRoot, { withFileTypes: true })) {
             if (!entry.isDirectory()) continue
@@ -1309,20 +1435,30 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
             const state = isProfileRunning(dir)
               ? 'chrome.exe ALIVE with this profile (close it via owner re-open + browser_close, or browser_attach to adopt it)'
               : 'closed'
-            retained.push(`(${state}) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`)
+            entries.push({ line: `(${state}) ${profileOwner}${described} — last write ${stat.mtime.toISOString().slice(0, 16).replace('T', ' ')}Z`, mtime: stat.mtime.getTime() })
           }
         } catch { /* profiles dir absent = no retained profiles */ }
+        entries.sort((a, b) => b.mtime - a.mtime)
+        retained.push(...entries.slice(0, HISTORY_CAP).map(e => e.line))
+        if (entries.length > HISTORY_CAP)
+          retained.push(`… +${entries.length - HISTORY_CAP} older retained profile(s) not shown — browser_profiles_reap lists them all (and reaps the stale ones)`)
       }
       if (retained.length > 0) lines.push(...retained)
-      // Run-8 §5 + run-39 §12.5: violations on the map count only
-      // LANE-CONTROLLABLE requests; page plumbing is noted, never a STOP.
+      // Run-8 §5 + run-39 §12.5, superseded by run-43 §1/run-44 §3: the page
+      // observer only sees PAGE-INITIATED traffic, so the counted class is
+      // "page-script" (the page's own xhr/fetch) and vendor platform hosts are
+      // noted like plumbing — never a STOP.
       for (const snap of snaps) {
         const session = env.registry.sessionFor(snap.owner)
         if (session === undefined || session.scopeViolations.length === 0) continue
-        const actionable = session.scopeViolations.filter(row => !isPagePlumbing(row.resourceType))
-        const plumbing = session.scopeViolations.length - actionable.length
-        if (actionable.length > 0)
-          lines.push(`⚠ ${snap.owner}: ${actionable.length} out-of-scope request(s) observed — browser_scope_violations {owner:"${snap.owner}"}`)
+        const byClass = (kind: ScopeRowClass) => session.scopeViolations.filter(row => classifyScopeRow(row) === kind)
+        const pageScript = byClass('page-script').length
+        const platform = byClass('platform').length
+        const plumbing = byClass('plumbing').length
+        if (pageScript > 0)
+          lines.push(`⚠ ${snap.owner}: ${pageScript} out-of-scope PAGE-SCRIPT request(s) (the page's own JS — scope_set the host or navigate away; do not stop the lane) — browser_scope_violations {owner:"${snap.owner}"}`)
+        if (platform > 0)
+          lines.push(`ℹ ${snap.owner}: ${platform} vendor-platform request(s) (app-framework plumbing — NOT actionable)`)
         if (plumbing > 0)
           lines.push(`ℹ ${snap.owner}: ${plumbing} page-plumbing request(s) (assets the page itself loaded — NOT counted, no action)`)
       }
@@ -1454,14 +1590,20 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         // dead runs accumulated because scope_clear is manual per owner — the
         // rule dies with the session now.
         if (hadRule) env.scope.clear(who)
-        return textResult(`Closed and killed "${who}"'s browser (graceful close; profile preserved at ${userDir}${reaped > 0 ? `; exact-match sweep reaped ${reaped} stray chrome.exe process(es) the graceful close left behind` : ''})${hadRule ? `; the owner's stale per-owner scope rule was cleared too` : ''}.`)
+        return textResult([
+          ...(hadRule ? [`⚠ SCOPE CLEARED — "${who}" is UNRESTRICTED until re-armed. Call scope_set for this owner BEFORE any target traffic (run-44 §2: a lane that killed a wedged browser came back unrestricted and had to ask for a re-arm).`] : []),
+          `Closed and killed "${who}"'s browser (graceful close; profile preserved at ${userDir}${reaped > 0 ? `; exact-match sweep reaped ${reaped} stray chrome.exe process(es) the graceful close left behind` : ''}).`,
+        ].join('\n'))
       }
       if (hadRule) env.scope.clear(who)
       const userDir = path.join(env.config.profilesRoot, `plain-${who}`)
       const killed = await killChromeByProfile(userDir)
-      return textResult((killed > 0
-        ? `No live session for "${who}"; killed ${killed} orphaned chrome.exe process(es) whose --user-data-dir exactly matches ${userDir}.`
-        : `No live session and no orphaned Chrome for "${who}" (profile ${userDir}).`) + (hadRule ? ` Stale per-owner scope rule cleared.` : ''))
+      return textResult([
+        ...(hadRule ? [`⚠ SCOPE CLEARED — "${who}" is UNRESTRICTED until re-armed (scope_set before any target traffic).`] : []),
+        killed > 0
+          ? `No live session for "${who}"; killed ${killed} orphaned chrome.exe process(es) whose --user-data-dir exactly matches ${userDir}.`
+          : `No live session and no orphaned Chrome for "${who}" (profile ${userDir}).`,
+      ].join('\n'))
     })
 
   t('browser_profiles_reap', 'Reap OLD retained browser profiles on disk (run-39 disk round: 498 profile dirs / ~35 GB accumulated across runs 26-39). DRY-RUN by default — it only lists what would go. Deletes a profile dir only when its last write is older than `older_than_days` (default 14) AND no live session owns it AND no chrome.exe is running with it. Live-session dirs, the shared profile, and any profile younger than the threshold are never touched. Set dry_run:false to actually delete.',
@@ -1521,36 +1663,46 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       return textResult(`Reaped ${deleted}/${victims.length} profile dir(s) older than ${days} day(s)${skippedLive.length > 0 ? `; skipped ${skippedLive.length} live dir(s)` : ''}.${errors.length > 0 ? `\n${errors.slice(0, 5).join('\n')}` : ''}`)
     })
 
-  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser — on EVERY route (launched, plain, or CDP-attached; the observer is wired at session creation, not per-handler). What is ENFORCED vs OBSERVED (V3, stated plainly): tool-level navigation and http_request are DENIED before leaving; page-initiated JS (in-page fetch/XHR/beacons) is OBSERVED and AUDITED but NOT blocked — the browser loads what the page loads. Run-39 §12.5: rows are split into LANE-CONTROLLABLE (document/xhr/fetch — the types our tools can initiate) and PAGE PLUMBING (stylesheets/scripts/images/fonts the page itself loads — gstatic, recaptcha, CDNs; shown but NOT actionable, never a "stop the lane"). `summary:true` returns counts by host instead of full rows.',
+  t('browser_scope_violations', 'Out-of-scope requests OBSERVED from an owner\'s browser — on EVERY route (launched, plain, or CDP-attached; the observer is wired at session creation, not per-handler). What is ENFORCED vs OBSERVED (V3, stated plainly): tool-level navigation and http_request are DENIED before leaving; page-initiated JS (in-page fetch/XHR/beacons) is OBSERVED and AUDITED but NOT blocked — the browser loads what the page loads. IMPORTANT (run-43 §1 + run-44 §3): every row here is PAGE-INITIATED (tool legs are asserted before leaving and never reach this list), so rows classify as PAGE-SCRIPT (the page\'s own app JS calling a host your scope does not cover — the fix is scope_set the host or navigate away, NOT stopping the lane), VENDOR-PLATFORM (app-framework plumbing: Atlassian Connect/API/cookie hosts, statuspage — NOT actionable), or PAGE PLUMBING (stylesheets/scripts/images/fonts — NOT actionable). This report is a normal RESULT, never an error — the error channel is reserved for tool failures (run-43 §2). `summary:true` returns counts by host.',
     {
       ...OWNER_FIELD,
-      summary: z.boolean().optional().describe('Counts by host + top examples instead of full rows'),
+      summary: z.boolean().optional().describe('Counts by host + class instead of full rows'),
     },
     async ({ owner, summary }: any) => {
       const { session } = sessionOf(env, owner)
       const rows = session.scopeViolations
-      if (rows.length === 0) return textResult(`No out-of-scope TRAFFIC observed from "${session.owner}". Enforcement notes (V4, measured 2026-11-12): a tool-level navigation to a denied URL is audited and the tab reset, but the request may already have left ONCE before the reset — the audit row is the record, not a guarantee the byte never crossed; denied attempts are in scope_audit.`, true)
-      const actionable = rows.filter(row => !isPagePlumbing(row.resourceType))
-      const plumbing = rows.filter(row => isPagePlumbing(row.resourceType))
-      const head = actionable.length > 0
-        ? `${actionable.length} LANE-CONTROLLABLE out-of-scope request(s) from "${session.owner}" (audited; STOP the lane and fix the scope)${plumbing.length > 0 ? ` + ${plumbing.length} page-plumbing request(s) (not actionable — the page loaded them itself)` : ''}:`
-        : `${plumbing.length} page-plumbing request(s) from "${session.owner}" — the page loaded these itself (gstatic/recaptcha/CDN assets); NOTHING is lane-controllable, do NOT stop the lane. (Run-39 §12.5: this used to read as a 100-row STOP banner.)`
+      if (rows.length === 0) return textResult(`No out-of-scope traffic observed from "${session.owner}". Enforcement notes (V4, measured 2026-11-12): a tool-level navigation to a denied URL is audited and the tab reset, but the request may already have left ONCE before the reset — the audit row is the record, not a guarantee the byte never crossed; denied attempts are in scope_audit.`)
+      const byClass = (kind: ScopeRowClass) => rows.filter(row => classifyScopeRow(row) === kind)
+      const pageScript = byClass('page-script')
+      const platform = byClass('platform')
+      const plumbing = byClass('plumbing')
+      const head = pageScript.length > 0
+        ? `${pageScript.length} out-of-scope PAGE-SCRIPT request(s) from "${session.owner}" — the page's own JS called hosts the scope does not cover. Decide: scope_set the host (it is part of the app) or navigate away. Do NOT stop the lane for this.`
+        : `Nothing lane-driven is out of scope. Observed from "${session.owner}": ${platform.length} vendor-platform + ${plumbing.length} page-plumbing request(s) — all page-initiated plumbing, NOT actionable.`
       if (summary === true) {
-        const byHost = new Map<string, number>()
+        const byHost = new Map<string, { count: number; kind: ScopeRowClass }>()
         for (const row of rows) {
-          try { const host = new URL(row.url).host; byHost.set(host, (byHost.get(host) ?? 0) + 1) } catch { /* keep going */ }
+          try {
+            const host = new URL(row.url).host
+            const kind = classifyScopeRow(row)
+            const slot = byHost.get(host)
+            if (slot === undefined) byHost.set(host, { count: 1, kind })
+            else { slot.count += 1; if (slot.kind === 'plumbing' && kind !== 'plumbing') slot.kind = kind }
+          } catch { /* keep going */ }
         }
         return textResult([
           head,
           'counts by host:',
-          ...[...byHost.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([host, count]) => `  ${String(count).padStart(4)}  ${host}${isPagePlumbing(rows.find(row => { try { return new URL(row.url).host === host } catch { return false } })?.resourceType) ? '  (plumbing)' : ''}`),
-        ].join('\n'), actionable.length > 0)
+          ...[...byHost.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 12)
+            .map(([host, { count, kind }]) => `  ${String(count).padStart(4)}  ${host}${kind === 'page-script' ? '' : kind === 'platform' ? '  (vendor platform — not actionable)' : '  (plumbing)'}`),
+        ].join('\n'))
       }
       return textResult([
         head,
-        ...(actionable.length > 0 ? actionable.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`) : []),
+        ...(pageScript.length > 0 ? ['page script (last 20):', ...pageScript.slice(-20).map(row => `  ${row.ts} ${row.method} ${row.url.slice(0, 160)} — ${row.reason}`)] : []),
+        ...(platform.length > 0 ? [`vendor platform (last ${Math.min(platform.length, 10)}, NOT actionable — app-framework plumbing):`, ...platform.slice(-10).map(row => `  ${row.method} ${row.url.slice(0, 120)}`)] : []),
         ...(plumbing.length > 0 ? [`page plumbing (last ${Math.min(plumbing.length, 10)}, NOT counted):`, ...plumbing.slice(-10).map(row => `  ${row.method} ${row.url.slice(0, 120)}`)] : []),
-      ].join('\n'), actionable.length > 0)
+      ].join('\n'))
     })
 
   t('browser_headers_set', 'Apply persistent extra HTTP headers to this owner\'s browser session (context-level, rides every request). Run-39 §12.14: a header set once through raw CDP persisted silently across navigations and contaminated a later CONTROL leg — set headers ONLY through this tool so they are recorded, listed by browser_headers_list, and cleared by browser_headers_clear / browser_reset. Merges into any headers already set via this tool.',
@@ -1611,8 +1763,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         const refusedLines = refused.map(row =>
           `REFUSED "${row.owner}": tabs leased (${row.leases.map(l => `#${l.tabId} by ${l.leasedBy}${l.purpose ? ` (${l.purpose})` : ''}`).join(', ')}) — resolve the leases first (tab_release) or have those owners close their own sessions`)
         return textResult([
+          ...(rulesCleared.length > 0 ? [`⚠ SCOPE CLEARED for: ${rulesCleared.join(', ')} — each is UNRESTRICTED until re-armed (scope_set before any target traffic; run-44 §2).`] : []),
           ...(closed.length === 0 ? ['Nothing to close.'] : [`Closed sessions: ${closed.join(', ')}`]),
-          ...(rulesCleared.length > 0 ? [`Cleared stale per-owner scope rules: ${rulesCleared.join(', ')}`] : []),
           ...refusedLines,
         ].join('\n'), refusedLines.length > 0)
       }
@@ -1622,7 +1774,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const closed = await env.registry.close(who)
       const hadRule = env.scope.owners().includes(who)
       if (closed && hadRule) env.scope.clear(who)
-      return textResult(closed ? `Closed session for "${who}" (profile preserved; attached sessions only DISCONNECT — the human's browser stays open)${hadRule ? '; the owner\'s per-owner scope rule was cleared' : ''}.` : `No running session for "${who}".`)
+      return textResult([
+        ...(closed && hadRule ? [`⚠ SCOPE CLEARED — "${who}" is UNRESTRICTED until re-armed (scope_set before any target traffic; run-44 §2).`] : []),
+        closed ? `Closed session for "${who}" (profile preserved; attached sessions only DISCONNECT — the human's browser stays open).` : `No running session for "${who}".`,
+      ].join('\n'))
     })
 
   t('browser_close', 'Close one owner\'s browser session (profile on disk is preserved for next time).',

@@ -231,6 +231,44 @@ function mapSameSite(samesite: number | null | undefined, secure: boolean): Impo
   return undefined
 }
 
+/** Partition imported cookie rows for browser_cookies_import (run-44 §8):
+ *  Playwright's addCookies aborts the WHOLE batch on the first malformed row
+ *  ("Invalid cookie fields"), so one stray row cost lanes a 3-failure tax and
+ *  per-domain narrowing was the only route. Here: trivially-fixable fields are
+ *  fixed in place (empty sameSite dropped, SQLite samesite ints mapped 0/1/2,
+ *  secure forced for SameSite=None, non-numeric expires dropped) and
+ *  unimportable rows are dropped WITH a named reason. Pure; tested. */
+export interface CookiePartition {
+  good: Array<Record<string, unknown>>
+  dropped: string[]
+  notes: string[]
+}
+export function partitionCookieRows(rows: Array<Record<string, unknown>>): CookiePartition {
+  const good: Array<Record<string, unknown>> = []
+  const dropped: string[] = []
+  const notes: string[] = []
+  for (const original of rows) {
+    const row: Record<string, unknown> = { ...original }
+    const name = typeof row.name === 'string' ? row.name : ''
+    const why = (reason: string): string => `"${name || '(unnamed)'}" ${String(row.domain ?? row.url ?? '?')} — ${reason}`
+    if (name === '') { dropped.push(why('no name')); continue }
+    if (typeof row.value !== 'string') { dropped.push(why('value is not a string')); continue }
+    if (typeof row.domain !== 'string' || row.domain === '') { dropped.push(why('no domain')); continue }
+    if (row.sameSite === '') { delete row.sameSite; notes.push(`"${name}": empty sameSite dropped`) }
+    else if (row.sameSite !== undefined && !['Strict', 'Lax', 'None'].includes(String(row.sameSite))) {
+      const n = Number(row.sameSite)
+      if (n === 1 || n === 2) { row.sameSite = n === 1 ? 'Lax' : 'Strict'; notes.push(`"${name}": sameSite ${String(original.sameSite)} → ${String(row.sameSite)}`) }
+      else if (n === 0 && row.secure === true) { row.sameSite = 'None'; notes.push(`"${name}": sameSite 0 (secure) → None`) }
+      else if (n === 0) { delete row.sameSite; notes.push(`"${name}": sameSite 0 without secure dropped (Chrome would reject the cookie)`) }
+      else { delete row.sameSite; notes.push(`"${name}": unrecognized sameSite "${String(row.sameSite)}" dropped`) }
+    }
+    if (row.sameSite === 'None' && row.secure !== true) { row.secure = true; notes.push(`"${name}": secure forced for SameSite=None (None is only valid on secure)`) }
+    if (row.expires !== undefined && row.expires !== -1 && typeof row.expires !== 'number') { delete row.expires; notes.push(`"${name}": non-numeric expires dropped`) }
+    good.push(row)
+  }
+  return { good, dropped, notes }
+}
+
 /**
  * Read and decrypt one Chrome/Edge profile's cookies. The SQLite file is
  * copied to a temp dir first (Chrome holds it locked while running); v20 rows

@@ -533,17 +533,36 @@ export function detectSignedOut(urlFinal: string, contentType: string | undefine
   return false
 }
 
-export function formatResult(r: RequestResult): string {
-  const headerLines = Object.entries(r.headers).map(([k, v]) => `  ${k}: ${v}`).join('\n')
+/** Header allowlist for the COMPACT projection (run-41 §4 + run-43 §4: every
+ *  call printed the full CSP/HSTS/Set-Cookie block — ~1.4 KB of headers for a
+ *  24-byte JSON body; 20+ calls per run is context for zero information).
+ *  These are the headers cards actually cite; headers_full:true restores the
+ *  whole block for the rare case the CSP IS the point. */
+const COMPACT_HEADERS = new Set([
+  'content-type', 'content-length', 'location', 'www-authenticate', 'retry-after',
+  'x-request-id', 'date', 'server', 'cache-control', 'allow', 'x-ratelimit-remaining',
+])
+
+export function formatResult(r: RequestResult, headersFull = false): string {
+  const entries = Object.entries(r.headers)
+  const shown = headersFull ? entries : entries.filter(([k]) => COMPACT_HEADERS.has(k))
+  const headerLines = shown.length > 0
+    ? shown.map(([k, v]) => `  ${k}: ${v}`).join('\n')
+    : '  (no card-relevant headers)'
   const binary = isBinaryContentType(r.headers['content-type'])
   const signedOut = detectSignedOut(r.url_final, r.headers['content-type'], r.body.slice(0, 4000))
+  const authMismatch = r.status === 401 && !signedOut && (
+    r.headers['www-authenticate'] !== undefined || /json|javascript/i.test(r.headers['content-type'] ?? '') || !/html/i.test(r.headers['content-type'] ?? 'html'))
   return [
     `HTTP ${r.status} ${r.statusText} (${r.timing_ms} ms) — final URL: ${r.url_final}${r.redirect_hops !== undefined ? ` (${r.redirect_hops} redirect hop(s) followed, each scope-checked)` : ''}`,
     ...(signedOut
       ? ['⚠ SESSION LOOKS SIGNED OUT — the final URL/body is a login page, not the authenticated surface you asked for (run-39 §12.7). Re-authenticate (browser_attach / cookie handoff) before parsing anything out of this body.']
       : []),
+    ...(authMismatch
+      ? ['⚠ 401 WITH A NON-LOGIN BODY — the API shape says header token, not cookies (run-42 §1.3): if this leg rode a cookie jar or a browser session, the host likely expects an Authorization header the cookies cannot supply. Check www-authenticate above; for the page\'s own token use browser_fetch or capture the app\'s call (browser_network_record + browser_network_bodies).']
+      : []),
     `body sha256: ${r.body_sha256}${r.set_cookies > 0 ? ` — ${r.set_cookies} Set-Cookie stored in jar` : ''}`,
-    `headers:\n${headerLines}`,
+    `headers (${headersFull ? 'full' : `compact, ${shown.length} of ${entries.length} — headers_full:true for the whole block`}):\n${headerLines}`,
     binary
       ? `body: (binary ${r.headers['content-type']} — preview suppressed; the full bytes are in the capture ring, use http_extract for values or http_download to save the file)`
       : `body:\n${r.body}`,
@@ -559,6 +578,7 @@ const REQUEST_SHAPE: z.ZodRawShape = {
   redirect: z.enum(['follow', 'manual']).optional().describe('follow: every redirect hop re-enters the scope guard (run-9 §2 — an out-of-scope hop is an audited DENY, never a quiet follow). manual: the 3xx comes back as-is.'),
   timeout_ms: z.number().int().optional(),
   max_body_bytes: z.number().int().optional().describe('Body preview cap (default 20000; sha256 always covers the full body)'),
+  headers_full: z.boolean().optional().describe('Print EVERY response header instead of the compact projection (run-43 §4: default shows only card-relevant ones — content-type/length, location, www-authenticate, rate limits; the full CSP/HSTS block costs ~1.4 KB of context per call)'),
   save_body: z.boolean().optional().describe('Always write the full body to the owner artifacts and report body_file (sha256 + bytes) instead of relying on the 20 KB auto-save — for JSON a finding cites (an MCP tools/list, an API document) that belongs on disk, not in the transcript'),
   auth: z.object({
     type: z.enum(['basic', 'bearer']),
@@ -718,7 +738,7 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       try { return await handler(args) } catch (error) { return errorResult(error) }
     })
 
-  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, headers, body, timing, body sha256. Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB); `save_body: true` forces that disk write for ANY size (A4 — a 2-20 KB MCP tools/list belongs on disk, not in the transcript). `browser: "<owner>"` (or true) sends the request through that owner\'s LIVE browser session — its cookie state, the identity the browser stages logged in — instead of a jar.',
+  t('http_request', 'Server-side HTTP client with a persistent per-id cookie jar, scope-guarded. Returns status, COMPACT headers (run-43 §4: only card-relevant ones — content-type/length, location, www-authenticate, rate limits; headers_full:true for the whole block), body, timing, body sha256. A 401 with a non-login body draws an auth-scheme hint (run-42 §1.3: header-token host vs cookies). Bodies past 20 KB are ALSO saved whole to disk with a body_file reference (run-8 §7 — delicate candidates were truncated at 20 KB); `save_body: true` forces that disk write for ANY size (A4 — a 2-20 KB MCP tools/list belongs on disk, not in the transcript). `browser: "<owner>"` (or true) sends the request through that owner\'s LIVE browser session — its cookie state, the identity the browser stages logged in — instead of a jar.',
     { ...REQUEST_SHAPE, owner: z.string().optional().describe('Attribution for the scope audit log') },
     async (args: any) => {
       const { owner, ...spec } = args
@@ -761,7 +781,7 @@ export function registerHttpTools(server: ToolRegistrar, env: HttpEnv, jars: Jar
       })
       if (ring.length > 20) ring.shift()
       captures.set(who, ring)
-      return textResult(`${formatResult(result)}\ncapture_id: ${captureId} (http_replay re-sends it with one field changed)${stored}`)
+      return textResult(`${formatResult(result, (spec as RequestSpec & { headers_full?: boolean }).headers_full === true)}\ncapture_id: ${captureId} (http_replay re-sends it with one field changed)${stored}`)
     })
 
   t('http_replay', 'Replay a captured http_request with EXACTLY the overrides you pass (run-8 §7): the correct shape for "vary one field" — url/header/body substitutions on a byte-identical template instead of re-typing the whole request and drifting.',
