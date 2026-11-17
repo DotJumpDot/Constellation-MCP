@@ -1580,8 +1580,14 @@ test('DBSC warnings: the signal is named and scoped per-domain (run-9 §4)', asy
     // store unreadable (a FILE where the directory belongs) -> inconclusive
     fs.rmSync(path.join(profile, 'Network', 'Device Bound Sessions'), { recursive: true, force: true })
     fs.writeFileSync(path.join(profile, 'Network', 'Device Bound Sessions'), 'not a dir')
-    const inconclusive = dbscWarningLines(stateDir, 'Default', ['plain.example'])
-    assert.match(inconclusive[0]!, /INCONCLUSIVE/)
+    // Chrome 157 layout (verification 2026-11-19 #6): the store is a SQLite
+    // FILE at this path — the NORMAL layout now, not an error. A file with
+    // no matching origin scans clean (NOTE, proceed); the INCONCLUSIVE
+    // wording is reserved for genuinely unreadable stores (EACCES-class).
+    fs.rmSync(path.join(profile, 'Network', 'Device Bound Sessions'), { recursive: true, force: true })
+    fs.writeFileSync(path.join(profile, 'Network', 'Device Bound Sessions'), 'not a dir')
+    const fileLayout = dbscWarningLines(stateDir, 'Default', ['plain.example'])
+    assert.match(fileLayout[0]!, /NO match for \[plain\.example\]/, 'a FILE store with no match is a clean scan, not inconclusive')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2656,4 +2662,65 @@ test('verification 2026-11-17: summarizeScopeRows pins the REAL ranking (imports
   ])
   assert.equal(mixed[0]!.kind, 'page-script', 'a page-script row upgrades a host whose first row was plumbing')
   assert.equal(mixed[0]!.count, 2)
+})
+
+test('verification 2026-11-19 BLOCKER: chunkedBase64 round-trips exact bytes (browser_fetch in-page encoder)', async () => {
+  const { chunkedBase64, B64_CHUNK } = await import('../src/browser/session.js')
+  const roundtrip = (raw: Buffer): void => {
+    const b64 = chunkedBase64(new Uint8Array(raw))
+    assert.equal(b64, raw.toString('base64'), 'identical to Buffer base64')
+    assert.ok(Buffer.from(b64, 'base64').equals(raw), 'exact byte round-trip')
+  }
+  roundtrip(Buffer.alloc(0))                                   // empty
+  roundtrip(Buffer.from('{"hello":"world","mark":"json-mark-42"}')) // 39 bytes ≡ 0 mod 3
+  roundtrip(Buffer.from('a'))                                  // ≡ 1 mod 3
+  roundtrip(Buffer.from('ab'))                                 // ≡ 2 mod 3
+  const big = Buffer.alloc(B64_CHUNK + 17)                     // crosses a chunk seam (32657 bytes)
+  for (let at = 0; at < big.length; at++) big[at] = (at * 31 + 7) % 256
+  roundtrip(big)
+  // The shipped bug: the in-page leg previously emitted a RAW binary string
+  // (no btoa) — Buffer.from(raw, 'base64') silently decoded garbage. Pin
+  // that the output is really base64 (decodes to fewer bytes, not garbage
+  // of near-equal length).
+  const sample = Buffer.from('plain-text-body')
+  const encoded = chunkedBase64(new Uint8Array(sample))
+  assert.ok(encoded.length > sample.length, 'base64 inflates ~4/3 (a raw binary string would not)')
+})
+
+test('verification 2026-11-19 #6: DBSC store as a FILE (Chrome 157 SQLite layout) scans; absence stays decisive', async () => {
+  const { deviceBoundSessionsFor } = await import('../src/browser/cookies.js')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dbsc-file-'))
+  try {
+    const profile = path.join(root, 'Default')
+    // File layout: a single SQLite-ish file at the store path.
+    fs.mkdirSync(path.join(profile, 'Network'), { recursive: true })
+    fs.writeFileSync(path.join(profile, 'Network', 'Device Bound Sessions'),
+      Buffer.concat([Buffer.from('SQLite format 3\0'), Buffer.from('...bugcrowd.com...session-row...')]))
+    assert.deepEqual(deviceBoundSessionsFor(root, 'Default', ['bugcrowd.com']), ['bugcrowd.com'], 'file layout MATCHES the bound origin')
+    assert.deepEqual(deviceBoundSessionsFor(root, 'Default', ['example.com']), [], 'file layout miss is a clean miss')
+    // Absence: decisive not-bound (the verifier's fresh-profile case).
+    const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'dbsc-fresh-'))
+    try {
+      assert.deepEqual(deviceBoundSessionsFor(fresh, 'Default', ['bugcrowd.com']), [], 'absent store = no DBSC registration ever')
+    } finally { fs.rmSync(fresh, { recursive: true, force: true }) }
+    // Legacy dir layout still scans.
+    const dirProfile = path.join(root, 'Profile 2')
+    fs.mkdirSync(path.join(dirProfile, 'Network', 'Device Bound Sessions'), { recursive: true })
+    fs.writeFileSync(path.join(dirProfile, 'Network', 'Device Bound Sessions', '000003.log'), 'x-google.com-y')
+    assert.deepEqual(deviceBoundSessionsFor(root, 'Profile 2', ['google.com']), ['google.com'], 'directory layout still matches')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('verification 2026-11-19: withDeadline rejects a never-settling body promise instead of wedging', async () => {
+  const { withDeadline } = await import('../src/browser/session.js')
+  const hung = new Promise<Buffer>(() => {}) // disposed-by-navigation body()
+  await assert.rejects(
+    withDeadline(hung, 50, 'body fetch'),
+    /timed out after 50ms.*arm browser_network_record/,
+    'the deadline surfaces the re-arm guidance instead of hanging forever',
+  )
+  const ok = await withDeadline(Promise.resolve(Buffer.from('data')), 1000, 'body fetch')
+  assert.equal(ok.toString(), 'data', 'fast promises pass through untouched')
 })

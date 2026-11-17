@@ -137,6 +137,42 @@ export function classifyScopeRow(row: { url: string; resourceType?: string }): S
   return 'page-script'
 }
 
+/** Chunked base64 encoder for browser_fetch's in-page leg (verification
+ *  round 2026-11-19 BLOCKER: the "chunked base64" comment shipped without
+ *  any btoa — a raw binary string reached Buffer.from(…, 'base64') and
+ *  corrupted EVERY body, sha and body_file). Chunk size is a MULTIPLE OF 3
+ *  so concatenated per-chunk base64 carries no mid-stream padding, and
+ *  stays under the ~65k apply() argument limit. Pure; unit-tested on known
+ *  bytes — the in-page code in browser_fetch must stay byte-identical to
+ *  this function. */
+export const B64_CHUNK = 0x7F80 // 32640 = 3 × 10880
+export function chunkedBase64(bytes: Uint8Array): string {
+  let b64 = ''
+  for (let at = 0; at < bytes.length; at += B64_CHUNK)
+    b64 += btoa(String.fromCharCode(...bytes.subarray(at, at + B64_CHUNK)))
+  return b64
+}
+
+/** Race a Playwright body/header promise against a deadline (verification
+ *  round 2026-11-19: arm → fetch → navigate immediately, and the EAGER
+ *  body() promise never settles; the LAZY fallback in
+ *  browser_network_bodies hung the same way — a wedged tool call with
+ *  partial artifacts on disk). Timeouts surface as the honest "body
+ *  unavailable, re-arm before the click that matters" path. */
+export async function withDeadline<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms — the response was likely disposed by a navigation; arm browser_network_record BEFORE the click that matters`)), ms)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 /** Host-tag rank for the summary view: a host with ANY page-script row reads
  *  page-script (the class a reader must act on), then platform, then
  *  plumbing — arrival order must not let a quieter class mask a louder one. */
@@ -538,7 +574,7 @@ export class BrowserSession {
       if (this.armedBodyCapture > 0) {
         this.armedBodyCapture -= 1
         capture.armedBy = this.armedBy
-        void response.body()
+        void withDeadline(response.body(), 15_000, 'armed body capture')
           .then(bytes => { capture.bodyBytes = bytes })
           .catch(error => { capture.bodyError = error instanceof Error ? error.message : String(error) })
       }

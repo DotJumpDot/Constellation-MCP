@@ -8,7 +8,7 @@ import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
-import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, classifyScopeRow, summarizeScopeRows, type ScopeRowClass, type BrowserSession } from './session.js'
+import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, classifyScopeRow, summarizeScopeRows, withDeadline, type ScopeRowClass, type BrowserSession } from './session.js'
 import {
   detectChallenge, challengeAdvice, killChromeByProfile, plainProfileDir, cdpEndpointOwner,
   portOfCdpUrl, resolveChromeByDebugPort, bindCdpEndpoint, releaseCdpBinding, pidAlive,
@@ -693,7 +693,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         const num = String(at + 1).padStart(2, '0')
         let headersText = ''
         try {
-          headersText = Object.entries(await row.request.allHeaders()).map(([k, v]) => `${k}: ${v}`).sort().join('\n')
+          headersText = Object.entries(await withDeadline(row.request.allHeaders(), 10_000, 'request header fetch')).map(([k, v]) => `${k}: ${v}`).sort().join('\n')
         } catch {
           headersText = Object.entries(row.request.headers()).map(([k, v]) => `${k}: ${v}`).sort().join('\n')
         }
@@ -712,8 +712,11 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         let preview = ''
         try {
           // Armed captures (browser_network_record) carry materialized bytes —
-          // read those FIRST: they survive navigation, the lazy handle does not.
-          const body = row.bodyBytes ?? await row.response.body()
+          // read those FIRST: they survive navigation, the lazy handle does
+          // not. The lazy fetch is deadline-raced: a response disposed by an
+          // immediate navigation can otherwise hang the call forever
+          // (verification round 2026-11-19 — wedged tool, partial artifacts).
+          const body = row.bodyBytes ?? await withDeadline(row.response.body(), 10_000, 'body fetch')
           const bytes = body.subarray(0, cap)
           const ext = bodyExtension(row.response.headers()['content-type'])
           const file = path.join(dir, `${num}.res${ext}`)
@@ -774,16 +777,18 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const result = await page.evaluate(async ({ fetchUrl, fetchMethod, fetchHeaders, fetchBody }) => {
         try {
           const res = await fetch(fetchUrl, { method: fetchMethod, headers: fetchHeaders, body: fetchBody, credentials: 'include' })
-          // Verification #5b: res.text() UTF-8-decodes the body, CORRUPTING
-          // binary payloads (and the sha/file written from it). Capture the
-          // raw ArrayBuffer and carry it out as chunked base64 — evaluate
-          // cannot serialize ArrayBuffers; 0x8000 keeps apply() off the
-          // call-stack limit. The preview is the only lossy decode.
+          // Verification rounds #5b + 2026-11-19 BLOCKER: res.text() UTF-8
+          // decodes (corrupts binaries), and the first fix shipped a raw
+          // binary string labeled base64 (no btoa) — EVERY body, sha and
+          // body_file came out garbage. This leg now encodes REAL chunked
+          // base64: chunk 0x7F80 (a multiple of 3 — no mid-stream padding
+          // at chunk seams; under the apply() arg limit), btoa per chunk.
+          // Keep byte-identical to chunkedBase64() in session.ts (tested).
           const bytes = new Uint8Array(await res.arrayBuffer())
           let b64 = ''
-          const CHUNK = 0x8000
+          const CHUNK = 0x7F80
           for (let at = 0; at < bytes.length; at += CHUNK)
-            b64 += String.fromCharCode.apply(null, Array.from(bytes.subarray(at, at + CHUNK)) as never)
+            b64 += btoa(String.fromCharCode.apply(null, bytes.subarray(at, at + CHUNK) as never))
           const preview = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, 4000))
           const picked: Record<string, string> = {}
           for (const name of ['content-type', 'content-length', 'location', 'www-authenticate', 'retry-after', 'x-request-id']) {

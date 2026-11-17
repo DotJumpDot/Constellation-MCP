@@ -190,17 +190,27 @@ export function detectDeviceBoundSessions(stateDir: string, profileLabel: string
 export function deviceBoundSessionsFor(stateDir: string, profileLabel: string, domains: readonly string[]): string[] | null {
   const profileDir = profileLabel === '(direct)' ? stateDir : path.join(stateDir, profileLabel)
   const store = path.join(profileDir, 'Network', 'Device Bound Sessions')
-  try {
-    const blob = fs.readdirSync(store)
-      .filter(f => { try { return !fs.statSync(path.join(store, f)).isDirectory() } catch { return false } })
-      .map(f => fs.readFileSync(path.join(store, f)).toString('latin1'))
-      .join('\n')
+  const scan = (blob: string): string[] => {
     const found = new Set<string>()
     for (const domain of domains) {
       const host = cookieHost(domain.toLowerCase())
       if (host !== '' && blob.includes(host)) found.add(domain)
     }
     return [...found]
+  }
+  try {
+    // Verification round 2026-11-19 (#6 half-fixed): Chrome 157 stores DBSC
+    // state as a SQLite FILE at this path (+ -journal) — the old
+    // readdirSync threw ENOTDIR (not ENOENT), so the decisive-absence branch
+    // never fired and file-layout profiles always read "unreadable". A file
+    // is scanned directly; a directory uses the legacy multi-file scan.
+    const stat = fs.statSync(store)
+    if (stat.isFile()) return scan(fs.readFileSync(store).toString('latin1'))
+    const blob = fs.readdirSync(store)
+      .filter(f => { try { return !fs.statSync(path.join(store, f)).isDirectory() } catch { return false } })
+      .map(f => fs.readFileSync(path.join(store, f)).toString('latin1'))
+      .join('\n')
+    return scan(blob)
   } catch (error) {
     // Verification #6: a store that does not EXIST is not "unreadable" —
     // Chrome only creates it on the first DBSC registration, so absence
