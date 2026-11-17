@@ -8,16 +8,17 @@ import type { Frame, Page } from 'playwright-core'
 import type { ConstellationConfig } from '../config.js'
 import { ScopeGuard } from '../scope.js'
 import { maskSecrets, passwordValuesProbe, redactSecrets } from '../redact.js'
-import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, classifyScopeRow, type ScopeRowClass, type BrowserSession } from './session.js'
+import { SHARED_OWNER, canTouchTab, loadOwnerLabels, sweepExtraContexts, isPagePlumbing, classifyScopeRow, summarizeScopeRows, type ScopeRowClass, type BrowserSession } from './session.js'
 import {
   detectChallenge, challengeAdvice, killChromeByProfile, plainProfileDir, cdpEndpointOwner,
   portOfCdpUrl, resolveChromeByDebugPort, bindCdpEndpoint, releaseCdpBinding, pidAlive,
   chromeProcessCensus,
   type ChallengeDetection,
 } from './plain-launch.js'
-import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, normalizeHostInput, partitionCookieRows, readProfileCookies } from './cookies.js'
+import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, normalizeHostInput, partitionCookieRows, readProfileCookies, resolveProfileLayout } from './cookies.js'
 import type { OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
+import { isBinaryContentType } from '../tools/http.js'
 import { appendChainEntry } from '../tools/evidence.js'
 
 export interface ToolEnv {
@@ -717,7 +718,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           const ext = bodyExtension(row.response.headers()['content-type'])
           const file = path.join(dir, `${num}.res${ext}`)
           fs.writeFileSync(file, bytes)
-          resNote = `response body: ${body.length} bytes${body.length > cap ? ` (only the first ${cap} written)` : ''} — ${num}.res${ext} — sha256 ${shaOf(bytes).slice(0, 16)}…${row.bodyBytes !== undefined ? ' (armed capture — survived navigation)' : ''}`
+          resNote = `response body: ${body.length} bytes${body.length > cap ? ` (only the first ${cap} written)` : ''} — ${num}.res${ext} — sha256 ${shaOf(bytes).slice(0, 16)}…${row.bodyBytes !== undefined ? ` (armed capture by ${row.armedBy ?? 'unknown'} — survived navigation)` : ''}`
           preview = truncate(redactSecrets(body.toString('utf8').slice(0, 200)).replace(/\s+/g, ' ').trim(), 200)
         } catch (error) {
           resNote = `response body: UNAVAILABLE — ${describeErrorChain(error).slice(0, 160)}${row.bodyError !== undefined ? ` (armed capture failed: ${row.bodyError.slice(0, 120)})` : ''} (bodies die when the page navigates; arm browser_network_record BEFORE the click that matters)`
@@ -752,7 +753,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
           : 'Disarmed. Bodies are back to lazy best-effort (they die when the page navigates away).')
     })
 
-  t('browser_fetch', 'Fetch a URL INSIDE this owner\'s page context (run-42 §1: the guarded "session-fetch") — the request rides the page\'s own credential state (cookies, client certs, service-worker-visible identity) with NO token ever entering the transcript. This is the cookie-vs-BEARER mismatch tool: when http_request {browser:"owner"} comes back 401 because the host wants headers the browser session cannot supply out-of-page, this call is the same-origin answer. Boundaries, stated plainly: (1) it is subject to the PAGE\'s CORS rules — same-origin APIs just work, cross-origin APIs answer only if they send CORS headers; (2) a Bearer token the app injects via its own JS wrappers does NOT ride automatically — if the API needs one, capture the app\'s own call instead (browser_network_record before the click, then browser_network_bodies); (3) any header value you PASS here is in the transcript — pass nothing sensitive; (4) the INITIAL url is scope-asserted before the fetch leaves, but REDIRECTS follow the page\'s rules (not per-hop asserted like http_request) — the final URL is audited after the fact and an out-of-scope landing is flagged loudly in the result, never silently.',
+  t('browser_fetch', 'Fetch a URL INSIDE this owner\'s page context (run-42 §1: the guarded "session-fetch") — the request rides the page\'s own credential state (cookies, client certs, service-worker-visible identity) with NO token ever entering the transcript. This is the cookie-vs-BEARER mismatch tool: when http_request {browser:"owner"} comes back 401 because the host wants headers the browser session cannot supply out-of-page, this call is the same-origin answer. Boundaries, stated plainly: (1) it is subject to the PAGE\'s CORS rules — same-origin APIs just work, cross-origin APIs answer only if they send CORS headers; (2) a Bearer token the app injects via its own JS wrappers does NOT ride automatically — if the API needs one, capture the app\'s own call instead (browser_network_record before the click, then browser_network_bodies); (3) any header value you PASS here is in the transcript — pass nothing sensitive; (4) the INITIAL url is scope-asserted before the fetch leaves, but REDIRECTS follow the page\'s rules (not per-hop asserted like http_request) — the final URL is audited after the fact (allowed and denied alike) and an out-of-scope landing is flagged loudly in the result, never silently; (5) the sha256 and body_file cover the EXACT response bytes — binary-safe.',
     {
       url: z.string().describe('Absolute URL — scope-guarded'),
       method: z.string().optional().describe('HTTP method (default GET)'),
@@ -773,12 +774,22 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const result = await page.evaluate(async ({ fetchUrl, fetchMethod, fetchHeaders, fetchBody }) => {
         try {
           const res = await fetch(fetchUrl, { method: fetchMethod, headers: fetchHeaders, body: fetchBody, credentials: 'include' })
-          const text = await res.text()
+          // Verification #5b: res.text() UTF-8-decodes the body, CORRUPTING
+          // binary payloads (and the sha/file written from it). Capture the
+          // raw ArrayBuffer and carry it out as chunked base64 — evaluate
+          // cannot serialize ArrayBuffers; 0x8000 keeps apply() off the
+          // call-stack limit. The preview is the only lossy decode.
+          const bytes = new Uint8Array(await res.arrayBuffer())
+          let b64 = ''
+          const CHUNK = 0x8000
+          for (let at = 0; at < bytes.length; at += CHUNK)
+            b64 += String.fromCharCode.apply(null, Array.from(bytes.subarray(at, at + CHUNK)) as never)
+          const preview = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, 4000))
           const picked: Record<string, string> = {}
           for (const name of ['content-type', 'content-length', 'location', 'www-authenticate', 'retry-after', 'x-request-id']) {
             const v = res.headers.get(name); if (v !== null) picked[name] = v
           }
-          return { ok: true as const, status: res.status, statusText: res.statusText, url: res.url, headers: picked, body: text }
+          return { ok: true as const, status: res.status, statusText: res.statusText, url: res.url, headers: picked, byteLength: bytes.length, b64, preview }
         } catch (error) {
           return { ok: false as const, error: String(error) }
         }
@@ -786,36 +797,42 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const timing = Date.now() - started
       if (!result.ok)
         return textResult(`in-page fetch FAILED (${timing} ms): ${result.error.slice(0, 300)}\nIf this is a CORS/type error, the page\'s origin is not allowed to read that API cross-origin — same-origin calls or CORS-enabled hosts only (check the tool description for the Bearer boundary).`, true)
-      const bytes = Buffer.from(result.body, 'utf8')
+      const bytes = Buffer.from(result.b64, 'base64')
       const sha = createHash('sha256').update(bytes).digest('hex')
       // Redirects inside the page follow the PAGE's rules, so only the
-      // initial URL was assertable — audit where the chain actually LANDED
-      // and flag an out-of-scope landing loudly (verification round
-      // 2026-11-16: "scope-asserted like every leg" overstated this).
+      // initial URL was assertable — audit where the chain actually LANDED,
+      // allowed and denied alike (verification: "checked + audited" must be
+      // literally true), and flag an out-of-scope landing loudly.
       const landing = env.scope.check(result.url, who)
-      if (!landing.allowed)
-        env.scope.audit(result.url, who, 'browser_fetch(landing)', landing)
+      env.scope.audit(result.url, who, 'browser_fetch(landing)', landing)
+      const isBinary = isBinaryContentType(result.headers['content-type'])
       const lines: string[] = [
         `HTTP ${result.status} ${result.statusText} — in-page fetch from ${page.url()} (${timing} ms; rode the page's own credentials)`,
         ...(!landing.allowed
           ? [`⚠ REDIRECT LEFT THE SCOPE: the chain landed on ${result.url} (${landing.reason}) — audited; the request already left, do NOT follow up out of scope. Re-arm scope_set if this host is legitimately part of the engagement.`]
           : []),
         `content-type: ${result.headers['content-type'] ?? '(none)'}`,
-        `body sha256: ${sha} — ${bytes.length} byte(s)`,
+        `body sha256: ${sha} — ${bytes.length} byte(s)${bytes.length !== result.byteLength ? ` ⚠ TRANSPORT TRUNCATION (${result.byteLength} byte(s) decoded in-page — treat this body as suspect)` : ''}`,
       ]
       if (result.status === 401)
         lines.push('⚠ 401 through the page\'s own credentials — if this host uses a Bearer-style header token the app injects in JS, this tool cannot supply it: browser_network_record the app\'s own call instead.')
-      // Full body always lands on disk (the preview stays lean).
+      // Exact bytes always land on disk (the preview stays lean and, for
+      // binary bodies, is suppressed — it would be mojibake).
       try {
         const ct = (result.headers['content-type'] ?? '').toLowerCase()
-        const ext = ct.includes('json') ? '.json' : ct.includes('html') ? '.html' : ct.includes('xml') ? '.xml' : '.txt'
+        const ext = ct.includes('json') ? '.json' : ct.includes('html') ? '.html' : ct.includes('xml') ? '.xml' : ct.includes('image') ? '.img' : ct.includes('pdf') ? '.pdf' : '.bin'
         const dir = path.join(session.artifactDir(), 'responses')
         fs.mkdirSync(dir, { recursive: true })
         const file = path.join(dir, `${sha}${ext}`)
         if (!fs.existsSync(file)) fs.writeFileSync(file, bytes)
-        lines.push(`body_file: ${file} (full ${bytes.length} bytes)`)
+        lines.push(`body_file: ${file} (full ${bytes.length} bytes, exact)`)
       } catch { /* best effort */ }
-      lines.push('body preview:', bytes.length > cap ? bytes.subarray(0, cap).toString('utf8') + `\n…[${bytes.length} bytes total — body_file has it whole]` : result.body)
+      if (isBinary)
+        lines.push(`body preview: (binary ${result.headers['content-type']} — suppressed; the exact bytes are in body_file)`)
+      else
+        lines.push('body preview:', bytes.length > cap
+          ? result.preview.slice(0, cap) + `\n…[${bytes.length} bytes total — body_file has it whole]`
+          : result.preview)
       return textResult(lines.join('\n'))
     })
 
@@ -1290,16 +1307,25 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         const lines: string[] = []
         for (const raw of digest_domains) {
           const wanted = normalizeHostInput(raw)
+          if (wanted === '') {
+            lines.push(`${JSON.stringify(raw)}: invalid domain input — skipped`)
+            continue
+          }
           const jar = allCookies.filter(c => cookieMatchesAnyDomain(String(c.domain), [wanted]))
           const sessionCount = jar.filter(c => !(typeof c.expires === 'number' && c.expires > 0)).length
           const persistent = jar.length - sessionCount
           let dbsc = 'unknown (attached browser — the store is not ours to read)'
           if (canScan) {
             try {
-              const hit = deviceBoundSessionsFor(session.userDir!, 'Default', [wanted])
-              dbsc = hit === null ? 'unknown (store unreadable — possibly locked)'
+              // Verification #6: resolve the real profile layout instead of
+              // assuming 'Default', and absence of the store reads as the
+              // decisive "not bound" it is (deviceBoundSessionsFor now
+              // separates ENOENT from locked/unreadable).
+              const layout = resolveProfileLayout(session.userDir!)
+              const hit = deviceBoundSessionsFor(layout.stateDir, layout.profileLabel, [wanted])
+              dbsc = hit === null ? 'unknown (store exists but is unreadable — possibly locked)'
                 : hit.length > 0 ? `BOUND (dies with the browser instance; cookie replay will be revoked — browser_attach is the route)`
-                : 'not bound (plain cookie replay should hold)'
+                : 'not bound (no match in this profile\'s store; if the session still dies within minutes, treat it as bound)'
             } catch { dbsc = 'unknown (scan failed)' }
           }
           lines.push(`${wanted}: ${jar.length} cookie(s) — ${sessionCount} session (die with the browser) · ${persistent} persistent (survive a crash on disk) — DBSC: ${dbsc}`)
@@ -1699,25 +1725,12 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         ? `${pageScript.length} out-of-scope PAGE-SCRIPT request(s) from "${session.owner}" — the page's own JS called hosts the scope does not cover. Decide: scope_set the host (it is part of the app) or navigate away. Do NOT stop the lane for this.`
         : `Nothing lane-driven is out of scope. Observed from "${session.owner}": ${platform.length} vendor-platform + ${plumbing.length} page-plumbing request(s) — all page-initiated plumbing, NOT actionable.`
       if (summary === true) {
-        // Host tag rank: a host with ANY page-script row reads page-script
-        // (the class a reader must act on), then platform, then plumbing —
-        // first-seen order used to let a platform row mask a page-script one.
-        const rankOf = (kind: ScopeRowClass): number => kind === 'page-script' ? 3 : kind === 'platform' ? 2 : 1
-        const byHost = new Map<string, { count: number; kind: ScopeRowClass }>()
-        for (const row of rows) {
-          try {
-            const host = new URL(row.url).host
-            const kind = classifyScopeRow(row)
-            const slot = byHost.get(host)
-            if (slot === undefined) byHost.set(host, { count: 1, kind })
-            else { slot.count += 1; if (rankOf(kind) > rankOf(slot.kind)) slot.kind = kind }
-          } catch { /* keep going */ }
-        }
+        const summarized = summarizeScopeRows(rows).slice(0, 12)
         return textResult([
           head,
           'counts by host:',
-          ...[...byHost.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 12)
-            .map(([host, { count, kind }]) => `  ${String(count).padStart(4)}  ${host}${kind === 'page-script' ? '' : kind === 'platform' ? '  (vendor platform — not actionable)' : '  (plumbing)'}`),
+          ...summarized.map(({ host, count, kind }) =>
+            `  ${String(count).padStart(4)}  ${host}${kind === 'page-script' ? '' : kind === 'platform' ? '  (vendor platform — not actionable)' : '  (plumbing)'}`),
         ].join('\n'))
       }
       return textResult([

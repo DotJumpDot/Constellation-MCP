@@ -550,9 +550,18 @@ export function formatResult(r: RequestResult, headersFull = false): string {
     ? shown.map(([k, v]) => `  ${k}: ${v}`).join('\n')
     : '  (no card-relevant headers)'
   const binary = isBinaryContentType(r.headers['content-type'])
-  const signedOut = detectSignedOut(r.url_final, r.headers['content-type'], r.body.slice(0, 4000))
+  // Verification #3: the login-path heuristic (run-39 §12.7) is an HTML
+  // signal — applied to JSON it flagged every API under /api/auth/*, /sso,
+  // /login as "signed out" (a JSON 401 there is the API answering, not a
+  // login redirect) and suppressed the auth-scheme hint those calls need.
+  // The signed-out warning is now HTML-only (or content-type-less, where
+  // the path is the only signal); an API-shaped 401 always draws the hint.
+  const ct = r.headers['content-type'] ?? ''
+  const looksHtml = /html/i.test(ct)
+  const looksApi = /json|javascript|ecmascript|urlencoded|xml/i.test(ct)
+  const signedOut = (looksHtml || ct === '') && detectSignedOut(r.url_final, r.headers['content-type'], r.body.slice(0, 4000))
   const authMismatch = r.status === 401 && !signedOut && (
-    r.headers['www-authenticate'] !== undefined || /json|javascript/i.test(r.headers['content-type'] ?? '') || !/html/i.test(r.headers['content-type'] ?? 'html'))
+    r.headers['www-authenticate'] !== undefined || looksApi || ct === '')
   return [
     `HTTP ${r.status} ${r.statusText} (${r.timing_ms} ms) — final URL: ${r.url_final}${r.redirect_hops !== undefined ? ` (${r.redirect_hops} redirect hop(s) followed, each scope-checked)` : ''}`,
     ...(signedOut

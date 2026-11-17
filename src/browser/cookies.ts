@@ -201,7 +201,14 @@ export function deviceBoundSessionsFor(stateDir: string, profileLabel: string, d
       if (host !== '' && blob.includes(host)) found.add(domain)
     }
     return [...found]
-  } catch {
+  } catch (error) {
+    // Verification #6: a store that does not EXIST is not "unreadable" —
+    // Chrome only creates it on the first DBSC registration, so absence
+    // means no device-bound sessions were ever recorded (decisive "not
+    // bound"), while other failures (locked DB, permissions) stay
+    // inconclusive-null.
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return []
     return null
   }
 }
@@ -241,13 +248,16 @@ export function normalizeHostInput(raw: string): string {
   const trimmed = raw.trim()
   if (trimmed === '') return ''
   try {
-    // new URL keeps a leading dot (".example.com" is a legal hostname to it);
-    // cookie matching wants the bare host either way.
-    return new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`).hostname.toLowerCase().replace(/^\.+/, '')
+    // new URL keeps a leading dot (".example.com" is a legal hostname to it)
+    // and a trailing dot (the FQDN root, "example.com."); cookie matching
+    // wants the bare host either way. A wildcard prefix ("*.example.com")
+    // is a scope-style entry, not a cookie host — strip it.
+    return new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`)
+      .hostname.toLowerCase().replace(/^\*+\./, '').replace(/^\.+/, '').replace(/\.+$/, '')
   } catch {
     // Not URL-parseable even with a scheme prepended (bare IPv6 etc.) — fall
     // back to a conservative strip: no scheme, no port, no path, no dots.
-    return trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0]!.split(':')[0]!.toLowerCase().replace(/^\.+/, '')
+    return trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0]!.split(':')[0]!.toLowerCase().replace(/^\*+\./, '').replace(/^\.+/, '').replace(/\.+$/, '')
   }
 }
 
@@ -273,17 +283,29 @@ export function partitionCookieRows(rows: Array<Record<string, unknown>>): Cooki
     const why = (reason: string): string => `"${name || '(unnamed)'}" ${String(row.domain ?? row.url ?? '?')} — ${reason}`
     if (name === '') { dropped.push(why('no name')); continue }
     if (typeof row.value !== 'string') { dropped.push(why('value is not a string')); continue }
-    if (typeof row.domain !== 'string' || row.domain === '') { dropped.push(why('no domain')); continue }
+    // Playwright accepts domain OR url as the cookie's host source
+    // (verification #13: url-only rows used to be dropped though they
+    // import fine).
+    const hasDomain = typeof row.domain === 'string' && row.domain !== ''
+    const hasUrl = typeof row.url === 'string' && row.url !== ''
+    if (!hasDomain && !hasUrl) { dropped.push(why('no domain or url')); continue }
     if (row.sameSite === '') { delete row.sameSite; notes.push(`"${name}": empty sameSite dropped`) }
     else if (row.sameSite !== undefined && !['Strict', 'Lax', 'None'].includes(String(row.sameSite))) {
       const n = Number(row.sameSite)
       if (n === 1 || n === 2) { row.sameSite = n === 1 ? 'Lax' : 'Strict'; notes.push(`"${name}": sameSite ${String(original.sameSite)} → ${String(row.sameSite)}`) }
       else if (n === 0 && row.secure === true) { row.sameSite = 'None'; notes.push(`"${name}": sameSite 0 (secure) → None`) }
       else if (n === 0) { delete row.sameSite; notes.push(`"${name}": sameSite 0 without secure dropped (Chrome would reject the cookie)`) }
-      else { delete row.sameSite; notes.push(`"${name}": unrecognized sameSite "${String(row.sameSite)}" dropped`) }
+      else { delete row.sameSite; notes.push(`"${name}": unrecognized sameSite ${JSON.stringify(original.sameSite)} dropped`) }
     }
     if (row.sameSite === 'None' && row.secure !== true) { row.secure = true; notes.push(`"${name}": secure forced for SameSite=None (None is only valid on secure)`) }
-    if (row.expires !== undefined && row.expires !== -1 && typeof row.expires !== 'number') { delete row.expires; notes.push(`"${name}": non-numeric expires dropped`) }
+    // Verification #13: NaN is a `number` to typeof — passing it through
+    // could abort the whole batch at addCookies. Non-finite expires goes.
+    const expiresRaw = row.expires
+    if (expiresRaw !== undefined && expiresRaw !== -1
+      && (typeof expiresRaw !== 'number' || !Number.isFinite(expiresRaw as number))) {
+      delete row.expires
+      notes.push(`"${name}": ${typeof expiresRaw === 'number' ? 'non-finite' : 'non-numeric'} expires dropped`)
+    }
     good.push(row)
   }
   return { good, dropped, notes }

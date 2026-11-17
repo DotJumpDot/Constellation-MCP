@@ -75,6 +75,9 @@ export interface NetworkCapture extends NetworkRecord {
    *  handle dies on navigation, these bytes do not. */
   bodyBytes?: Buffer
   bodyError?: string
+  /** Who armed the capture that materialized this body (verification #9 —
+   *  the bodies report names the armer, not just the fact of arming). */
+  armedBy?: string
 }
 
 const CONSOLE_RING = 300
@@ -106,10 +109,15 @@ export function isPagePlumbing(resourceType: string | undefined): boolean {
 const VENDOR_PLATFORM_HOST_RE = [
   /(^|\.)atlassian\.com$/,            // as./api./xp. — app-framework + tenant APIs
   /(^|\.)atlassian-dev\.net$/,        // *.cdn.prod.atlassian-dev.net Connect iframes
-  /^atlassian-cookies\./,             // cookie-partition hosts
   /(^|\.)statuspage\.io$/,            // status widget
   /(^|\.)hCaptcha\.com$/i,            // hCaptcha framework (same family as challenges.cloudflare.com)
 ]
+// Verification #4: the `^atlassian-cookies\.` prefix pattern was REMOVED —
+// it matched any host STARTING with that label (atlassian-cookies.evil.com
+// is attacker-named), and a lookalike reading "vendor platform" would be
+// muted exactly when it should read as page-script. Only suffix-anchored
+// patterns remain; an unknown cookie-partition host classifies page-script
+// (the fail-safe direction: visible, scope_set-able).
 export function isVendorPlatformHost(url: string): boolean {
   let host = url
   try { host = new URL(url).hostname.toLowerCase() } catch { /* raw host string */ }
@@ -127,6 +135,28 @@ export function classifyScopeRow(row: { url: string; resourceType?: string }): S
   if (isVendorPlatformHost(row.url)) return 'platform'
   if (isPagePlumbing(row.resourceType)) return 'plumbing'
   return 'page-script'
+}
+
+/** Host-tag rank for the summary view: a host with ANY page-script row reads
+ *  page-script (the class a reader must act on), then platform, then
+ *  plumbing — arrival order must not let a quieter class mask a louder one. */
+export function scopeRowClassRank(kind: ScopeRowClass): number {
+  return kind === 'page-script' ? 3 : kind === 'platform' ? 2 : 1
+}
+
+/** Counts-by-host summary of scope rows (browser_scope_violations
+ *  `summary:true`). Pure; extracted so tests pin the REAL ranking logic. */
+export function summarizeScopeRows(rows: Array<{ url: string; resourceType?: string }>): Array<{ host: string; count: number; kind: ScopeRowClass }> {
+  const byHost = new Map<string, { count: number; kind: ScopeRowClass }>()
+  for (const row of rows) {
+    let host = row.url
+    try { host = new URL(row.url).host } catch { /* keep raw */ }
+    const kind = classifyScopeRow(row)
+    const slot = byHost.get(host)
+    if (slot === undefined) byHost.set(host, { count: 1, kind })
+    else { slot.count += 1; if (scopeRowClassRank(kind) > scopeRowClassRank(slot.kind)) slot.kind = kind }
+  }
+  return [...byHost.entries()].map(([host, slot]) => ({ host, ...slot })).sort((a, b) => b.count - a.count)
 }
 
 /** Owner info-label persistence (DST-Comet P3, build-session advice): labels
@@ -504,9 +534,10 @@ export class BrowserSession {
       }
       // Armed capture (run-42 §1.2): materialize the body NOW, before the
       // page navigates away and Playwright disposes it. Fire-and-forget —
-      // the row records the bytes or the honest reason.
+      // the row records the bytes or the honest reason, plus who armed it.
       if (this.armedBodyCapture > 0) {
         this.armedBodyCapture -= 1
+        capture.armedBy = this.armedBy
         void response.body()
           .then(bytes => { capture.bodyBytes = bytes })
           .catch(error => { capture.bodyError = error instanceof Error ? error.message : String(error) })

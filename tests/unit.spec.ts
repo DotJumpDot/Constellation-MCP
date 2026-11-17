@@ -2538,7 +2538,12 @@ test('run-43 §1 / run-44 §3: scope rows classify platform / plumbing / page-sc
   assert.equal(classifyScopeRow({ url: 'https://xyz.cdn.prod.atlassian-dev.net/frame', resourceType: 'xhr' }), 'platform')
   assert.equal(classifyScopeRow({ url: 'https://api.atlassian.com/me', resourceType: 'xhr' }), 'platform')
   assert.equal(classifyScopeRow({ url: 'https://test.statuspage.io/widget', resourceType: 'fetch' }), 'platform')
-  assert.equal(classifyScopeRow({ url: 'https://atlassian-cookies.ingest.io/x', resourceType: 'ping' }), 'platform')
+  // Verification #4: the ^atlassian-cookies. prefix pattern was REMOVED — it
+  // matched attacker-named lookalikes (atlassian-cookies.evil.com) and muted
+  // them as "platform"; an unknown cookie-partition host on an app request
+  // stays page-script (visible, scope_set-able — the fail-safe direction).
+  assert.equal(classifyScopeRow({ url: 'https://atlassian-cookies.evil.com/x', resourceType: 'xhr' }), 'page-script')
+  assert.equal(classifyScopeRow({ url: 'https://atlassian-cookies.ingest.io/x', resourceType: 'ping' }), 'plumbing', 'asset loads still plumbing by type')
   // The app's OWN backend on an armed host is page-script (scope decision, not noise)
   assert.equal(classifyScopeRow({ url: 'https://cloud.stonikbyte.com/api/x', resourceType: 'xhr' }), 'page-script')
   // Assets the page loads stay plumbing
@@ -2569,8 +2574,18 @@ test('run-43 §4 + run-42 §1.3: formatResult compact headers + 401 auth-scheme 
   // ログインしてください body on a cookie replay read as "tool weirdness")
   const denied = formatResult({ ...base, status: 401, statusText: 'Unauthorized', headers: { 'content-type': 'application/json', 'www-authenticate': 'Bearer' } } as never)
   assert.ok(denied.includes('header token') && denied.includes('browser_fetch'), '401 hint names the cookie-vs-header mismatch and the tool that works')
+  // Verification #3: a JSON 401 on an /auth-path API is the API ANSWERING,
+  // not a login redirect — it must draw the hint even though the path says
+  // auth (this used to read "SESSION LOOKS SIGNED OUT" and suppress it).
+  const authApi = formatResult({ ...base, status: 401, url_final: 'https://x.example.com/api/auth/session', body: '{"error":"unauthorized"}', headers: { 'content-type': 'application/json' } } as never)
+  assert.ok(authApi.includes('header token'), 'JSON 401 on an auth-path API still draws the auth-scheme hint')
+  assert.ok(!authApi.includes('SIGNED OUT'), 'and is NOT misread as a login redirect')
+  // A real HTML login page keeps the signed-out warning, not the token hint
+  // (the old negative assertion was tautological — 'auth-scheme' appears in
+  // no output; assert on the strings that actually print).
   const loginPage = formatResult({ ...base, status: 401, url_final: 'https://x.example.com/login', body: '<form><input type=password>', headers: { 'content-type': 'text/html' } } as never)
-  assert.ok(!loginPage.includes('auth-scheme'), 'a real login page keeps the signed-out warning, not the token hint')
+  assert.ok(loginPage.includes('SIGNED OUT'), 'an HTML login page draws the signed-out warning')
+  assert.ok(!loginPage.includes('header token'), 'and not the auth-scheme hint')
 })
 
 test('run-44 §8: partitionCookieRows fixes trivial rows, drops bad ones with reasons', async () => {
@@ -2582,14 +2597,22 @@ test('run-44 §8: partitionCookieRows fixes trivial rows, drops bad ones with re
     { name: 'cross', value: 'v', domain: 'example.com', sameSite: 'None' },        // None without secure → forced
     { name: '', value: 'v', domain: 'example.com' },                               // no name → dropped
     { name: 'broken', domain: 'example.com' },                                     // no value → dropped
-    { name: 'nodom', value: 'v' },                                                 // no domain → dropped
+    { name: 'nodom', value: 'v' },                                                 // no domain/url → dropped
     { name: 'weird', value: 'v', domain: 'example.com', expires: 'soon' },         // bad expires → fixed
+    { name: 'nan', value: 'v', domain: 'example.com', expires: Number.NaN },       // NaN passes typeof number — must be caught (#13)
+    { name: 'urly', value: 'v', url: 'https://example.com/' },                     // url-only: Playwright accepts it (#13)
+    { name: 'junkss', value: 'v', domain: 'example.com', sameSite: 'lax;' },       // unrecognized value must appear in the note (#2)
   ])
-  assert.equal(good.length, 5, 'five importable rows survive (sid, old, jar, cross, weird)')
+  assert.equal(good.length, 8, 'eight importable rows survive (sid, old, jar, cross, weird, nan, urly, junkss)')
   assert.equal(dropped.length, 3, 'the three unimportable rows are named')
   assert.ok(dropped.some(d => d.includes('"broken"') && d.includes('value')))
   assert.ok(dropped.some(d => d.includes('(unnamed)') && d.includes('no name')))
-  assert.ok(dropped.some(d => d.includes('"nodom"') && d.includes('no domain')))
+  assert.ok(dropped.some(d => d.includes('"nodom"') && d.includes('no domain or url')))
+  assert.ok(good.some(c => c.name === 'urly' && c.url === 'https://example.com/'), 'url-only row imports')
+  const nanRow = good.find(c => c.name === 'nan')!
+  assert.equal(nanRow.expires, undefined, 'NaN expires dropped, never passed to addCookies')
+  const junk = notes.find(n => n.includes('"junkss"'))
+  assert.ok(junk !== undefined && junk.includes('lax;'), 'the unrecognized sameSite VALUE appears in the note (was "undefined")')
   assert.ok(notes.some(n => n.includes('"old"') && n.includes('empty sameSite')))
   assert.ok(notes.some(n => n.includes('"jar"') && n.includes('→ Lax')))
   assert.ok(notes.some(n => n.includes('"cross"') && n.includes('secure forced')))
@@ -2606,16 +2629,31 @@ test('verification 2026-11-16 #1: normalizeHostInput strips scheme/port/path to 
   assert.equal(normalizeHostInput('.example.com'), 'example.com')
   assert.equal(normalizeHostInput('  Sub.Example.COM/path  '), 'sub.example.com')
   assert.equal(normalizeHostInput('example.com'), 'example.com')
+  assert.equal(normalizeHostInput('example.com.'), 'example.com', 'trailing FQDN dot stripped')
+  assert.equal(normalizeHostInput('*.example.com'), 'example.com', 'wildcard prefix stripped')
   // Unparseable junk falls back to a conservative strip, never throws.
   assert.equal(typeof normalizeHostInput('https://[broken'), 'string')
   assert.equal(normalizeHostInput(''), '')
 })
 
-test('verification 2026-11-16 #4: summary host tag ranks page-script over platform', async () => {
-  // A host with BOTH platform and page-script rows must read page-script.
-  const rankOf = (kind: 'page-script' | 'platform' | 'plumbing'): number => kind === 'page-script' ? 3 : kind === 'platform' ? 2 : 1
-  const classes = ['platform', 'plumbing', 'page-script'] as const
-  let acc = classes[0]
-  for (const kind of classes) if (rankOf(kind) > rankOf(acc)) acc = kind
-  assert.equal(acc, 'page-script', 'rank upgrade reaches the actionable class regardless of arrival order')
+test('verification 2026-11-17: summarizeScopeRows pins the REAL ranking (imports the handler logic)', async () => {
+  const { summarizeScopeRows } = await import('../src/browser/session.js')
+  const rows = [
+    { url: 'https://cdn.prod.atlassian-dev.net/frame', resourceType: 'xhr' },   // platform
+    { url: 'https://cdn.prod.atlassian-dev.net/frame2', resourceType: 'fetch' },
+    { url: 'https://gstatic.com/a.woff', resourceType: 'font' },               // plumbing
+    { url: 'https://evil.example.com/x', resourceType: 'fetch' },              // page-script
+  ]
+  const byHost = Object.fromEntries(summarizeScopeRows(rows).map(s => [s.host, s]))
+  assert.equal(byHost['cdn.prod.atlassian-dev.net'].kind, 'platform', 'pure-platform host reads platform')
+  assert.equal(byHost['gstatic.com'].kind, 'plumbing', 'pure-plumbing host reads plumbing')
+  assert.equal(byHost['evil.example.com'].kind, 'page-script', 'page-script host reads page-script')
+  // The mask case the rank exists for: a plumbing row first, a page-script
+  // row later on the SAME host must upgrade the tag.
+  const mixed = summarizeScopeRows([
+    { url: 'https://app.example.com/pixel.png', resourceType: 'image' },
+    { url: 'https://app.example.com/api/x', resourceType: 'xhr' },
+  ])
+  assert.equal(mixed[0]!.kind, 'page-script', 'a page-script row upgrades a host whose first row was plumbing')
+  assert.equal(mixed[0]!.count, 2)
 })
