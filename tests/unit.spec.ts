@@ -2724,3 +2724,68 @@ test('verification 2026-11-19: withDeadline rejects a never-settling body promis
   const ok = await withDeadline(Promise.resolve(Buffer.from('data')), 1000, 'body fetch')
   assert.equal(ok.toString(), 'data', 'fast promises pass through untouched')
 })
+
+// ── run-50 round (2026-11-18): profile-held refusal, holder-named lock
+// message, unknown-tool did-you-mean, scope reap ────────────────────────────
+
+const RUN50_TOOLS = [
+  'browser_launch', 'browser_launch_plain', 'browser_cookies_import', 'browser_cookies_export',
+  'browser_network_record', 'browser_network_bodies', 'browser_map', 'browser_tabs',
+  'scope_set', 'scope_get', 'scope_clear', 'scope_reap', 'scope_audit',
+  'http_request', 'http_replay', 'mcp_tools', 'evidence_capture',
+]
+
+test('run-50 §14e: suggestToolName recovers the lane-guessed names', async () => {
+  const { suggestToolName } = await import('../src/server.js')
+  // The literal run-50 guess: token overlap beats an edit distance of 8.
+  assert.equal(suggestToolName('browser_import', RUN50_TOOLS), 'browser_cookies_import')
+  assert.equal(suggestToolName('mcp__constellation__browser_import', RUN50_TOOLS), 'browser_cookies_import', 'server-prefixed guesses normalize')
+  // Near typos via bounded edit distance.
+  assert.equal(suggestToolName('scope_reep', RUN50_TOOLS), 'scope_reap')
+  assert.equal(suggestToolName('browser_network_rec', RUN50_TOOLS), 'browser_network_record')
+  // A name that matches nothing real stays undefined (no confident lie).
+  assert.equal(suggestToolName('zz_glob_wobble', RUN50_TOOLS), undefined)
+  // Exact known names never come back as a "suggestion".
+  assert.equal(suggestToolName('scope_set', RUN50_TOOLS), undefined)
+  // A partial token match that is NOT every token is a different tool, not a match.
+  assert.equal(suggestToolName('browser_record_evidence', RUN50_TOOLS), undefined)
+})
+
+test('run-50 §2: lockedProfileMessage names the holding lane when known', async () => {
+  const { lockedProfileMessage } = await import('../src/browser/cookies.js')
+  const bare = lockedProfileMessage('C:\\p\\Default\\Cookies', 'EBUSY')
+  assert.match(bare, /locked by the browser that owns it \(EBUSY\)/)
+  assert.match(bare, /browser_cookies_export/, 'the live-session escape hatch stays')
+  assert.doesNotMatch(bare, /held by LIVE lane/, 'no registry holder → no fabricated lane name')
+  const named = lockedProfileMessage('C:\\p\\Default\\Cookies', 'EBUSY', 'bc-xss-2')
+  assert.match(named, /held by LIVE lane "bc-xss-2"/)
+  assert.match(named, /browser_kill \{owner:"bc-xss-2"\}/, 'the one-line fix the advice asked for')
+})
+
+test('run-50 §14d: scope_reap drops aged + legacy per-owner rules, keeps live/keep/global', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scopereap-'))
+  const scopeFile = path.join(dir, 'scope.json')
+  const guard = new ScopeGuard(scopeFile, path.join(dir, 'audit.jsonl'))
+  guard.set({ engagement: 'global-eng', in_scope: ['example.com'], out_scope: [] })
+  guard.set({ engagement: 'fresh-lane', in_scope: ['a.com'], out_scope: [] }, 'fresh-lane')
+  guard.set({ engagement: 'aged-lane', in_scope: ['b.com'], out_scope: [] }, 'aged-lane')
+  guard.set({ engagement: 'legacy-lane', in_scope: ['c.com'], out_scope: [] }, 'legacy-lane')
+  guard.set({ engagement: 'live-lane', in_scope: ['d.com'], out_scope: [] }, 'live-lane')
+  // set() stamps armedAt — fresh rules must carry it.
+  assert.ok(guard.current('fresh-lane')?.armedAt, 'set() stamps armedAt')
+  // Age one rule past the cutoff and unstamp the legacy one, then reload.
+  const aged = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString()
+  const file = JSON.parse(fs.readFileSync(scopeFile, 'utf8'))
+  file.perOwner['aged-lane'].armedAt = aged
+  delete file.perOwner['legacy-lane'].armedAt
+  fs.writeFileSync(scopeFile, JSON.stringify(file))
+  const reloaded = new ScopeGuard(scopeFile, path.join(dir, 'audit.jsonl'))
+  const { dropped, kept } = reloaded.reap(30, {
+    keep: ['aged-lane'],
+    live: () => new Set(['live-lane']),
+  })
+  assert.deepEqual(dropped, ['legacy-lane'], 'unstamped legacy backlog is reappable now')
+  assert.deepEqual(kept, ['aged-lane', 'fresh-lane', 'live-lane'], 'keep list, live owner, and fresh rule survive')
+  assert.equal(reloaded.current()?.engagement, 'global-eng', 'the global rule is never reaped')
+  assert.deepEqual(reloaded.owners(), ['aged-lane', 'fresh-lane', 'live-lane'])
+})

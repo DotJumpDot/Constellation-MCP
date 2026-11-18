@@ -47,6 +47,21 @@ Config: CLI flags (`--browser chrome`, `--headless`, `--shared-user-data-dir`,
 `CONSTELLATION_*` env. Secrets come from `CONSTELLATION_SECRET_*` /
 `DSH_SECRET_*` env only — never files, never literals in source.
 
+## Session handoff lifetimes (measured — run-50 §12, three runs)
+
+Different login routes on the same tenant decay at very different speeds;
+build lane sequences that do not outlive their seed identity:
+
+| Route | Measured lifetime | Use for |
+| --- | --- | --- |
+| Password sign-in in the lane's own browser | stable for the whole lane (~hours) | any lane longer than 5 minutes |
+| Cookie handoff (`browser_cookies_export` → `import`) onto a DBSC-bound tenant (Atlassian) | **~4 minutes** (3–4 min, two lanes) — the same cookies stayed valid in their origin profile; a device/session binding, not cookie expiry | one short leg only |
+| Lead's plain-profile Bugcrowd session | **~40 minutes** (died twice in one run) | board-watch legs need a lane-owned session, not the Lead's window |
+
+Template rule: **prefer a real sign-in over a cookie handoff for any lane
+longer than 5 minutes.** `browser_cookies_import`'s description carries the
+same numbers.
+
 ## Origin
 
 Started as a clone of microsoft/playwright-mcp (Apache-2.0, see `LICENSE` and

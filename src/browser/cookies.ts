@@ -321,12 +321,25 @@ export function partitionCookieRows(rows: Array<Record<string, unknown>>): Cooki
   return { good, dropped, notes }
 }
 
+/** The copy raced the profile's live browser and the OS refused it — say
+ * the fix, not the stack (run-11 D14). `heldBy` (run-50 §2/§14) names the
+ * lane when the server's own registry holds that profile, turning a
+ * 10-minute "locked or broken?" detour into a one-line decision. Pure. */
+export function lockedProfileMessage(cookiesFile: string, code: string, heldBy?: string): string {
+  const holder = heldBy === undefined
+    ? ''
+    : ` — held by LIVE lane "${heldBy}": browser_map to confirm, browser_kill {owner:"${heldBy}"} when it is safe, or wait for that lane to finish`
+  return `"${cookiesFile}" is locked by the browser that owns it (${code})${holder} — close that Chrome/Edge first, or read the cookies from the LIVE session instead (browser_cookies_export on an attached/owner browser) and import the handoff. Retrying while it runs will keep failing.`
+}
+
 /**
  * Read and decrypt one Chrome/Edge profile's cookies. The SQLite file is
  * copied to a temp dir first (Chrome holds it locked while running); v20 rows
- * are counted into warnings, never into values.
+ * are counted into warnings, never into values. `heldBy` only decorates the
+ * locked-file error (the lane whose browser holds the profile, if the
+ * registry knows one).
  */
-export async function readProfileCookies(profileDir: string, domainFilter?: string[]): Promise<ProfileCookieReport> {
+export async function readProfileCookies(profileDir: string, domainFilter?: string[], heldBy?: string): Promise<ProfileCookieReport> {
   const layout = resolveProfileLayout(profileDir)
   const warnings: string[] = []
   const deviceBoundSessions = detectDeviceBoundSessions(layout.stateDir, layout.profileLabel)
@@ -341,12 +354,9 @@ export async function readProfileCookies(profileDir: string, domainFilter?: stri
     try {
       fs.copyFileSync(layout.cookiesFile, tempDb)
     } catch (error) {
-      // Run-11 D14: while the profile's own browser is RUNNING it holds the
-      // Cookies DB locked — retries do not help (a pwsh Copy-Item retry
-      // failed identically in the field). Say the fix, not the stack.
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'EBUSY' || code === 'EPERM' || code === 'ETXTBSY') {
-        throw new Error(`"${layout.cookiesFile}" is locked by the browser that owns it (${code}) — close that Chrome/Edge first, or read the cookies from the LIVE session instead (browser_cookies_export on an attached/owner browser) and import the handoff. Retrying while it runs will keep failing.`)
+        throw new Error(lockedProfileMessage(layout.cookiesFile, code, heldBy))
       }
       throw error
     }

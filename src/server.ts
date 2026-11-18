@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { McpError } from '@modelcontextprotocol/sdk/types.js'
 import path from 'node:path'
 import type { ConstellationConfig } from './config.js'
 import { ScopeGuard } from './scope.js'
@@ -27,6 +28,91 @@ import { registerReportTools } from './tools/report.js'
 export interface ConstellationServer {
   connect(): Promise<void>
   dispose(): Promise<void>
+}
+
+/** Best candidate for a mistyped tool name (run-50 §14: lanes guessed
+ * "browser_import" and burned a call on the bare not-found). Two honest
+ * signals only: EVERY 3+ char token of the guess appears in the candidate
+ * (browser_import → browser_cookies_import, even though edit distance says
+ * 8), or a near typo on the normalized forms (scope_reep → scope_reap).
+ * Partial overlap suggests nothing — that is a different tool, not a typo.
+ * Pure; tested. */
+export function suggestToolName(raw: string, known: readonly string[]): string | undefined {
+  const norm = (s: string) => s.toLowerCase().replace(/^mcp__constellation__/, '').replace(/[-_]/g, '')
+  const stripped = raw.toLowerCase().replace(/^mcp__constellation__/, '')
+  const n = norm(raw)
+  if (n === '') return undefined
+  // A name that IS real is not a typo — never "suggest" a sibling instead.
+  if (known.some(k => norm(k) === n)) return undefined
+  const tokens = stripped.split(/[^a-z0-9]+/).filter(t => t.length >= 3)
+  const maxEdits = Math.max(2, Math.floor(n.length / 5))
+  let best: { name: string; extra: number } | undefined
+  for (const name of known) {
+    const cand = norm(name)
+    const fullOverlap = tokens.length > 0 && tokens.every(t => cand.includes(t))
+    const nearTypo = !fullOverlap && editDistance(n, cand) <= maxEdits
+    if (!fullOverlap && !nearTypo) continue
+    const extra = Math.abs(cand.length - n.length)
+    if (best === undefined || extra < best.extra) best = { name, extra }
+  }
+  return best?.name
+}
+
+function editDistance(a: string, b: string): number {
+  // bounded Wagner–Fischer; strings here are short tool names
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    let carry = prev[0]!
+    prev[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const temp = prev[j]!
+      prev[j] = Math.min(prev[j]! + 1, prev[j - 1]! + 1, carry + (a[i - 1] === b[j - 1] ? 0 : 1))
+      carry = temp
+    }
+  }
+  return prev[b.length]!
+}
+
+/** Append a "did you mean" hint to the SDK's bare `Tool X not found` error.
+ * Feature-detected on the SDK's internal handler map (keyed by the method
+ * STRING 'tools/call' in SDK ≥1.25) — if a future SDK release moves it, the
+ * hint silently disappears and the server behaves exactly as before (the
+ * suggestion itself lives in the tested suggestToolName above). */
+function installUnknownToolHint(mcp: McpServer, names: Set<string>): void {
+  const hintFor = (guessed: string): string => {
+    const best = suggestToolName(guessed, [...names])
+    return best !== undefined
+      ? ` — did you mean "${best}"? (mcp_tools lists all ${names.size} tools)`
+      : ` (mcp_tools lists all ${names.size} tools)`
+  }
+  try {
+    const handlers = (mcp as unknown as { server?: { _requestHandlers?: unknown } }).server?._requestHandlers
+    if (!(handlers instanceof Map)) return
+    const original = handlers.get('tools/call') as
+      | ((request: unknown, extra: unknown) => Promise<unknown>)
+      | undefined
+    if (typeof original !== 'function') return
+    handlers.set('tools/call', async (request: unknown, extra: unknown) => {
+      try {
+        const result = await original(request, extra)
+        // SDK ≥1.25 folds the not-found McpError into an isError RESULT
+        // (createToolError), carrying the McpError text — sometimes with its
+        // "MCP error -32602: " toString prefix — patch the text there.
+        const first = (result as { isError?: boolean; content?: Array<{ text?: string }> })?.content?.[0]
+        if ((result as { isError?: boolean })?.isError === true && first?.text !== undefined) {
+          const match = /^(?:MCP error -\d+: )?(Tool (.+) not found)$/.exec(first.text)
+          if (match !== null) first.text = `${match[1]}${hintFor(match[2]!)}`
+        }
+        return result
+      } catch (error) {
+        // Older/other paths throw the McpError instead — patch the throw.
+        const message = error instanceof Error ? error.message : String(error)
+        const match = /^Tool (.+) not found$/.exec(message)
+        if (match === null || !(error instanceof McpError)) throw error
+        throw new McpError((error as McpError).code, `${message}${hintFor(match[1]!)}`)
+      }
+    })
+  } catch { /* feature-detect failed — no hint, original behavior */ }
 }
 
 export function buildServer(config: ConstellationConfig): ConstellationServer {
@@ -57,8 +143,10 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
     ].join('\n'),
   })
 
+  const toolNames = new Set<string>()
   const registrar: ToolRegistrar = {
     registerTool: (name, info, schema, handler) => {
+      toolNames.add(name)
       mcp.registerTool(name, { ...info, inputSchema: schema }, async args => handler(args))
     },
   }
@@ -76,12 +164,13 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerMcpTools(registrar, { config, scope, budget })
   registerDnsTools(registrar, { scope, budget, jars })
   registerReportTools(registrar, { config })
-  registerScopeTools(registrar, scope, config.requireScope)
+  registerScopeTools(registrar, scope, config.requireScope, () => new Set(registry.liveOwnerNames()))
   registerSecretTools(registrar, scope)
   registerMailTools(registrar)
   registerOobTools(registrar, oob)
   registerGitTools(registrar)
   registerBudgetTools(registrar, budget)
+  installUnknownToolHint(mcp, toolNames)
   registry.startIdleSweeper()
 
   return {

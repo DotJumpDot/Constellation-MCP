@@ -7,6 +7,10 @@ export interface ScopeRule {
   in_scope: string[]
   /** Host patterns always denied even when inside in_scope. */
   out_scope: string[]
+  /** When this rule was armed (ISO). Stamped by set() since the run-50
+   *  round; rules persisted before that have no stamp and are treated as
+   *  reappable by reap() regardless of age — they all predate it. */
+  armedAt?: string
 }
 
 export interface ScopeDecision {
@@ -148,8 +152,9 @@ export class ScopeGuard {
   }
 
   set(rule: ScopeRule, owner?: string): void {
-    if (owner === undefined) this.rule = rule
-    else this.perOwner[owner] = rule
+    const stamped = { ...rule, armedAt: new Date().toISOString() }
+    if (owner === undefined) this.rule = stamped
+    else this.perOwner[owner] = stamped
     this.persist()
   }
 
@@ -166,6 +171,31 @@ export class ScopeGuard {
 
   owners(): string[] {
     return Object.keys(this.perOwner).sort()
+  }
+
+  /** Run-50 §14: per-lane rules accumulate across runs (~370 after run 50 —
+   * scope_clear at lane end is advisory and lanes skip it) until the owner
+   * list is unreadable ("… +362 more"). Drop per-owner rules older than
+   * maxAgeDays. Never drops the global rule; never drops an owner that is
+   * LIVE right now (a mid-run lane keeps its engagement scope) or listed in
+   * keep. Unstamped rules predate the armedAt stamp and are reappable
+   * immediately — that is exactly the accumulated backlog. Pure aside from
+   * persist(); tested. */
+  reap(maxAgeDays: number, opts: { keep?: string[]; live?: () => Set<string> } = {}): { dropped: string[]; kept: string[] } {
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000
+    const keep = new Set(opts.keep ?? [])
+    const live = opts.live !== undefined ? opts.live() : new Set<string>()
+    const dropped: string[] = []
+    const kept: string[] = []
+    for (const owner of Object.keys(this.perOwner)) {
+      if (live.has(owner) || keep.has(owner)) { kept.push(owner); continue }
+      const armedAt = this.perOwner[owner]!.armedAt
+      if (armedAt !== undefined && Date.parse(armedAt) >= cutoff) { kept.push(owner); continue }
+      delete this.perOwner[owner]
+      dropped.push(owner)
+    }
+    if (dropped.length > 0) this.persist()
+    return { dropped: dropped.sort(), kept: kept.sort() }
   }
 
   private persist(): void {

@@ -15,7 +15,7 @@ function trimOwners(perOwners: string[]): string {
   return `${perOwners.slice(0, 8).join(', ')} … +${perOwners.length - 8} more`
 }
 
-export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, requireScope: boolean): void {
+export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, requireScope: boolean, liveOwners?: () => Set<string>): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
       try { return await handler(args) } catch (error) { return errorResult(error) }
@@ -75,5 +75,23 @@ export function registerScopeTools(server: ToolRegistrar, scope: ScopeGuard, req
       const lines = scope.auditLines(limit ?? 50, owner)
       if (lines.length === 0) return textResult('(no scope decisions recorded yet)')
       return textResult(lines.map(l => `${l.allowed ? 'ALLOW' : 'DENY '} ${l.ts} ${l.owner} ${l.tool} ${l.host}${l.allowed ? '' : ' — ' + l.reason}`).join('\n'))
+    })
+
+  t('scope_reap', 'Housekeeping: per-lane scope rules accumulate across runs (~370 after run 50 — scope_clear at lane end is advisory) until the owner list is unreadable. Drops per-owner rules older than `max_age_days` (rules armed before the armedAt stamp are treated as reappable NOW — that is the backlog). NEVER drops the global rule, an owner with a LIVE browser session right now, or any owner in `keep_owners`. Safe to call mid-run.',
+    {
+      max_age_days: z.number().int().min(1).max(365).optional().describe('Drop per-owner rules armed more than this many days ago (default 30)'),
+      keep_owners: z.array(z.string()).optional().describe('Owner names whose rules survive regardless of age'),
+    },
+    async ({ max_age_days, keep_owners }: any) => {
+      const { dropped, kept } = scope.reap(max_age_days ?? 30, {
+        ...(keep_owners === undefined ? {} : { keep: keep_owners }),
+        ...(liveOwners === undefined ? {} : { live: liveOwners }),
+      })
+      return textResult([
+        `scope REAPED: dropped ${dropped.length} per-owner rule(s) older than ${max_age_days ?? 30} day(s) (or unstamped legacy); ${kept.length} kept (live owners + keep list + fresh rules).`,
+        `global rule: ${scope.current() === null ? 'none armed' : `"${scope.current()!.engagement}" (never reaped)`}`,
+        `remaining per-owner rules: ${trimOwners(scope.owners()) || '∅'}`,
+        ...(dropped.length > 0 ? [`dropped: ${trimOwners(dropped)}`] : []),
+      ].join('\n'))
     })
 }

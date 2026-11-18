@@ -16,7 +16,7 @@ import {
   type ChallengeDetection,
 } from './plain-launch.js'
 import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, normalizeHostInput, partitionCookieRows, readProfileCookies, resolveProfileLayout } from './cookies.js'
-import type { OwnerRegistry } from './registry.js'
+import { normalizeDir, type OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
 import { isBinaryContentType } from '../tools/http.js'
 import { appendChainEntry } from '../tools/evidence.js'
@@ -1218,7 +1218,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ].join('\n'))
     })
 
-  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session. Bad rows are SKIPPED with named reasons by DEFAULT (run-44 §8: one malformed row used to abort the WHOLE import with "Invalid cookie fields"); trivially fixable fields (empty sameSite, None-without-secure) are fixed in place and noted; pass `strict: true` for the old abort-everything behaviour.',
+  t('browser_cookies_import', 'Import cookies into an owner\'s browser. Two sources: `handoff_id` from browser_cookies_export, or `profile_dir` to read an EXTERNAL Chrome/Edge profile directly (run-7 P0-1: DPAPI-decrypted v10/v11, values stay server-side; v20 app-bound rows and Device-Bound-Session profiles are reported, not silently broken). AUDITED, not scope-asserted (run-11 D15): an import is a handoff, not target traffic — driving the browser to any host still goes through the navigation guard, so no scope widening is needed to move a session. Bad rows are SKIPPED with named reasons by DEFAULT (run-44 §8: one malformed row used to abort the WHOLE import with "Invalid cookie fields"); trivially fixable fields (empty sameSite, None-without-secure) are fixed in place and noted; pass `strict: true` for the old abort-everything behaviour. MEASURED LIFETIMES (run-50 §12, three independent runs): a cookie handoff onto a DBSC-bound tenant lasts ~4 MINUTES (Atlassian) even though the same cookies stayed valid in their origin profile — prefer a REAL sign-in for any lane longer than 5 minutes; use the handoff only for a single short leg. A locked source profile names its holding lane in the error when the server knows one.',
     {
       owner: z.string().describe('Owner whose browser receives the cookies'),
       handoff_id: z.string().optional().describe('Handoff id from browser_cookies_export'),
@@ -1234,7 +1234,11 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       let targetLabel: string
       let extraLines: string[] = []
       if (profile_dir !== undefined && profile_dir !== '') {
-        const report = await readProfileCookies(profile_dir, domain_filter)
+        // Run-50 §2/§14: name the holder when the locked profile belongs to
+        // one of OUR live lanes — "EBUSY" alone left lanes guessing whether
+        // the source was locked or broken.
+        const heldBy = env.registry.liveOwnerOfUserDir(profile_dir)
+        const report = await readProfileCookies(profile_dir, domain_filter, heldBy)
         cookies = report.cookies as unknown as Array<Record<string, unknown>>
         targetLabel = report.hosts.join(', ')
         extraLines = report.warnings
@@ -1572,7 +1576,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       ].join('\n'))
     })
 
-  t('browser_launch', 'Launch this owner\'s browser on an EXPLICIT user-data-dir with extra Chrome args and NO automation flag (a normal-looking window — run-7 P0-2). Sign the human in there once, then browser_cookies_export works from it, or re-launch + attach for DBSC-bound identities.',
+  t('browser_launch', 'Launch this owner\'s browser on an EXPLICIT user-data-dir with extra Chrome args and NO automation flag (a normal-looking window — run-7 P0-2). Sign the human in there once, then browser_cookies_export works from it, or re-launch + attach for DBSC-bound identities. REFUSED up front with PROFILE_HELD_BY:<owner|external> when another live lane or an outside chrome.exe already holds that profile (run-50 §1: the handoff used to attach nothing) — pick another profile or close the holder.',
     {
       owner: z.string().describe('Owner name for the launched browser'),
       user_data_dir: z.string().describe('Absolute user-data-dir (created if missing)'),
@@ -1582,6 +1586,22 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const who = resolveOwner(owner)
       if (who === SHARED_OWNER) throw new Error('browser_launch needs a named owner — the shared session uses its own configured profile')
       if (!path.isAbsolute(user_data_dir)) throw new Error('user_data_dir must be an absolute path')
+      // Run-50 §1/§14: launching onto a profile another live owner (or an
+      // external chrome.exe) already holds makes Chrome hand off to the
+      // existing session — "Opening in existing browser session" — and this
+      // launch then attaches NOTHING or fails opaquely, costing lanes 2–5
+      // units and one lane ~10 minutes to discover. Refuse BEFORE spawning,
+      // naming a holder the lane can act on. Same-owner relaunch is exempt
+      // (launchFor closes that session first).
+      const holder = env.registry.liveOwnerOfUserDir(user_data_dir, who)
+      if (holder !== undefined)
+        throw new Error(`PROFILE_HELD_BY:${holder} — owner "${holder}" has a LIVE browser on ${user_data_dir}; launching now would hand off to their window and attach nothing. browser_map to confirm, have "${holder}" browser_close/browser_kill first, copy the profile to a new dir, or browser_launch_plain for your own warm profile.`)
+      const ownDir = env.registry.sessionIfExists(who)?.userDir
+      if (ownDir !== user_data_dir) {
+        const held = new Set([...await env.registry.runningProfileDirs()].map(normalizeDir))
+        if (held.has(normalizeDir(user_data_dir)))
+          throw new Error(`PROFILE_HELD_BY:external — a chrome.exe process that is NOT one of this server's live sessions is running on ${user_data_dir}: Chrome would hand off to that window and this launch would attach nothing. Close that Chrome first (check the taskbar), or copy the profile to a fresh dir. (browser_map lists the lanes this server owns.)`)
+      }
       env.scope.audit(`launch:${user_data_dir}`, who, 'browser_launch', {
         allowed: true,
         reason: `persistent launch on explicit user-data-dir${extra_args !== undefined ? ` with ${extra_args.length} extra arg(s)` : ''}`,

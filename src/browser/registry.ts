@@ -46,15 +46,23 @@ export class OwnerRegistry {
 
   /** Whether another LIVE session already owns this profile dir (run-39
    * §11.2: attach must not adopt another lane's window through a recycled
-   * port). Path comparison is case-insensitive, slash- and trailing-slash-
-   * tolerant — the census and PS layers hand us every variant. */
-  liveOwnerOfUserDir(userDir: string, exceptOwner: string): string | undefined {
+   * port; run-50 §1: browser_launch refuses a held profile BEFORE spawning).
+   * Path comparison is case-insensitive, slash- and trailing-slash-
+   * tolerant — the census and PS layers hand us every variant. Omit
+   * exceptOwner to ask about ANY holder (the cookies_import lock hint). */
+  liveOwnerOfUserDir(userDir: string, exceptOwner?: string): string | undefined {
     const want = normalizeDir(userDir)
     for (const [owner, session] of this.sessions) {
       if (owner === exceptOwner || session.context === undefined) continue
       if (normalizeDir(session.userDir) === want) return owner
     }
     return undefined
+  }
+
+  /** Sync owner-name list of LIVE sessions — scope_reap refuses to drop the
+   * rule of a lane whose browser is running right now. */
+  liveOwnerNames(): string[] {
+    return [...this.sessions.keys()]
   }
 
   /** Attach mode (run-7 P0-2): adopt a running browser over CDP as an owner

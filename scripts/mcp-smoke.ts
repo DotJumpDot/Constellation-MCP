@@ -41,7 +41,7 @@ async function main(): Promise<void> {
     'recipe_baseline', 'recipe_drift',
     'repo_commit', 'repo_status',
     'report_assemble',
-    'scope_audit', 'scope_clear', 'scope_get', 'scope_set',
+    'scope_audit', 'scope_clear', 'scope_get', 'scope_reap', 'scope_set',
     'secrets_get', 'secrets_list', 'secrets_patch',
     'session_keepalive', 'session_keepalive_stop', 'session_proof_set', 'session_status', 'session_verify', 'session_watch', 'session_watch_stop',
     'tab_lease', 'tab_open', 'tab_release',
