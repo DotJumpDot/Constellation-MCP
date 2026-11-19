@@ -31,7 +31,7 @@ async function main(): Promise<void> {
     'cell_ledger', 'cell_register', 'cell_run', 'cell_status',
     'diff_pair', 'dns_takeover_check', 'dupe_check',
     'evidence_capture', 'evidence_file', 'evidence_log', 'evidence_scan', 'evidence_verify',
-    'fixture_forge', 'fixture_hits', 'fixture_list', 'fixture_publish',
+    'fixture_forge', 'fixture_hits', 'fixture_lease', 'fixture_list', 'fixture_publish',
     'fixture_recipe_list', 'fixture_recipe_run', 'fixture_recipe_set',
     'http_diff', 'http_download', 'http_extract', 'http_jars', 'http_replay', 'http_request',
     'inject_create', 'inject_run', 'inject_score',
@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     'repo_commit', 'repo_status',
     'report_assemble',
     'scope_audit', 'scope_clear', 'scope_get', 'scope_reap', 'scope_set',
-    'secrets_get', 'secrets_list', 'secrets_patch',
+    'secrets_get', 'secrets_file_patch', 'secrets_list', 'secrets_patch',
     'session_keepalive', 'session_keepalive_stop', 'session_proof_set', 'session_status', 'session_verify', 'session_watch', 'session_watch_stop',
     'tab_lease', 'tab_open', 'tab_release',
   ]

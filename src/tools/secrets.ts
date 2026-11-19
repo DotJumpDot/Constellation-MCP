@@ -1,4 +1,7 @@
 import { z } from 'zod'
+import { createHash } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 import { errorResult, textResult, type ToolResult } from '../browser/tools.js'
 import type { ToolRegistrar } from '../browser/tools.js'
 
@@ -109,6 +112,67 @@ export function jsonSecretKeys(value: string): string[] | undefined {
   return undefined
 }
 
+/** Serialized mutation of a JSON FILE on disk (run-50 §3: two lanes
+ *  hand-rolling read-modify-write on atlassian-run50-tenant2.json clobbered
+ *  each other and one generated password was lost — ~6 units to recover).
+ *  Same contract as patchJsonSecret: per-path single-flight lock, RFC 7396
+ *  merge patch, values never enter the return value; the write is atomic
+ *  (temp file in the same dir + rename) so a crash mid-patch leaves either
+ *  the old or the new whole file, never a truncated one. */
+const jsonFileLocks = new Map<string, Promise<unknown>>()
+const JSON_FILE_MAX_BYTES = 8 * 1024 * 1024
+
+export async function patchJsonFile(file: string, patch: Record<string, unknown>): Promise<{ before: string[]; after: string[]; bytes: number; sha256: string; created: boolean }> {
+  const resolved = path.resolve(file)
+  if (!resolved.toLowerCase().endsWith('.json'))
+    throw new Error(`"${file}" is not a .json file — the atomic merge is for JSON objects only`)
+  const execute = async (): Promise<{ before: string[]; after: string[]; bytes: number; sha256: string; created: boolean }> => {
+    let parsed: unknown = {}
+    let created = false
+    if (fs.existsSync(resolved)) {
+      const stat = fs.statSync(resolved)
+      if (stat.size > JSON_FILE_MAX_BYTES)
+        throw new Error(`"${resolved}" is ${Math.round(stat.size / 1024)} KB — over the ${JSON_FILE_MAX_BYTES / 1024 / 1024} MB merge limit (a fixture/secrets file, not a data dump)`)
+      const text = fs.readFileSync(resolved, 'utf8')
+      try {
+        parsed = JSON.parse(text)
+      } catch (error) {
+        throw new Error(`"${resolved}" is not valid JSON (${error instanceof Error ? error.message : String(error)}) — the merge refuses to guess; fix or move the file first`)
+      }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+        throw new Error(`"${resolved}" is JSON but not an object — merge patch needs an object root`)
+    } else {
+      created = true
+    }
+    const merged = applyJsonMergePatch(parsed, patch)
+    const serialized = JSON.stringify(merged, null, 2) + '\n'
+    const tmp = `${resolved}.tmp-${process.pid}-${Date.now()}`
+    fs.writeFileSync(tmp, serialized)
+    try {
+      fs.renameSync(tmp, resolved)
+    } catch (error) {
+      try { fs.rmSync(tmp, { force: true }) } catch { /* best effort */ }
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES')
+        throw new Error(`could not replace "${resolved}" atomically (${code}) — another process holds the file; the original is UNTOUCHED (the merge wrote a temp file and discarded it)`)
+      throw error
+    }
+    return {
+      before: Object.keys(parsed as Record<string, unknown>).sort(),
+      after: Object.keys(merged as Record<string, unknown>).sort(),
+      bytes: Buffer.byteLength(serialized),
+      sha256: createHash('sha256').update(serialized).digest('hex'),
+      created,
+    }
+  }
+  // Single-flight per resolved path: patches queue behind the previous patch
+  // whatever its outcome, so two lanes can never interleave read-modify-write.
+  const prior = jsonFileLocks.get(resolved) ?? Promise.resolve()
+  const run = prior.then(execute, execute)
+  jsonFileLocks.set(resolved, run.then(() => undefined, () => undefined))
+  return run
+}
+
 export function registerSecretTools(server: ToolRegistrar, scope?: import('../scope.js').ScopeGuard): void {
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
@@ -156,6 +220,33 @@ export function registerSecretTools(server: ToolRegistrar, scope?: import('../sc
         `keys after:  ${result.after.join(', ') || '(none)'}`,
         ...(removed.length > 0 ? [`removed: ${removed.join(', ')}`] : []),
         ...(added.length > 0 ? [`added: ${added.join(', ')}`] : []),
+      ].join('\n'))
+    })
+
+  t('secrets_file_patch', 'Atomically merge-patch a JSON FILE on disk (run-50 §3: two lanes hand-rolling read-modify-write on the shared fixture JSON clobbered each other and lost a generated password). RFC 7396 JSON Merge Patch — objects merge recursively, null deletes a key, other values replace — under a per-path lock, written atomically (temp + rename, so a crash leaves the old or the new whole file, never a truncated one). A missing file starts as {}. Values never enter the transcript: the result lists keys before/after plus the new file\'s size and sha256 (citable in evidence_capture). Use this for shared per-run fixtures like tenant identity pools; env secrets still go through secrets_patch.',
+    {
+      file: z.string().describe('Path to the .json file (absolute, or relative to the server cwd — the run workspace)'),
+      patch: z.record(z.string(), z.unknown()).describe('Merge-patch object, e.g. {"identities":{"lane-b":{"email":"…","password":"…"}}}'),
+      owner: z.string().optional().describe('Your agent name (audit identity for the write)'),
+    },
+    async ({ file, patch, owner }: any) => {
+      if (patch === null || typeof patch !== 'object' || Array.isArray(patch))
+        return textResult('patch must be a JSON object (RFC 7396 merge patch)', true)
+      const result = await patchJsonFile(file, patch)
+      const who = owner === undefined || owner.trim() === '' ? 'unattributed' : owner.trim()
+      scope?.audit(`file:${file}`, who, 'secrets_file_patch', {
+        allowed: true,
+        reason: `atomic merge under lock${result.created ? ' (file created)' : ''}: ${result.after.length} top-level key(s), values never printed`,
+      })
+      const removed = result.before.filter(key => !result.after.includes(key))
+      const added = result.after.filter(key => !result.before.includes(key))
+      return textResult([
+        `Patched "${file}" under the per-file lock${result.created ? ' — file CREATED (was missing)' : ''} — now ${result.bytes} bytes.`,
+        `keys before: ${result.before.join(', ') || '(none)'}`,
+        `keys after:  ${result.after.join(', ') || '(none)'}`,
+        ...(removed.length > 0 ? [`removed: ${removed.join(', ')}`] : []),
+        ...(added.length > 0 ? [`added: ${added.join(', ')}`] : []),
+        `sha256: ${result.sha256} (values never printed; cite the hash in evidence_capture)`,
       ].join('\n'))
     })
 }

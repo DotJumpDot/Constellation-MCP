@@ -2789,3 +2789,76 @@ test('run-50 §14d: scope_reap drops aged + legacy per-owner rules, keeps live/k
   assert.equal(reloaded.current()?.engagement, 'global-eng', 'the global rule is never reaped')
   assert.deepEqual(reloaded.owners(), ['aged-lane', 'fresh-lane', 'live-lane'])
 })
+
+// ── run-50 leftovers round (2026-11-19): atomic JSON file merge + fixture leases ──
+
+test('run-50 §3: patchJsonFile merges atomically, creates missing files, refuses non-JSON', async () => {
+  const { patchJsonFile } = await import('../src/tools/secrets.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jsonfile-'))
+  const file = path.join(dir, 'tenant2-identities.json')
+  try {
+    // Two lanes patch CONCURRENTLY — the single-flight lock must serialize
+    // both into one file (the run-50 incident lost one write to the other).
+    await Promise.all([
+      patchJsonFile(file, { identities: { 'lane-a': { email: 'a@x.test', password: 'pw-a' } } }),
+      patchJsonFile(file, { identities: { 'lane-b': { email: 'b@x.test', password: 'pw-b' } } }),
+    ])
+    const merged = JSON.parse(fs.readFileSync(file, 'utf8'))
+    assert.deepEqual(Object.keys(merged.identities).sort(), ['lane-a', 'lane-b'], 'both concurrent patches survive')
+    assert.equal(merged.identities['lane-a'].password, 'pw-a')
+    // RFC 7396: null deletes, missing file starts {}, values never returned.
+    const result = await patchJsonFile(file, { identities: { 'lane-a': null }, stale: 'kept-then-deleted' })
+    assert.equal(result.created, false)
+    assert.ok(result.after.includes('stale'), 'the set landed before the delete')
+    await patchJsonFile(file, { stale: null })
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'))
+    assert.equal(after.identities['lane-a'], undefined, 'null deletes the key')
+    assert.equal(after.stale, undefined)
+    assert.match(result.sha256, /^[0-9a-f]{64}$/, 'the new file hash is citable')
+    // Fresh file creation works.
+    const fresh = await patchJsonFile(path.join(dir, 'new-file.json'), { a: 1 })
+    assert.equal(fresh.created, true)
+    // Non-.json paths are refused outright.
+    await assert.rejects(patchJsonFile(path.join(dir, 'notes.txt'), { a: 1 }), /not a \.json file/)
+    // A corrupted file is a named error, never a blind overwrite.
+    fs.writeFileSync(path.join(dir, 'broken.json'), '{nope')
+    await assert.rejects(patchJsonFile(path.join(dir, 'broken.json'), { a: 1 }), /not valid JSON.*refuses to guess/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('run-50 §10: fixture leases hold, conflict with the holder named, expire, and sweep', async () => {
+  const { FixtureLeases } = await import('../src/tools/fixture.js')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'leases-'))
+  const file = path.join(dir, 'fixture-leases.json')
+  try {
+    const leases = new FixtureLeases(file)
+    const held = leases.take('val-mailinj', 'val-mailinj', { note: 'issue_created rule', ttl_min: 60 })
+    assert.equal(held.owner, 'val-mailinj')
+    assert.equal(leases.holderOf('val-mailinj')?.owner, 'val-mailinj')
+    // A second lane is refused with the structured holder line.
+    assert.throws(() => leases.take('val-mailinj', 'bc-xss-1'), /FIXTURE_LEASE_HELD_BY:val-mailinj/, 'the conflict names the holder a lane can act on')
+    assert.throws(() => leases.take('val-mailinj', 'bc-xss-1'), /Ask "val-mailinj" to fixture_lease/)
+    // Same-owner re-take refreshes instead of conflicting.
+    const refreshed = leases.take('val-mailinj', 'val-mailinj', { ttl_min: 120 })
+    assert.ok(Date.parse(refreshed.expiresAt) > Date.parse(held.expiresAt), 're-take extends the lease')
+    // Only the holder may release.
+    assert.throws(() => leases.release('val-mailinj', 'bc-xss-1'), /only the holder may release/)
+    assert.equal(leases.release('val-mailinj', 'val-mailinj'), true)
+    assert.equal(leases.holderOf('val-mailinj'), undefined)
+    assert.equal(leases.release('val-mailinj', 'val-mailinj'), false, 'releasing an unleased name is a no-op')
+    // Expiry: a short lease stops holding, and list() sweeps it from disk.
+    leases.take('tenant2-mailbox', 'bc-ssrf-1', { ttl_min: 1 })
+    const sweep = JSON.parse(fs.readFileSync(file, 'utf8'))
+    sweep['tenant2-mailbox'].expiresAt = new Date(Date.now() - 1000).toISOString()
+    fs.writeFileSync(file, JSON.stringify(sweep))
+    assert.equal(new FixtureLeases(file).holderOf('tenant2-mailbox'), undefined, 'an expired lease never holds')
+    assert.deepEqual(new FixtureLeases(file).list().map(l => l.name), [], 'list() sweeps expired rows')
+    // Persistence round-trips a live lease.
+    leases.take('keep-me', 'bc-xss-2', { note: 'held' })
+    assert.equal(new FixtureLeases(file).holderOf('keep-me')?.note, 'held')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -60,7 +60,13 @@ build lane sequences that do not outlive their seed identity:
 
 Template rule: **prefer a real sign-in over a cookie handoff for any lane
 longer than 5 minutes.** `browser_cookies_import`'s description carries the
-same numbers.
+same numbers. For board-watch legs that must outlive the Lead's ~40-minute
+window, hand the session into a dedicated `board-watch` owner
+(`browser_cookies_export` → import) instead of polling from the Lead's own
+window. Shared per-run fixture JSON (tenant identity pools) belongs in
+`secrets_file_patch` — atomic merge under a lock, never two lanes
+hand-rolling read-modify-write — and event-driven fixtures belong under a
+`fixture_lease`.
 
 ## Origin
 

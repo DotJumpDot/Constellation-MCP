@@ -149,6 +149,84 @@ export class FixtureStore {
   }
 }
 
+// ── fixture leases (run-50 §10: two lanes on one event-driven fixture) ─────
+
+/** One held lease: a named engagement resource (e.g. "val-mailinj") pinned to
+ *  an owner until release or expiry. TTL-bounded so a crashed lane never
+ *  wedges the fixture for the rest of the run. */
+export interface FixtureLease {
+  name: string
+  owner: string
+  note?: string
+  takenAt: string
+  expiresAt: string
+}
+
+export const FIXTURE_LEASE_DEFAULT_TTL_MIN = 360
+
+/** Lease registry persisted beside the other run state. Expiry is evaluated
+ *  lazily on every read; `list()` also sweeps expired rows from disk. Pure
+ *  aside from the JSON file; tested directly. */
+export class FixtureLeases {
+  private leases: Record<string, FixtureLease> = {}
+
+  constructor(readonly file: string) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, FixtureLease>
+      if (parsed !== null && typeof parsed === 'object') this.leases = parsed
+    } catch { /* missing or malformed — start empty */ }
+  }
+
+  private persist(): void {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true })
+    fs.writeFileSync(this.file, JSON.stringify(this.leases, null, 2) + '\n')
+  }
+
+  /** The ACTIVE holder of a name, or undefined. An expired lease never holds. */
+  holderOf(name: string): FixtureLease | undefined {
+    const lease = this.leases[name]
+    if (lease === undefined) return undefined
+    if (Date.parse(lease.expiresAt) <= Date.now()) { delete this.leases[name]; this.persist(); return undefined }
+    return lease
+  }
+
+  /** Take (or refresh) a lease. Taking a name another owner holds
+   *  unexpired FAILS with the structured holder line a lane can act on. */
+  take(name: string, owner: string, opts: { note?: string; ttl_min?: number } = {}): FixtureLease {
+    const held = this.holderOf(name)
+    if (held !== undefined && held.owner !== owner)
+      throw new Error(`FIXTURE_LEASE_HELD_BY:${held.owner} — "${name}" has been leased by "${held.owner}" since ${held.takenAt}${held.note !== undefined ? ` (${held.note})` : ''} until ${held.expiresAt}. Two lanes on one event-driven fixture contaminate each other's controls (run-50 §10: a saved rule fired on foreign test issues and burned the validator's mail budget). Ask "${held.owner}" to fixture_lease {action:"release"} or pick another fixture.`)
+    const lease: FixtureLease = {
+      name,
+      owner,
+      ...(opts.note !== undefined && opts.note !== '' ? { note: opts.note } : {}),
+      takenAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + Math.max(opts.ttl_min ?? FIXTURE_LEASE_DEFAULT_TTL_MIN, 1) * 60_000).toISOString(),
+    }
+    this.leases[name] = lease
+    this.persist()
+    return lease
+  }
+
+  /** Release by the holder (or anyone, once expired — holderOf already
+   *  swept it). A non-holder release of a live lease FAILS naming the holder. */
+  release(name: string, owner: string): boolean {
+    const held = this.holderOf(name)
+    if (held === undefined) return false
+    if (held.owner !== owner)
+      throw new Error(`FIXTURE_LEASE_HELD_BY:${held.owner} — only the holder may release "${name}" (taken ${held.takenAt}, expires ${held.expiresAt}).`)
+    delete this.leases[name]
+    this.persist()
+    return true
+  }
+
+  /** Active leases sorted by name; expired rows are swept from disk. */
+  list(): FixtureLease[] {
+    for (const name of Object.keys(this.leases)) this.holderOf(name)
+    return Object.values(this.leases).sort((a, b) => a.name.localeCompare(b.name))
+  }
+}
+
 // ── fixture_forge: local document generation (run-8 proposals §1b) ──────────
 
 const CRC_TABLE = (() => {
@@ -276,9 +354,37 @@ export function markdownToPdf(title: string, markdown: string): Buffer {
 }
 
 export function registerFixtureTools(server: ToolRegistrar, store: FixtureStore): void {
+  const leases = new FixtureLeases(path.join(store.config.rootDir, 'fixture-leases.json'))
   const t = (name: string, description: string, schema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResult>) =>
     server.registerTool(name, { title: name, description }, schema, async args => {
       try { return await handler(args) } catch (error) { return errorResult(error) }
+    })
+
+  t('fixture_lease', 'Take a LEASE on one named engagement fixture so two lanes cannot contaminate each other (run-50 §10: a lane\'s saved issue_created rule fired on ANOTHER lane\'s test issues and consumed the validator\'s mail budget — nothing warned, and that is how false positives get manufactured). One event-driven fixture per run: the Lead records the lease in the spawn block AND here. Taking a name another owner holds fails with FIXTURE_LEASE_HELD_BY:<owner>; leases expire automatically (default 6h — a crashed lane never wedges the fixture); re-take refreshes; fixture_list shows active leases.',
+    {
+      name: z.string().min(1).optional().describe('Fixture/resource name, e.g. "val-mailinj" or "tenant2-mailbox" (required for take/release)'),
+      owner: z.string().min(1).optional().describe('Your agent/lane name (required for take/release)'),
+      action: z.enum(['take', 'release', 'list']).optional().describe('take (default) | release (holder only) | list (active leases — no other args needed)'),
+      note: z.string().optional().describe('What the lease is for (shown to other lanes)'),
+      ttl_min: z.number().int().min(1).optional().describe('Lease TTL in minutes (default 360)'),
+    },
+    async ({ name, owner, action, note, ttl_min }: any) => {
+      const act = action ?? 'take'
+      if (act === 'list') return leaseListResult(leases)
+      if (name === undefined || name === '' || owner === undefined || owner === '')
+        return textResult(`action "${act}" needs both name and owner (list needs neither)`, true)
+      if (act === 'release') {
+        const released = leases.release(name, owner)
+        return textResult(released
+          ? `Lease "${name}" RELEASED by "${owner}" — another lane may take it now.`
+          : `No active lease on "${name}" (nothing to release${Object.keys(leases.list()).length === 0 ? '' : ' — see the list below'}).`, released ? false : true)
+      }
+      const lease = leases.take(name, owner, { ...(note === undefined ? {} : { note }), ...(ttl_min === undefined ? {} : { ttl_min }) })
+      return textResult([
+        `Lease "${name}" TAKEN by "${owner}" — until ${lease.expiresAt} (ttl ${ttl_min ?? FIXTURE_LEASE_DEFAULT_TTL_MIN} min, auto-expires).`,
+        ...(lease.note !== undefined ? [`note: ${lease.note}`] : []),
+        'Other lanes taking this name get FIXTURE_LEASE_HELD_BY — record the lease in the spawn block.',
+      ].join('\n'))
     })
 
   t('fixture_publish', 'Publish attacker-controlled content behind a PUBLIC trycloudflare.com URL (run-8 §1a): the SSRF/blind-XSS/AI-exfil content host lanes used to hand-roll with cloudflared + a text file. `canary` is the proof value — fixture_hits reports canary_seen per hit, so a hit PROVES exfiltration instead of making you grep headers. Content must be things you are authorized to test with; the tunnel is torn down by oob_close {token:"__fixtures__"} or server shutdown.',
@@ -292,11 +398,15 @@ export function registerFixtureTools(server: ToolRegistrar, store: FixtureStore)
     async ({ kind, body, canary, label, ttl_hours }: any) => {
       const entry = store.publish({ kind, body, canary, label, ttl_hours })
       const url = await store.urlFor(entry.id)
+      // Run-50 §10: publishing under a label another lane LEASED is the
+      // contamination shape — warn loudly, do not silently mix controls.
+      const held = label === undefined ? undefined : leases.holderOf(label)
       return textResult([
         `url: ${url}`,
         `id: ${entry.id}${label !== undefined ? ` (${label})` : ''}`,
         ...(canary !== undefined && canary !== '' ? [`canary: ${canary} — fixture_hits {id:"${entry.id}"} reports canary_seen per hit`] : ['canary: (none — a hit proves traffic, not exfiltration)']),
         `ttl: ${ttl_hours ?? DEFAULT_TTL_HOURS}h — read hits with fixture_hits {id:"${entry.id}"}`,
+        ...(held !== undefined ? [`⚠ label "${label}" is LEASED by "${held.owner}" since ${held.takenAt} — a second lane on this fixture contaminates controls (run-50 §10); coordinate via fixture_lease`] : []),
       ].join('\n'))
     })
 
@@ -343,13 +453,26 @@ export function registerFixtureTools(server: ToolRegistrar, store: FixtureStore)
       return textResult(`Forged ${kind}: ${file} — ${stat.size} bytes. Upload it with browser_upload (Drive: upload then "Open with Google Docs"; Docs/Word import real documents without touching the kix editor).`)
     })
 
-  t('fixture_list', 'List published fixtures with hit and canary-hit counts.',
+  t('fixture_list', 'List published fixtures with hit and canary-hit counts, plus ACTIVE fixture leases (run-50 §10: the one-line view of which lane owns which event-driven fixture).',
     {},
     async () => {
       const rows = store.list()
-      if (rows.length === 0) return textResult('(no fixtures published — fixture_publish creates one)')
-      return textResult(rows.map(row =>
-        `${row.id}${row.label === undefined ? '' : ` (${row.label})`} — ${row.kind}, ${row.hits} hit(s), ${row.canary_hits} canary, ${row.age_min} min old`,
-      ).join('\n'))
+      const active = leases.list()
+      if (rows.length === 0 && active.length === 0) return textResult('(no fixtures published, no leases taken — fixture_publish creates one, fixture_lease takes a name)')
+      return textResult([
+        ...rows.map(row =>
+          `${row.id}${row.label === undefined ? '' : ` (${row.label})`} — ${row.kind}, ${row.hits} hit(s), ${row.canary_hits} canary, ${row.age_min} min old`),
+        ...active.map(lease =>
+          `lease: "${lease.name}" → ${lease.owner} (until ${lease.expiresAt}${lease.note !== undefined ? `; ${lease.note}` : ''})`),
+      ].join('\n'))
     })
+}
+
+/** The fixture_lease list view (also reused by release's nothing-to-release note). */
+function leaseListResult(leases: FixtureLeases): ToolResult {
+  const active = leases.list()
+  if (active.length === 0) return textResult('(no active fixture leases)')
+  return textResult(active.map(lease =>
+    `"${lease.name}" → ${lease.owner} (taken ${lease.takenAt}, until ${lease.expiresAt}${lease.note !== undefined ? `; ${lease.note}` : ''})`,
+  ).join('\n'))
 }
