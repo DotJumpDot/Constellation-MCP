@@ -75,6 +75,12 @@ export interface ConstellationConfig {
   /** Disk-budget re-check cadence in minutes (0 = startup check only).
    *  CONSTELLATION_DISK_BUDGET_CHECK_MIN (default 30). */
   diskBudgetCheckMin: number
+  /** Noise-governor profile (ARTEX-mining round 2026-11-20): off|quiet|
+   *  balanced|aggressive. Every outbound target touch is paced by
+   *  per-owner/per-host/global token buckets + jitter — queued, never
+   *  dropped; budget_set stays the hard tier. Default quiet (noise only
+   *  gets harder). CONSTELLATION_NOISE_PROFILE; runtime noise_profile. */
+  noiseProfile: string
 }
 
 function env(name: string): string | undefined {
@@ -117,6 +123,7 @@ export function defaultConfig(): ConstellationConfig {
     ramAutoPark: env('RAM_AUTOPARK') === '1' || env('RAM_AUTOPARK') === 'true',
     diskBudgetMb: int('DISK_BUDGET_MB', 10240),
     diskBudgetCheckMin: int('DISK_BUDGET_CHECK_MIN', 30),
+    noiseProfile: env('NOISE_PROFILE') ?? 'quiet',
   }
 }
 
@@ -177,6 +184,11 @@ export function applyCliArgs(config: ConstellationConfig, argv: string[]): strin
           : key === '--disk-budget-mb' ? 'diskBudgetMb' : 'diskBudgetCheckMin'
         ;(config as unknown as Record<string, unknown>)[field] = v
       }
+      continue
+    }
+    if (key === '--noise-profile') {
+      const v = value()
+      if (v !== undefined) config.noiseProfile = v
       continue
     }
     rest.push(arg)

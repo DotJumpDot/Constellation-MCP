@@ -47,6 +47,7 @@ async function main(): Promise<void> {
       'inject_create', 'inject_run', 'inject_score',
       'mail_diagnose', 'mail_get', 'mail_latest_otp', 'mail_search', 'mail_status', 'mail_wait',
       'mcp_auth_gate', 'mcp_diff', 'mcp_tools',
+      'noise_profile', 'noise_report',
       'oob_close', 'oob_events', 'oob_list', 'oob_new',
       'recipe_baseline', 'recipe_drift',
       'repo_commit', 'repo_status',
@@ -68,6 +69,8 @@ async function main(): Promise<void> {
     assert.match(String(map.content?.[0]?.text ?? ''), /UNRESTRICTED|scope:/)
     const storage = await client.callTool({ name: 'storage_reap', arguments: {} })
     assert.match(String(storage.content?.[0]?.text ?? ''), /cap/, 'storage_reap status mentions the cap')
+    const noise = await client.callTool({ name: 'noise_report', arguments: {} })
+    assert.match(String(noise.content?.[0]?.text ?? ''), /governor/, 'noise_report names the governor')
     console.log(`MCP SMOKE PASS (${names.length} tools registered)`)
   } finally {
     await client.close()

@@ -28,6 +28,7 @@ import path from 'node:path'
 import { z } from 'zod'
 import type { ConstellationConfig } from '../config.js'
 import type { ScopeGuard } from '../scope.js'
+import { paceNoise } from '../noise.js'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
 import type { BudgetGuard } from './budget.js'
 import { interpolateDeep } from './secrets.js'
@@ -103,6 +104,7 @@ function mcpHeaders(opts: McpRpcOptions, extra: Record<string, string> = {}): Re
  *  (Streamable HTTP servers vary); captures Mcp-Session-Id; never throws for
  *  an HTTP status — the caller decides what a 401 means. */
 export async function mcpRpc(opts: McpRpcOptions, body: unknown, sessionId?: string): Promise<McpRpcResult> {
+  await paceNoise(opts.owner, opts.url)
   const headers = mcpHeaders(opts, sessionId !== undefined ? { 'mcp-session-id': sessionId } : {})
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), opts.timeout_ms ?? RPC_TIMEOUT_DEFAULT)

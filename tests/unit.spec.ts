@@ -3046,3 +3046,149 @@ test('disk budget: measure counts profiles, artifacts and protected state separa
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── noise governor (ARTEX-mining round 2026-11-20) ───────────────────────────
+
+import { NoiseGovernor, installNoiseGovernor, hostKeyOf, reserve, type Bucket } from '../src/noise.js'
+
+/** Fake clock + recording sleep: pace() decides waits against `at`, sleeps
+ *  advance it — one microtask LATER, so paces fired in the same tick all
+ *  reserve against the same instant (that is what makes concurrent debt
+ *  stack, exactly like real awaits). Deterministic; jitter is the only
+ *  randomness and assertions bound it by the profile cap. */
+function fakeGovernor(profile: 'off' | 'quiet' | 'balanced' | 'aggressive', auditFile?: string) {
+  let at = 1_000_000
+  const sleeps: number[] = []
+  const governor = new NoiseGovernor(profile, {
+    now: () => at,
+    sleep: async ms => { sleeps.push(ms); await Promise.resolve(); at += ms },
+    ...(auditFile !== undefined ? { auditFile } : {}),
+  })
+  return { governor, sleeps, advance: (ms: number) => { at += ms }, now: () => at }
+}
+
+test('noise: token-bucket reserve math — full bucket free, debt is the wait, burst caps refill', () => {
+  const bucket: Bucket = { tokens: 3, last: 0 }
+  assert.equal(reserve(bucket, 0.1, 3, 0), 0) // burst allowance: first 3 free
+  assert.equal(reserve(bucket, 0.1, 3, 0), 0)
+  assert.equal(reserve(bucket, 0.1, 3, 0), 0)
+  const wait = reserve(bucket, 0.1, 3, 0) // 4th immediate send: debt = 1 token
+  assert.ok(Math.abs(wait - 10_000) < 5, `expected ~10000ms wait, got ${wait}`) // 1 / 0.1 rps
+  // 10 s later: refill repays exactly the 1-token debt, and THIS reserve
+  // consumes another — steady state, the wait stays ~1/rps (each borrow is
+  // paid by the previous sleep; the lane crawls at its ceiling, it never
+  // gets free sends back).
+  const steady = reserve(bucket, 0.1, 3, 10_000)
+  assert.ok(Math.abs(steady - 10_000) < 5, `steady-state wait stays ~1/rps, got ${steady}`)
+  // 20 s of idle accrues 2 tokens (debt 1 repaid + 1 spare): the next send
+  // is free, and long idle never exceeds the burst cap.
+  const next = reserve(bucket, 0.1, 3, 30_000)
+  assert.equal(next, 0)
+  assert.ok(bucket.tokens <= 3, 'refill is capped at burst')
+})
+
+test('noise: off profile is a strict passthrough — nothing counted, nothing waited', async () => {
+  const { governor, sleeps } = fakeGovernor('off')
+  for (let i = 0; i < 10; i++) await governor.pace('lane-a', 'https://target.example/x')
+  assert.equal(sleeps.length, 0)
+  const snap = governor.snapshot()
+  assert.equal(snap.profile, 'off')
+  assert.equal(snap.owners.length, 0)
+  assert.equal(snap.global.sent, 0)
+})
+
+test('noise: quiet paces a runaway lane — waits grow past the burst, every send audited', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'constellation-noise-'))
+  const auditFile = path.join(dir, 'noise-audit.jsonl')
+  const { governor, sleeps } = fakeGovernor('quiet', auditFile)
+  for (let i = 0; i < 8; i++) await governor.pace('runaway', 'https://target.example/x')
+  try {
+    // Every paced send waits at least its jitter (≤250 ms); sends past the
+    // burst-3 allowance pay the owner token debt (1/0.1 rps ≈ 10 s), capped
+    // by debt + jitter — steady state, the debt is paid by each sleep.
+    assert.equal(sleeps.length, 8, 'every paced send waited (jitter at minimum)')
+    assert.ok(sleeps.every(ms => ms <= 10_250), `waits bounded by debt + jitter cap, got ${sleeps.map(Math.round).join(',')}`)
+    assert.ok(sleeps.filter(ms => ms > 9_000).length >= 4, 'sends past the burst pay the ~10s token debt')
+    const snap = governor.snapshot()
+    assert.equal(snap.owners[0]!.owner, 'runaway')
+    assert.equal(snap.owners[0]!.sent, 8)
+    assert.ok(snap.owners[0]!.waits >= 4, 'sends past the burst are counted as throttled')
+    assert.equal(snap.hosts[0]!.host, 'target.example')
+    assert.equal(snap.global.sent, 8)
+    // The fake clock advanced through the sleeps, so waits were REAL debt.
+    const audit = fs.readFileSync(auditFile, 'utf8').trim().split('\n')
+    assert.equal(audit.length, 8, 'every paced send appended one audit line')
+    const first = JSON.parse(audit[0]!) as { owner: string; host: string; waited_ms: number }
+    assert.equal(first.owner, 'runaway')
+    assert.equal(first.host, 'target.example')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('noise: host bucket is shared across owners; non-http URLs are not paced', async () => {
+  const { governor, sleeps } = fakeGovernor('quiet')
+  for (let i = 0; i < 3; i++) await governor.pace('lane-a', 'https://target.example/x')
+  for (let i = 0; i < 3; i++) await governor.pace('lane-b', 'https://target.example/y')
+  await governor.pace('lane-a', 'about:blank')
+  await governor.pace('lane-b', 'file:///C:/temp/x.html')
+  try {
+    // lane-b hits the SAME host bucket lane-a drained → its burst is not free.
+    assert.ok(sleeps.length >= 3, 'shared host bucket throttles the second owner')
+    const snap = governor.snapshot()
+    assert.equal(snap.hosts.length, 1, 'one host bucket for both owners')
+    assert.equal(snap.owners.find(o => o.owner === 'lane-a')!.sent, 3, 'about:blank/file: are not target noise — never counted')
+    assert.equal(snap.owners.length, 2)
+  } finally { /* nothing to clean */ }
+})
+
+test('noise: a same-tick flood hits the 120s cap and refuses instead of sleeping forever', async () => {
+  const { governor } = fakeGovernor('quiet')
+  // 60 paces fired in ONE tick: every reserve runs before any sleep resolves,
+  // so the per-owner + global bucket debt STACKS — the tail of the flood
+  // would wait minutes and is refused (not sent, not counted).
+  const results = await Promise.allSettled(Array.from({ length: 60 }, () => governor.pace('flood', 'https://t.example/x')))
+  const refused = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+  assert.ok(refused.length > 0, 'the flood crossed the 120s cap')
+  assert.match(String(refused[0]!.reason), /NOISE GOVERNOR/)
+  const snap = governor.snapshot()
+  assert.equal(snap.global.sent, results.length - refused.length, 'refused sends are not counted')
+})
+
+test('noise: setProfile resets counters and is audited; installNoiseGovernor swaps the process governor', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'constellation-noise-'))
+  const auditFile = path.join(dir, 'noise-audit.jsonl')
+  const { governor } = fakeGovernor('quiet', auditFile)
+  try {
+    for (let i = 0; i < 2; i++) await governor.pace('lane', 'https://t.example/x')
+    assert.equal(governor.snapshot().global.sent, 2)
+    const switchResult = governor.setProfile('balanced')
+    assert.deepEqual(switchResult, { from: 'quiet', to: 'balanced' })
+    assert.equal(governor.snapshot().global.sent, 0, 'counters reset on switch')
+    assert.equal(governor.profileName(), 'balanced')
+    const lines = fs.readFileSync(auditFile, 'utf8').trim().split('\n')
+    const profileLine = lines.map(l => JSON.parse(l) as { event?: string }).find(r => r.event === 'profile')
+    assert.ok(profileLine !== undefined, 'the profile switch is audited')
+    // Process-wide install/restore (what server.ts does at startup).
+    const prior = installNoiseGovernor(governor)
+    assert.equal(prior, undefined, 'no governor installed before')
+    await paceNoiseProbe('owner-x', 'https://t.example/z')
+    assert.equal(governor.snapshot().owners.some(o => o.owner === 'owner-x'), true, 'paceNoise reached the installed governor')
+    installNoiseGovernor(prior)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('noise: hostKeyOf keeps non-default ports, folds default ones', () => {
+  assert.equal(hostKeyOf('https://Example.COM/x'), 'example.com')
+  assert.equal(hostKeyOf('http://example.com:8080/x'), 'example.com:8080')
+  assert.equal(hostKeyOf('https://example.com:443/x'), 'example.com')
+})
+
+/** paceNoise imported lazily so the module-level governor state stays under
+ *  this test's control. */
+async function paceNoiseProbe(owner: string, url: string): Promise<void> {
+  const { paceNoise } = await import('../src/noise.js')
+  await paceNoise(owner, url)
+}

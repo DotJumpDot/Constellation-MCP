@@ -88,6 +88,25 @@ over budget. `storage_reap` (no arguments) is the on-demand status report —
 breakdown, protection list, oldest evictable — and `dry_run:false` enforces
 immediately.
 
+## Noise governor (request pacing — 2026-11-20)
+
+Every outbound target touch — `browser_navigate`, `browser_fetch`,
+`browser_tabs new`, `tab_open`, `http_request`/`http_replay`/`http_download`,
+diff/recipe/cell legs, `dns_takeover_check` fetches, `mcp_auth_gate` probes —
+is now **paced** by three token buckets: per-owner, per-host (shared across
+owners), and global, plus uniform send jitter (≤250 ms). Calls **queue
+(sleep) until a token frees** — nothing is dropped; only a wait beyond 120 s
+refuses with a `NOISE GOVERNOR` error (a same-instant flood, not normal
+work). The hard tier stays separate: `budget_set` still refuses past a
+per-owner TOTAL cap. Default profile **quiet** (owner/host/global 6/12/21
+rpm, burst 3 — noise only gets harder); `CONSTELLATION_NOISE_PROFILE` or
+`--noise-profile` picks `off|quiet|balanced|aggressive` at start, and the
+Lead can switch at runtime with `noise_profile`. `noise_report` shows rpm
+now / peak / throttle waits per owner and per host. Every paced request
+appends one line to `noise-audit.jsonl`. Chrome subresource traffic inside
+a page is invisible to this (same class of limitation ARTEX documents) —
+the buckets cover every request the tools themselves issue.
+
 ## Origin
 
 Started as a clone of microsoft/playwright-mcp (Apache-2.0, see `LICENSE` and

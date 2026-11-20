@@ -18,6 +18,7 @@ import {
 import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, deviceBoundSessionsFor, normalizeHostInput, partitionCookieRows, readProfileCookies, resolveProfileLayout } from './cookies.js'
 import { normalizeDir, type OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
+import { paceNoise } from '../noise.js'
 import { isBinaryContentType } from '../tools/http.js'
 import { appendChainEntry } from '../tools/evidence.js'
 
@@ -456,6 +457,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         throw new Error('tab 0 is the ownership-label info tab — it stays on the owner label. Open your own tab first (browser_tabs new / tab_open).')
       env.scope.assert(url, who, 'browser_navigate')
       env.budget.spend(who)
+      await paceNoise(who, url)
       const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 })
       await assertLandedInScope(env, page, who, url, 'browser_navigate')
       // Challenge interstitials (2026-11-11 round): classify before reporting
@@ -769,9 +771,10 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const { session, owner: who } = sessionOf(env, owner)
       const page = await tabFor(session, who, tab)
       // Same guard discipline as every leg: assert BEFORE the request can
-      // leave, spend budget, then evaluate in-page.
+      // leave, spend budget, pace noise, then evaluate in-page.
       env.scope.assert(url, who, 'browser_fetch')
       env.budget.spend(who)
+      await paceNoise(who, url)
       const cap = Math.max(256, Math.min(50_000, max_bytes ?? 2_000))
       const started = Date.now()
       const result = await page.evaluate(async ({ fetchUrl, fetchMethod, fetchHeaders, fetchBody }) => {
@@ -925,6 +928,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       if (action === 'new') {
         if (url !== undefined) env.scope.assert(url, who, 'browser_tabs(new)')
         env.budget.spend(who)
+        if (url !== undefined) await paceNoise(who, url)
         const wasDown = session.context === undefined // this call SPAWNED the window
         const { meta, page } = await session.newTab(who, url)
         if (url !== undefined) await assertLandedInScope(env, page, who, url, 'browser_tabs(new)')
@@ -961,6 +965,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       const { session, owner: who } = sessionOf(env, owner)
       if (url !== undefined) env.scope.assert(url, who, 'tab_open')
       env.budget.spend(who)
+      if (url !== undefined) await paceNoise(who, url)
       const wasDown = session.context === undefined // this call SPAWNED the window
       const { meta, page } = await session.newTab(who, url, purpose)
       if (url !== undefined) await assertLandedInScope(env, page, who, url, 'tab_open')

@@ -25,6 +25,8 @@ import { registerMcpTools } from './tools/mcp.js'
 import { registerDnsTools } from './tools/dns.js'
 import { registerReportTools } from './tools/report.js'
 import { registerStorageTools } from './tools/storage.js'
+import { registerNoiseTools } from './tools/noise.js'
+import { NoiseGovernor, installNoiseGovernor, isNoiseProfileName, noiseLeversLine } from './noise.js'
 import { diskBudgetLine, enforceDiskBudget } from './diskbudget.js'
 
 export interface ConstellationServer {
@@ -161,6 +163,15 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   const registry = new OwnerRegistry(config)
   const scope = new ScopeGuard(config.scopeFile, config.auditFile, config.requireScope)
   const budget = new BudgetGuard(path.join(config.rootDir, 'budgets.json'))
+  // Noise governor (ARTEX-mining round): installed process-wide so every
+  // choke point (browser tools + http legs) paces via one import. Unknown
+  // profile names fall back to quiet — loudly, never to off.
+  const noiseName = isNoiseProfileName(config.noiseProfile) ? config.noiseProfile : 'quiet'
+  if (noiseName !== config.noiseProfile)
+    process.stderr.write(`constellation-mcp noise: unknown profile "${config.noiseProfile}" — using quiet\n`)
+  installNoiseGovernor(new NoiseGovernor(noiseName, { auditFile: path.join(config.rootDir, 'noise-audit.jsonl') }))
+  if (noiseName !== 'off')
+    process.stderr.write(`constellation-mcp noise: profile ${noiseName} — ${noiseLeversLine(noiseName)} (CONSTELLATION_NOISE_PROFILE to change; noise_report for the live view)\n`)
   const env: ToolEnv = { config, registry, scope, budget }
   const oob = new OobStore(config.oobPort, config.oobPublicBase, path.join(config.rootDir, 'oob-log.jsonl'))
   const jars = new JarStore(config)
@@ -213,6 +224,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerGitTools(registrar)
   registerBudgetTools(registrar, budget)
   registerStorageTools(registrar, config, registry)
+  registerNoiseTools(registrar)
   installUnknownToolHint(mcp, toolNames)
   registry.startIdleSweeper()
   const diskBudget = startDiskBudgetLoop(config, registry)

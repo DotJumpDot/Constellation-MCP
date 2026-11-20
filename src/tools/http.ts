@@ -7,6 +7,7 @@ import type { ConstellationConfig } from '../config.js'
 import type { ScopeGuard } from '../scope.js'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
 import { HTTP_SCHEMES } from '../scope.js'
+import { paceNoise } from '../noise.js'
 import { interpolateDeep } from './secrets.js'
 import { queryJsonPath, renderStructuralDiff, structuralJsonDiff } from './structural.js'
 
@@ -223,6 +224,7 @@ export async function performRequest(jars: JarStore, scope: ScopeGuard, spec: Re
     throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — http_request supports http/https only`)
   scope.assert(spec.url, owner, tool)
   budget?.spend(owner)
+  await paceNoise(owner, spec.url)
   const jar = jars.jar(spec.jar ?? 'default')
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')} — set them via CONSTELLATION_SECRET_* env`)
@@ -360,6 +362,7 @@ export async function performBrowserRequest(
     throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — browser-authenticated requests support http/https only`)
   scope.assert(spec.url, owner, tool)
   budget?.spend(owner)
+  await paceNoise(owner, spec.url)
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
   const headers: Record<string, string> = { ...(headersInterp as Record<string, string>) }
@@ -626,6 +629,7 @@ export async function performDownload(
     throw new Error(`scheme "${parsedUrl.protocol}" is not allowed — http_download supports http/https only`)
   scope.assert(spec.url, owner, 'http_download')
   budget?.spend(owner)
+  await paceNoise(owner, spec.url)
   const jar = jars.jar(spec.jar ?? 'default')
   const { value: headersInterp, missing } = interpolateDeep(spec.headers ?? {})
   if (missing.length > 0) throw new Error(`unknown secret(s): ${missing.join(', ')}`)
