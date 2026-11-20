@@ -24,6 +24,8 @@ import { registerCellTools } from './tools/cell.js'
 import { registerMcpTools } from './tools/mcp.js'
 import { registerDnsTools } from './tools/dns.js'
 import { registerReportTools } from './tools/report.js'
+import { registerStorageTools } from './tools/storage.js'
+import { diskBudgetLine, enforceDiskBudget } from './diskbudget.js'
 
 export interface ConstellationServer {
   connect(): Promise<void>
@@ -115,6 +117,46 @@ function installUnknownToolHint(mcp: McpServer, names: Set<string>): void {
   } catch { /* feature-detect failed — no hint, original behavior */ }
 }
 
+/** Disk-budget loop (2026-11-20, user ask: the rootDir swelled past 60 GB
+ *  because nothing reaps retained profiles/artifacts unless a Lead calls a
+ *  tool): first pass ~2 s after start (after the MCP handshake), then every
+ *  diskBudgetCheckMin minutes. Announces the measurement once at start;
+ *  later passes only speak when they evicted something or sit over the cap
+ *  with nothing left to take. */
+function startDiskBudgetLoop(config: ConstellationConfig, registry: OwnerRegistry): { stop(): void } {
+  if (config.diskBudgetMb <= 0) return { stop() { /* budget off */ } }
+  let busy = false
+  const pass = async (announce: boolean): Promise<void> => {
+    if (busy) return
+    busy = true
+    try {
+      const run = await enforceDiskBudget(config, {
+        liveDirs: () => registry.liveUserDirs(),
+        runningDirs: () => registry.runningProfileDirs(),
+      })
+      if (run.evicted.length > 0 || announce || run.overCap)
+        process.stderr.write(`constellation-mcp disk-budget: ${diskBudgetLine(run)}\n`)
+    } catch (error) {
+      process.stderr.write(`constellation-mcp disk-budget pass failed: ${error instanceof Error ? error.message : String(error)}\n`)
+    } finally {
+      busy = false
+    }
+  }
+  const timer = setTimeout(() => void pass(true), 2_000)
+  timer.unref()
+  let interval: ReturnType<typeof setInterval> | undefined
+  if (config.diskBudgetCheckMin > 0) {
+    interval = setInterval(() => void pass(false), config.diskBudgetCheckMin * 60_000)
+    interval.unref()
+  }
+  return {
+    stop(): void {
+      clearTimeout(timer)
+      if (interval !== undefined) clearInterval(interval)
+    },
+  }
+}
+
 export function buildServer(config: ConstellationConfig): ConstellationServer {
   const registry = new OwnerRegistry(config)
   const scope = new ScopeGuard(config.scopeFile, config.auditFile, config.requireScope)
@@ -170,8 +212,10 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   registerOobTools(registrar, oob)
   registerGitTools(registrar)
   registerBudgetTools(registrar, budget)
+  registerStorageTools(registrar, config, registry)
   installUnknownToolHint(mcp, toolNames)
   registry.startIdleSweeper()
+  const diskBudget = startDiskBudgetLoop(config, registry)
 
   return {
     async connect(): Promise<void> {
@@ -181,6 +225,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
     async dispose(): Promise<void> {
       watches.stopAll()
       keepalives.stopAll()
+      diskBudget.stop()
       await registry.disposeAll()
       await oob.dispose()
     },

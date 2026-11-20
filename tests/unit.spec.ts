@@ -13,6 +13,7 @@ import { renderCommitMessage, type CommitDraft } from '../src/tools/git.js'
 import { JarStore } from '../src/tools/http.js'
 import { OobStore } from '../src/tools/oob.js'
 import { applyCliArgs, defaultConfig } from '../src/config.js'
+import { enforceDiskBudget, fmtBytes, measureDisk } from '../src/diskbudget.js'
 import http from 'node:http'
 
 test('scope: unrestricted when no rule set', () => {
@@ -2858,6 +2859,189 @@ test('run-50 §10: fixture leases hold, conflict with the holder named, expire, 
     // Persistence round-trips a live lease.
     leases.take('keep-me', 'bc-xss-2', { note: 'held' })
     assert.equal(new FixtureLeases(file).holderOf('keep-me')?.note, 'held')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---- disk budget (2026-11-20: a 60 GB root taught these shapes) ----
+
+function diskRoot(): { dir: string; cfg: ReturnType<typeof defaultConfig> } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'diskbudget-'))
+  const cfg = defaultConfig()
+  cfg.rootDir = dir
+  cfg.profilesRoot = path.join(dir, 'profiles')
+  cfg.sharedUserDataDir = path.join(dir, 'shared-profile')
+  cfg.outputDir = path.join(dir, 'artifacts')
+  cfg.diskBudgetMb = 1024
+  cfg.diskBudgetCheckMin = 0
+  return { dir, cfg }
+}
+
+const noDeps = (): { liveDirs: () => string[]; runningDirs: () => Promise<Set<string>> } =>
+  ({ liveDirs: () => [], runningDirs: async () => new Set<string>() })
+
+function writeDated(file: string, bytes: number, ageDays: number): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, Buffer.alloc(bytes, 1))
+  const at = new Date(Date.now() - ageDays * 86_400_000)
+  fs.utimesSync(file, at, at)
+}
+
+/** The budget dates a profile by its newest write INCLUDING the dir stat —
+ * age the dir itself or a freshly-created dir (mtime = now) masks the dated
+ * files inside and oldest-first ordering collapses. */
+function ageDir(dir: string, ageDays: number): void {
+  const at = new Date(Date.now() - ageDays * 86_400_000)
+  fs.utimesSync(dir, at, at)
+}
+
+test('disk budget: under the cap nothing is touched', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.profilesRoot, 'd-old-lane', 'Cache', 'x.bin'), 2 * 1024 * 1024, 30)
+    ageDir(path.join(cfg.profilesRoot, 'd-old-lane'), 30)
+    writeDated(path.join(cfg.outputDir, 'shared', 'shot.png'), 1000, 1)
+    const run = await enforceDiskBudget(cfg, noDeps())
+    assert.equal(run.evicted.length, 0)
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'd-old-lane', 'Cache', 'x.bin')))
+    assert.equal(run.measure.totalBytes, 2 * 1024 * 1024 + 1000)
+    assert.equal(run.overCap, false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: over the cap evicts OLDEST profiles first, whole-dir', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.profilesRoot, 'lane-old', 'c.bin'), 2 * 1024 * 1024, 40)
+    ageDir(path.join(cfg.profilesRoot, 'lane-old'), 40)
+    writeDated(path.join(cfg.profilesRoot, 'lane-mid', 'c.bin'), 2 * 1024 * 1024, 10)
+    ageDir(path.join(cfg.profilesRoot, 'lane-mid'), 10)
+    writeDated(path.join(cfg.profilesRoot, 'lane-new', 'c.bin'), 2 * 1024 * 1024, 1)
+    ageDir(path.join(cfg.profilesRoot, 'lane-new'), 1)
+    cfg.diskBudgetMb = 4 // 4 MB < 6 MB total: exactly the oldest dir must go
+    const run = await enforceDiskBudget(cfg, noDeps())
+    assert.equal(run.evicted.length, 1)
+    assert.equal(path.basename(run.evicted[0]!.path), 'lane-old')
+    assert.ok(!fs.existsSync(path.join(cfg.profilesRoot, 'lane-old')), 'oldest dir deleted')
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'lane-mid', 'c.bin')))
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'lane-new', 'c.bin')))
+    assert.equal(run.freedBytes, 2 * 1024 * 1024)
+    assert.equal(run.overCap, false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: live sessions and running chromes are never reaped', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.profilesRoot, 'lane-old', 'c.bin'), 2 * 1024 * 1024, 40)
+    ageDir(path.join(cfg.profilesRoot, 'lane-old'), 40)
+    writeDated(path.join(cfg.profilesRoot, 'lane-mid', 'c.bin'), 2 * 1024 * 1024, 10)
+    ageDir(path.join(cfg.profilesRoot, 'lane-mid'), 10)
+    writeDated(path.join(cfg.profilesRoot, 'lane-new', 'c.bin'), 2 * 1024 * 1024, 1)
+    ageDir(path.join(cfg.profilesRoot, 'lane-new'), 1)
+    cfg.diskBudgetMb = 4
+    const deps = {
+      liveDirs: () => [path.join(cfg.profilesRoot, 'lane-old')],
+      runningDirs: async () => new Set([path.join(cfg.profilesRoot, 'lane-mid')]),
+    }
+    const run = await enforceDiskBudget(cfg, deps)
+    // oldest two are protected — the budget takes the NEWEST evictable instead
+    assert.deepEqual(run.evicted.map(item => path.basename(item.path)), ['lane-new'])
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'lane-old', 'c.bin')), 'live dir survives')
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'lane-mid', 'c.bin')), 'chrome-running dir survives')
+    assert.ok(run.protectedNames.includes('lane-old') && run.protectedNames.includes('lane-mid'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: shared profile and plain-shared survive; overCap is honest', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.sharedUserDataDir, 'Default', 'Cookies'), 5 * 1024 * 1024, 5)
+    writeDated(path.join(cfg.profilesRoot, 'plain-shared', 'c.bin'), 1024 * 1024, 50)
+    ageDir(path.join(cfg.profilesRoot, 'plain-shared'), 50)
+    writeDated(path.join(cfg.profilesRoot, 'lane-x', 'c.bin'), 1024 * 1024, 20)
+    ageDir(path.join(cfg.profilesRoot, 'lane-x'), 20)
+    cfg.diskBudgetMb = 1
+    const run = await enforceDiskBudget(cfg, noDeps())
+    assert.ok(!fs.existsSync(path.join(cfg.profilesRoot, 'lane-x')), 'ordinary lane evicted')
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'plain-shared', 'c.bin')), 'plain-shared survives')
+    assert.ok(fs.existsSync(path.join(cfg.sharedUserDataDir, 'Default', 'Cookies')), 'shared profile survives')
+    assert.equal(run.overCap, true, '5 MB of protected mass cannot satisfy a 1 MB cap — said so')
+    assert.ok(run.measure.protectedBytes >= 5 * 1024 * 1024)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: artifacts evict per-file oldest-first and emptied dirs are pruned', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.outputDir, 'old-sub', 'a.bin'), 3 * 1024 * 1024, 20)
+    writeDated(path.join(cfg.outputDir, 'downloads', 'b.bin'), 3 * 1024 * 1024, 2)
+    cfg.diskBudgetMb = 4
+    const run = await enforceDiskBudget(cfg, noDeps())
+    assert.deepEqual(run.evicted.map(item => path.basename(item.path)), ['a.bin'])
+    assert.ok(!fs.existsSync(path.join(cfg.outputDir, 'old-sub')), 'dir left empty by the eviction is pruned')
+    assert.ok(fs.existsSync(path.join(cfg.outputDir, 'downloads', 'b.bin')), 'newer artifact kept')
+    assert.equal(run.overCap, false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: dry run simulates the eviction without deleting', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.profilesRoot, 'lane-z', 'c.bin'), 3 * 1024 * 1024, 15)
+    ageDir(path.join(cfg.profilesRoot, 'lane-z'), 15)
+    cfg.diskBudgetMb = 1
+    const run = await enforceDiskBudget(cfg, noDeps(), true)
+    assert.equal(run.evicted.length, 1)
+    assert.equal(run.freedBytes, 3 * 1024 * 1024)
+    assert.equal(run.dryRun, true)
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'lane-z', 'c.bin')), 'dry run deleted nothing')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: 0 disables the budget entirely', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.profilesRoot, 'lane-huge', 'c.bin'), 5 * 1024 * 1024, 90)
+    ageDir(path.join(cfg.profilesRoot, 'lane-huge'), 90)
+    cfg.diskBudgetMb = 0
+    const run = await enforceDiskBudget(cfg, noDeps())
+    assert.equal(run.evicted.length, 0)
+    assert.equal(run.capBytes, 0)
+    assert.ok(fs.existsSync(path.join(cfg.profilesRoot, 'lane-huge', 'c.bin')))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('disk budget: measure counts profiles, artifacts and protected state separately', async () => {
+  const { dir, cfg } = diskRoot()
+  try {
+    writeDated(path.join(cfg.profilesRoot, 'lane-a', 'c.bin'), 1024 * 1024, 3)
+    ageDir(path.join(cfg.profilesRoot, 'lane-a'), 3)
+    writeDated(path.join(cfg.outputDir, 'o', 'f.bin'), 2048, 3)
+    writeDated(path.join(cfg.rootDir, 'scope.json'), 12, 3)
+    const measure = await measureDisk(cfg)
+    assert.equal(measure.profiles.length, 1)
+    assert.equal(measure.profiles[0]!.bytes, 1024 * 1024)
+    assert.equal(measure.artifacts.length, 1)
+    assert.equal(measure.protectedBytes, 12)
+    assert.equal(measure.totalBytes, 1024 * 1024 + 2048 + 12)
+    assert.equal(fmtBytes(5 * 1024 ** 3), '5.0 GB')
+    assert.equal(fmtBytes(3 * 1024 * 1024), '3 MB')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

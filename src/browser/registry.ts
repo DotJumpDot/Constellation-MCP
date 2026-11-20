@@ -60,9 +60,23 @@ export class OwnerRegistry {
   }
 
   /** Sync owner-name list of LIVE sessions — scope_reap refuses to drop the
-   * rule of a lane whose browser is running right now. */
+   *  rule of a lane whose browser is running right now. */
   liveOwnerNames(): string[] {
     return [...this.sessions.keys()]
+  }
+
+  /** Normalized user-data-dirs of LIVE sessions (userDir + adopted, the
+   *  "(attached) …" placeholders skipped) — the disk budget re-queries this
+   *  right before every deletion so a lane launching mid-pass is never
+   *  reaped. */
+  liveUserDirs(): string[] {
+    const out: string[] = []
+    for (const session of this.sessions.values()) {
+      for (const dir of [session.userDir, session.adoptedProfileDir]) {
+        if (dir !== undefined && !dir.startsWith('(attached)')) out.push(normalizeDir(dir))
+      }
+    }
+    return out
   }
 
   /** Attach mode (run-7 P0-2): adopt a running browser over CDP as an owner

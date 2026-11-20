@@ -65,6 +65,16 @@ export interface ConstellationConfig {
    *  browser_launch_plain relaunches warm). Off by default: a live lane's
    *  browser dying mid-card is a decision for the Lead, not a default. */
   ramAutoPark: boolean
+  /** Disk budget in MB for the rootDir (2026-11-20: 60+ GB accumulated
+   *  across hunt runs). On server start — and every diskBudgetCheckMin
+   *  minutes — the oldest NON-evictable-safe items (retained profile dirs
+   *  with no live session/chrome, then artifact files, oldest first) are
+   *  deleted until the root is under the cap. 0 = off.
+   *  CONSTELLATION_DISK_BUDGET_MB (default 10240 = 10 GB). */
+  diskBudgetMb: number
+  /** Disk-budget re-check cadence in minutes (0 = startup check only).
+   *  CONSTELLATION_DISK_BUDGET_CHECK_MIN (default 30). */
+  diskBudgetCheckMin: number
 }
 
 function env(name: string): string | undefined {
@@ -105,6 +115,8 @@ export function defaultConfig(): ConstellationConfig {
     focusGuard: env('FOCUS_GUARD') !== '0' && env('FOCUS_GUARD') !== 'false',
     ramGuardMb: int('RAM_GUARD_MB', 2500),
     ramAutoPark: env('RAM_AUTOPARK') === '1' || env('RAM_AUTOPARK') === 'true',
+    diskBudgetMb: int('DISK_BUDGET_MB', 10240),
+    diskBudgetCheckMin: int('DISK_BUDGET_CHECK_MIN', 30),
   }
 }
 
@@ -158,10 +170,12 @@ export function applyCliArgs(config: ConstellationConfig, argv: string[]): strin
       if (v !== undefined) (config as unknown as Record<string, unknown>)[field] = v
       continue
     }
-    if (key === '--oob-port' || key === '--idle-timeout-min') {
+    if (key === '--oob-port' || key === '--idle-timeout-min' || key === '--disk-budget-mb' || key === '--disk-budget-check-min') {
       const v = Number.parseInt(value() ?? '', 10)
       if (Number.isFinite(v)) {
-        ;(config as unknown as Record<string, unknown>)[key === '--oob-port' ? 'oobPort' : 'idleTimeoutMin'] = v
+        const field = key === '--oob-port' ? 'oobPort' : key === '--idle-timeout-min' ? 'idleTimeoutMin'
+          : key === '--disk-budget-mb' ? 'diskBudgetMb' : 'diskBudgetCheckMin'
+        ;(config as unknown as Record<string, unknown>)[field] = v
       }
       continue
     }

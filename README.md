@@ -68,6 +68,26 @@ window. Shared per-run fixture JSON (tenant identity pools) belongs in
 hand-rolling read-modify-write — and event-driven fixtures belong under a
 `fixture_lease`.
 
+## Disk budget (rootDir cap — 2026-11-20)
+
+The root (`%LOCALAPPDATA%\constellation-mcp`) accumulated **60+ GB** across
+hunt runs: retained per-owner profile dirs plus artifact files are only
+reaped when a Lead remembers to call `browser_profiles_reap`. The root is
+now **capped at 10 GB by default** (`CONSTELLATION_DISK_BUDGET_MB`, 0 =
+off), enforced automatically ~2 s after server start and then every 30
+minutes (`CONSTELLATION_DISK_BUDGET_CHECK_MIN`, 0 = startup only). When
+over the cap, the **oldest safe items are deleted first**: retained profile
+dirs with no live session and no running chrome.exe (whole dir), then
+artifact files under `artifacts/` (screenshots, downloads, response bodies,
+evidence dirs — per file, oldest first; emptied dirs are pruned). **Never
+deleted:** the shared profile (human logins), `plain-shared`, dirs of live
+sessions or chromes (fresh census right before each deletion), and the
+small state files (scope/jars/injectlab/fixture records). If the protected
+mass alone exceeds the cap, the server says so instead of silently sitting
+over budget. `storage_reap` (no arguments) is the on-demand status report —
+breakdown, protection list, oldest evictable — and `dry_run:false` enforces
+immediately.
+
 ## Origin
 
 Started as a clone of microsoft/playwright-mcp (Apache-2.0, see `LICENSE` and
