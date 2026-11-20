@@ -20,6 +20,7 @@ import { normalizeDir, type OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
 import { paceNoise } from '../noise.js'
 import { frameUntrusted } from '../untrusted.js'
+import { auditFence, checkUnsafeCode } from '../fence.js'
 import { isBinaryContentType } from '../tools/http.js'
 import { appendChainEntry } from '../tools/evidence.js'
 
@@ -1898,7 +1899,7 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
   // it settles; the settled result is reported by the next call.
   const unsafeRuns = new Map<string, { startedAt: number; done?: { finishedAt: number; summary: string } }>()
 
-  t('browser_run_code_unsafe', 'UNSAFE escape hatch: run `async (page, require) => {...}` server-side with the full Playwright Page API on the owner\'s current tab, plus Node `require` (fs, path, …) for saving artifacts. NOT scope-guarded inside — only use it when the guarded tools cannot express the step (bulk sweeps, waitUntil networkidle, complex flows). Timeout semantics (run-11 D11): past timeout_ms (default 45000) the tool returns STILL_RUNNING — the code KEEPS RUNNING server-side, artifacts keep landing, and further run_code_unsafe calls on that owner are refused until it settles (the next call then reports its result).',
+  t('browser_run_code_unsafe', 'UNSAFE escape hatch: run `async (page, require) => {...}` server-side with the full Playwright Page API on the owner\'s current tab, plus Node `require` (fs, path, …) for saving artifacts. NOT scope-guarded inside — only use it when the guarded tools cannot express the step (bulk sweeps, waitUntil networkidle, complex flows). FENCED (2026-11-20): the call is refused BEFORE compiling for child_process (any shell/scanner binary), process.exit, window.open (use browser_tabs new / tab_open), and bare busy-waits — platform policy, not a target defense; every decision is audited. Timeout semantics (run-11 D11): past timeout_ms (default 45000) the tool returns STILL_RUNNING — the code KEEPS RUNNING server-side, artifacts keep landing, and further run_code_unsafe calls on that owner are refused until it settles (the next call then reports its result).',
     {
       code: z.string().describe('Function expression, e.g. `async (page, require) => { await page.goto(url); return page.title() }`'),
       timeout_ms: z.number().int().optional().describe('In-tool budget in ms (default 45000, capped 300000). A timeout means STILL_RUNNING, not failure — the code continues.'),
@@ -1913,6 +1914,15 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
       }
       const priorNote = prior?.done === undefined ? '' : `[harness] your previous (timed-out) run FINISHED at ${new Date(prior.done.finishedAt).toISOString()} — result: ${prior.done.summary}\n`
       unsafeRuns.delete(who)
+      // ARTEX-mining #4: the fence decides BEFORE the code is compiled —
+      // built-in denies (child_process, process.exit, window.open, bare
+      // busy-waits) can never be exempted; operator deny rules
+      // (CONSTELLATION_UNSAFE_DENY) can, by CONSTELLATION_UNSAFE_ALLOW.
+      // Every decision lands in fence-audit.jsonl as sha256+size, never
+      // the code itself.
+      const fence = checkUnsafeCode(code, env.config.unsafeDeny, env.config.unsafeAllow)
+      auditFence(env.config.rootDir, who, code, fence)
+      if (!fence.allowed) throw new Error(fence.message)
       const page = await tabFor(session, who, tab)
       const fn = makeUserFn(code)
       const nodeRequire = createRequire(import.meta.url)

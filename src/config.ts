@@ -88,6 +88,14 @@ export interface ConstellationConfig {
    *  (ARTEX-mining mechanism 5). Advisory, and marker-shaped text inside
    *  the content is neutralized so a page cannot forge frames. */
   untrustedFraming: boolean
+  /** Extra deny patterns for the escape-hatch fence (ARTEX-mining
+   *  mechanism 4): semicolon-separated regex sources checked against the
+   *  browser_run_code_unsafe code text, ON TOP of the built-ins
+   *  (child_process, process.exit, window.open, bare busy-waits).
+   *  CONSTELLATION_UNSAFE_ALLOW may exempt ONLY these operator rules,
+   *  never the built-ins. Every decision is audited (sha256, not code). */
+  unsafeDeny?: string
+  unsafeAllow?: string
 }
 
 function env(name: string): string | undefined {
@@ -132,6 +140,8 @@ export function defaultConfig(): ConstellationConfig {
     diskBudgetCheckMin: int('DISK_BUDGET_CHECK_MIN', 30),
     noiseProfile: env('NOISE_PROFILE') ?? 'quiet',
     untrustedFraming: env('UNTRUSTED_FRAMING') !== '0' && env('UNTRUSTED_FRAMING') !== 'false' && env('UNTRUSTED_FRAMING') !== 'off',
+    unsafeDeny: env('UNSAFE_DENY'),
+    unsafeAllow: env('UNSAFE_ALLOW'),
   }
 }
 

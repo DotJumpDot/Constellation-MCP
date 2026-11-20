@@ -3430,3 +3430,63 @@ test('untrusted framing: disabled is a strict passthrough', () => {
     setUntrustedFraming(prior)
   }
 })
+
+// ── escape-hatch fence (ARTEX-mining mechanism 4) ─────────────────────────────
+
+import { auditFence, checkUnsafeCode, parsePatternList } from '../src/fence.js'
+
+test('fence: built-in denies refuse the dangerous classes with platform-control framing', () => {
+  const refusals = [
+    `async (page, require) => { const cp = require('child_process'); cp.execSync('nmap -sV target') }`,
+    `async (page) => { const cp = await import('child_process'); return 1 }`,
+    `async (page) => { process.exit(0) }`,
+    `async (page) => { window.open('https://spam.example'); return 1 }`,
+    `async (page) => { while (true) { await page.waitForTimeout(100) } }`,
+    `async (page) => { for (;;) {} }`,
+  ]
+  for (const code of refusals) {
+    const verdict = checkUnsafeCode(code)
+    assert.equal(verdict.allowed, false, `should refuse: ${code.slice(0, 60)}`)
+    assert.match(verdict.message!, /platform policy, NOT a target defense/, 'the block is framed as platform control')
+  }
+  // Legitimate escape-hatch use passes: fs for artifacts, page work, returns.
+  const ok = checkUnsafeCode(`async (page, require) => { const fs = require('fs'); fs.writeFileSync('out.txt', 'x'); await page.goto('https://t.example'); return page.title() }`)
+  assert.equal(ok.allowed, true)
+})
+
+test('fence: operator deny rules are exemptable by operator allows — built-ins never', () => {
+  // Operator rule blocks eval(…
+  const denied = checkUnsafeCode(`async (page) => { return eval('1+1') }`, 'eval\\(', undefined)
+  assert.equal(denied.allowed, false)
+  assert.match(denied.rule!, /user deny/)
+  // The operator allow exempts the operator deny…
+  const exempted = checkUnsafeCode(`async (page) => { return eval('1+1') }`, 'eval\\(', 'eval\\(')
+  assert.equal(exempted.allowed, true)
+  // …but NEVER the built-ins: child_process stays refused even with both set.
+  const stillRefused = checkUnsafeCode(`async (page, require) => { return require('child_process') }`, 'eval\\(', 'child_process|eval\\(')
+  assert.equal(stillRefused.allowed, false)
+  assert.match(stillRefused.rule!, /child_process/)
+  // Unparseable operator patterns are skipped, never widen the fence.
+  assert.equal(checkUnsafeCode('async (page) => 1', '([unclosed', undefined).allowed, true)
+  assert.deepEqual(parsePatternList(' a ; ; b '), ['a', 'b'])
+})
+
+test('fence: audit records sha256 + size, never the code text', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'constellation-fence-'))
+  try {
+    const secretCode = `async (page, require) => { const UNIQUE_CODE_SENTINEL_XYZ = require('child_process'); return UNIQUE_CODE_SENTINEL_XYZ }`
+    auditFence(dir, 'lane-x', secretCode, checkUnsafeCode(secretCode))
+    auditFence(dir, 'lane-x', 'async (page) => 1', checkUnsafeCode('async (page) => 1'))
+    const lines = fs.readFileSync(path.join(dir, 'fence-audit.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l) as { verdict: string; rule?: string; code_sha256: string; bytes: number })
+    assert.equal(lines.length, 2)
+    assert.equal(lines[0]!.verdict, 'denied')
+    assert.match(lines[0]!.rule!, /child_process/)
+    assert.equal(lines[0]!.code_sha256.length, 64)
+    assert.equal(lines[1]!.verdict, 'allowed')
+    // The RULE may name what was denied; the CODE TEXT itself never enters.
+    const raw = fs.readFileSync(path.join(dir, 'fence-audit.jsonl'), 'utf8')
+    assert.ok(!raw.includes('UNIQUE_CODE_SENTINEL_XYZ'), 'the audit never carries the code text')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

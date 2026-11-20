@@ -129,6 +129,27 @@ manifest.json + hash-re-verified copies of every bound file) that moves
 lane → validator → report without re-capture, and flags STALE when a
 report was exported against older evidence.
 
+## Escape-hatch fence + untrusted framing (2026-11-20)
+
+`browser_run_code_unsafe` (the escape hatch with Node `require`) is now
+**fenced before its code is ever compiled**: built-in denies refuse
+`child_process` (the whole shell/scanner-binary class), `process.exit`
+(killing the MCP server), `window.open` (windows invisible to the tab
+registry/leases/ownership label), and bare busy-waits (a timeout never
+stops escape-hatch code). These can never be exempted.
+`CONSTELLATION_UNSAFE_DENY` adds operator regex rules (semicolon-separated);
+`CONSTELLATION_UNSAFE_ALLOW` may exempt **only** operator rules — allow
+matches less, deny matches more. Every decision appends `fence-audit.jsonl`
+(code sha256 + size, never the code text), and refusals use platform-control
+framing so a lane does not mistake them for a target defense to bypass.
+
+Target-derived tool output — page/a11y snapshots, HTTP body previews,
+escape-hatch results — is wrapped in **UNTRUSTED TARGET CONTENT** markers
+carrying a standing ignore-directives line; marker-shaped text inside the
+content is neutralized so a page cannot forge or close a frame
+(prompt-injection defense, advisory by design — same honesty as ARTEX).
+`CONSTELLATION_UNTRUSTED_FRAMING=0` opts out.
+
 ## Origin
 
 Started as a clone of microsoft/playwright-mcp (Apache-2.0, see `LICENSE` and
