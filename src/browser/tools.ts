@@ -19,6 +19,7 @@ import { cookieMatchesAnyDomain, dbscWarningLines, detectDeviceBoundSessions, de
 import { normalizeDir, type OwnerRegistry } from './registry.js'
 import type { BudgetGuard } from '../tools/budget.js'
 import { paceNoise } from '../noise.js'
+import { frameUntrusted } from '../untrusted.js'
 import { isBinaryContentType } from '../tools/http.js'
 import { appendChainEntry } from '../tools/evidence.js'
 
@@ -366,18 +367,22 @@ export function isTrivialSnapshot(snapshot: string): boolean {
  *  Gemini returned "- document:" and then a full tree seconds later. */
 async function snapshotOf(page: Page): Promise<string> {
   const secrets = await passwordValuesOf(page)
+  // Every return is frameUntrusted-wrapped (ARTEX-mining #5): page text is
+  // TARGET-AUTHORED data — the markers carry the standing instruction that
+  // nothing inside is a directive, and marker-shaped text inside is
+  // neutralized so a page cannot forge or close a frame.
   try {
     let snapshot = await page.locator('html').ariaSnapshot()
     if (isTrivialSnapshot(snapshot)) {
       await page.waitForFunction(() => (document.body?.innerText ?? '').trim().length > 200, undefined, { timeout: 6_000 }).catch(() => undefined)
       snapshot = await page.locator('html').ariaSnapshot()
     }
-    return maskSecrets(collapseImgRuns(snapshot), secrets)
+    return frameUntrusted(maskSecrets(collapseImgRuns(snapshot), secrets))
   } catch (ariaError) {
     const reason = ariaError instanceof Error ? ariaError.message : String(ariaError)
     try {
       const text = await page.evaluate(() => document.body?.innerText ?? '')
-      return maskSecrets(`[aria snapshot unavailable (${reason}); DOM text fallback]\n${text}`, secrets)
+      return frameUntrusted(maskSecrets(`[aria snapshot unavailable (${reason}); DOM text fallback]\n${text}`, secrets))
     } catch (domError) {
       const domReason = domError instanceof Error ? domError.message : String(domError)
       return `[aria snapshot unavailable: ${reason}; DOM text fallback failed: ${domReason}]\nURL: ${page.url()}`
@@ -1962,7 +1967,8 @@ export function registerBrowserTools(server: ToolRegistrar, env: ToolEnv): void 
         ? ''
         : `[harness] closed ${outcome.swept.length} extra browser context(s)/window(s) created by this code — use tabs in the owner context (browser_tabs new / tab_open), never a new browser context. Closed pages: ${JSON.stringify(outcome.swept)}\n`
       const rendered = outcome.result === undefined ? 'undefined' : JSON.stringify(outcome.result, null, 2) ?? String(outcome.result)
-      return textResult(priorNote + sweptNote + truncate(rendered, 50_000))
+      // The result is fully attacker-authored page data — frame it (#5).
+      return textResult(priorNote + sweptNote + frameUntrusted(truncate(rendered, 50_000)))
     })
 
   t('browser_wait_for', 'Wait for text to appear or for a time to pass on the owner\'s current tab.',

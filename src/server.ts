@@ -28,6 +28,7 @@ import { registerStorageTools } from './tools/storage.js'
 import { registerFindingsTools } from './tools/findings.js'
 import { registerNoiseTools } from './tools/noise.js'
 import { NoiseGovernor, installNoiseGovernor, isNoiseProfileName, noiseLeversLine } from './noise.js'
+import { setUntrustedFraming } from './untrusted.js'
 import { diskBudgetLine, enforceDiskBudget } from './diskbudget.js'
 
 export interface ConstellationServer {
@@ -171,6 +172,7 @@ export function buildServer(config: ConstellationConfig): ConstellationServer {
   if (noiseName !== config.noiseProfile)
     process.stderr.write(`constellation-mcp noise: unknown profile "${config.noiseProfile}" — using quiet\n`)
   installNoiseGovernor(new NoiseGovernor(noiseName, { auditFile: path.join(config.rootDir, 'noise-audit.jsonl') }))
+  setUntrustedFraming(config.untrustedFraming)
   if (noiseName !== 'off')
     process.stderr.write(`constellation-mcp noise: profile ${noiseName} — ${noiseLeversLine(noiseName)} (CONSTELLATION_NOISE_PROFILE to change; noise_report for the live view)\n`)
   const env: ToolEnv = { config, registry, scope, budget }

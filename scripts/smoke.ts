@@ -12,6 +12,7 @@ import { OwnerRegistry } from '../src/browser/registry.js'
 import { ScopeGuard } from '../src/scope.js'
 import type { ToolEnv } from '../src/browser/tools.js'
 import { registerBrowserTools, type ToolRegistrar, type ToolResult } from '../src/browser/tools.js'
+import { BudgetGuard } from '../src/tools/budget.js'
 
 const PAGE = 'data:text/html,' + encodeURIComponent(`<!doctype html>
 <h1 id="go">Constellation smoke</h1>
@@ -39,16 +40,32 @@ class FakeRegistrar implements ToolRegistrar {
 
 async function main(): Promise<void> {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'constellation-smoke-'))
-  const config = { ...defaultConfig(), rootDir, headless: true, channel: 'chrome', outputDir: path.join(rootDir, 'artifacts') }
+  // FULLY hermetic (2026-11-20): overriding only rootDir left profilesRoot,
+  // sharedUserDataDir, scopeFile and auditFile pointing at the REAL
+  // %LOCALAPPDATA% root — every smoke run silently created profiles/
+  // smoke-agent there. All derived paths are pinned to the temp root now.
+  const config = {
+    ...defaultConfig(),
+    rootDir,
+    profilesRoot: path.join(rootDir, 'profiles'),
+    sharedUserDataDir: path.join(rootDir, 'shared-profile'),
+    outputDir: path.join(rootDir, 'artifacts'),
+    scopeFile: path.join(rootDir, 'scope.json'),
+    auditFile: path.join(rootDir, 'audit.jsonl'),
+    headless: true,
+    channel: 'chrome',
+  }
   const registry = new OwnerRegistry(config)
   const scope = new ScopeGuard(path.join(rootDir, 'scope.json'), path.join(rootDir, 'audit.jsonl'))
-  const env: ToolEnv = { config, registry, scope }
+  const env: ToolEnv = { config, registry, scope, budget: new BudgetGuard() }
   const registrar = new FakeRegistrar()
   registerBrowserTools(registrar, env)
 
   const owner = 'smoke-agent'
   const nav = await call(registrar, 'browser_navigate', { url: PAGE, owner })
   assert.match(nav, /Constellation smoke/, 'navigate returns snapshot')
+  // ARTEX-mining #5: page snapshots are wrapped as untrusted target data.
+  assert.match(nav, /BEGIN UNTRUSTED TARGET CONTENT/, 'navigate frames the snapshot as untrusted')
 
   const click = await call(registrar, 'browser_click', { element: 'button', name: 'Press', owner })
   assert.match(click, /Clicked!/, 'click updated the page')
@@ -67,11 +84,11 @@ async function main(): Promise<void> {
 
   const tabs = await call(registrar, 'tab_open', { owner, purpose: 'second lane', url: PAGE })
   assert.match(tabs, /leased/, 'tab_open leases')
-  const map = await call(registrar, 'browser_map', {})
+  const map = await call(registrar, 'browser_map', { detail: true })
   assert.match(map, new RegExp(`\\[${owner}\\]`), 'browser_map labels the owner window')
   assert.match(map, /leased:smoke-agent/, 'browser_map shows the lease')
 
-  const reset = await call(registrar, 'browser_reset', { keep: ['shared'] })
+  const reset = await call(registrar, 'browser_reset', { owner, keep: ['shared'] })
   assert.match(reset, /smoke-agent/, 'reset closes owner sessions, keeps shared')
   assert.ok(!fs.existsSync(path.join(config.sharedUserDataDir, 'lockfile')) || true, 'shared never closed by reset')
 

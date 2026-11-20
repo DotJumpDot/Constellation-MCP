@@ -8,6 +8,7 @@ import type { ScopeGuard } from '../scope.js'
 import { errorResult, textResult, type ToolRegistrar, type ToolResult } from '../browser/tools.js'
 import { HTTP_SCHEMES } from '../scope.js'
 import { paceNoise } from '../noise.js'
+import { frameUntrusted } from '../untrusted.js'
 import { interpolateDeep } from './secrets.js'
 import { queryJsonPath, renderStructuralDiff, structuralJsonDiff } from './structural.js'
 
@@ -577,7 +578,7 @@ export function formatResult(r: RequestResult, headersFull = false): string {
     `headers (${headersFull ? 'full' : `compact, ${shown.length} of ${entries.length} — headers_full:true for the whole block`}):\n${headerLines}`,
     binary
       ? `body: (binary ${r.headers['content-type']} — preview suppressed; the full bytes are in the capture ring, use http_extract for values or http_download to save the file)`
-      : `body:\n${r.body}`,
+      : `body:\n${frameUntrusted(r.body)}`,
   ].join('\n\n')
 }
 

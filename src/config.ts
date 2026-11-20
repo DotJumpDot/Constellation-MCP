@@ -81,6 +81,13 @@ export interface ConstellationConfig {
    *  dropped; budget_set stays the hard tier. Default quiet (noise only
    *  gets harder). CONSTELLATION_NOISE_PROFILE; runtime noise_profile. */
   noiseProfile: string
+  /** true (default; CONSTELLATION_UNTRUSTED_FRAMING=0 disables): wrap
+   *  target-derived tool output (page snapshots, HTTP body previews,
+   *  escape-hatch results) in UNTRUSTED TARGET CONTENT markers with a
+   *  standing ignore-directives line — prompt-injection defense
+   *  (ARTEX-mining mechanism 5). Advisory, and marker-shaped text inside
+   *  the content is neutralized so a page cannot forge frames. */
+  untrustedFraming: boolean
 }
 
 function env(name: string): string | undefined {
@@ -124,6 +131,7 @@ export function defaultConfig(): ConstellationConfig {
     diskBudgetMb: int('DISK_BUDGET_MB', 10240),
     diskBudgetCheckMin: int('DISK_BUDGET_CHECK_MIN', 30),
     noiseProfile: env('NOISE_PROFILE') ?? 'quiet',
+    untrustedFraming: env('UNTRUSTED_FRAMING') !== '0' && env('UNTRUSTED_FRAMING') !== 'false' && env('UNTRUSTED_FRAMING') !== 'off',
   }
 }
 
@@ -152,6 +160,7 @@ export function applyCliArgs(config: ConstellationConfig, argv: string[]): strin
     }
     if (arg === '--headless') { config.headless = true; continue }
     if (arg === '--start-minimized') { config.startMinimized = true; continue }
+    if (arg === '--no-untrusted-framing') { config.untrustedFraming = false; continue }
     if ((arg === '--window-peek-px' || arg.startsWith('--window-peek-px='))) {
       const raw = arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : value()
       const v = Number.parseInt(raw ?? '', 10)
