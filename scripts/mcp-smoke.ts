@@ -41,6 +41,7 @@ async function main(): Promise<void> {
       'cell_ledger', 'cell_register', 'cell_run', 'cell_status',
       'diff_pair', 'dns_takeover_check', 'dupe_check',
       'evidence_capture', 'evidence_file', 'evidence_log', 'evidence_scan', 'evidence_verify',
+      'findings_add', 'findings_export', 'findings_list', 'findings_update',
       'fixture_forge', 'fixture_hits', 'fixture_lease', 'fixture_list', 'fixture_publish',
       'fixture_recipe_list', 'fixture_recipe_run', 'fixture_recipe_set',
       'http_diff', 'http_download', 'http_extract', 'http_jars', 'http_replay', 'http_request',
@@ -71,6 +72,8 @@ async function main(): Promise<void> {
     assert.match(String(storage.content?.[0]?.text ?? ''), /cap/, 'storage_reap status mentions the cap')
     const noise = await client.callTool({ name: 'noise_report', arguments: {} })
     assert.match(String(noise.content?.[0]?.text ?? ''), /governor/, 'noise_report names the governor')
+    const findings = await client.callTool({ name: 'findings_list', arguments: {} })
+    assert.match(String(findings.content?.[0]?.text ?? ''), /no findings match/, 'findings_list answers on an empty index')
     console.log(`MCP SMOKE PASS (${names.length} tools registered)`)
   } finally {
     await client.close()

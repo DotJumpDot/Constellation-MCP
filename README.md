@@ -107,6 +107,28 @@ appends one line to `noise-audit.jsonl`. Chrome subresource traffic inside
 a page is invisible to this (same class of limitation ARTEX documents) —
 the buckets cover every request the tools themselves issue.
 
+## Findings index + machine verification (POE — 2026-11-20)
+
+Candidates used to live in chat prose: "verified" was a word a lane typed,
+and evidence sat in the tamper-evident chain unlinked to any finding. Now a
+finding is a first-class record (`findings.json` at the root) that **binds
+evidence files sha256-pinned with roles** (`baseline` = the unaffected
+control, `proof` = the body carrying the finding, `verification` = an
+independent re-check, `supporting` = context), optionally anchored to an
+evidence-chain entry. It carries **POE 1–4** — the lane's *declared*
+demonstrated depth (1 anomaly/timing, 2 structural manipulation, 3 data
+extracted, 4 critical impact) — and a **machine `verification`** the agent
+never sets: `verified` requires ≥1 proof/verification binding, POE ≥3, and
+**every quote ≥8 chars found verbatim (whitespace-normalized) inside a
+bound body whose sha256 still matches** — the server reads the bodies
+itself, never the lane's memory of them. Missing/drifted/oversized
+evidence ⇒ `not_assessed` (fail closed). `status` stays the human
+disposition. `findings_list` is the Lead's machine-readable gate;
+`findings_export` freezes an **evidence pack** (per-finding markdown +
+manifest.json + hash-re-verified copies of every bound file) that moves
+lane → validator → report without re-capture, and flags STALE when a
+report was exported against older evidence.
+
 ## Origin
 
 Started as a clone of microsoft/playwright-mcp (Apache-2.0, see `LICENSE` and

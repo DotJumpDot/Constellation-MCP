@@ -3192,3 +3192,202 @@ async function paceNoiseProbe(owner: string, url: string): Promise<void> {
   const { paceNoise } = await import('../src/noise.js')
   await paceNoise(owner, url)
 }
+
+// ── findings index + POE verification (ARTEX-mining mechanisms 2+3) ──────────
+
+import { createHash } from 'node:crypto'
+import { assessFinding, findingIsStale, loadFindings, nextFindingId, normalizeWs, saveFindings, type EvidenceBinding, type Finding } from '../src/findings.js'
+import { registerFindingsTools } from '../src/tools/findings.js'
+import type { ChainEntry } from '../src/tools/evidence.js'
+
+function findingsRoot(): { dir: string; cfg: ReturnType<typeof defaultConfig> } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'constellation-findings-'))
+  const cfg = defaultConfig()
+  cfg.rootDir = dir
+  cfg.outputDir = path.join(dir, 'artifacts')
+  cfg.diskBudgetMb = 0
+  cfg.diskBudgetCheckMin = 0
+  return { dir, cfg }
+}
+
+function writeBody(dir: string, name: string, text: string): string {
+  const file = path.join(dir, name)
+  fs.writeFileSync(file, text)
+  return file
+}
+
+function baseFinding(body: string, quotes: string[], overrides: Partial<Finding> = {}): Finding & { bindings: EvidenceBinding[] } {
+  // Tolerates a missing path (the missing-file case pins a dummy sha — the
+  // assessor must fail closed on the stat, not on this helper).
+  let sha = '0'.repeat(64)
+  try { sha = createHash('sha256').update(fs.readFileSync(body)).digest('hex') } catch { /* ghost path */ }
+  return {
+    id: 'F-001',
+    title: 'stored XSS in profile bio',
+    owner: 'lane-a',
+    created_ts: new Date().toISOString(),
+    updated_ts: new Date().toISOString(),
+    poe: 3,
+    status: 'open',
+    verification: 'unverified',
+    verification_note: '',
+    bindings: [{ path: body, sha256: sha, role: 'proof' }],
+    quotes,
+    evidence_version: 1,
+    ...overrides,
+  }
+}
+
+/** Capture registered tool handlers so the findings tools can be exercised
+ *  end-to-end (add → list → update → export) without an MCP client. */
+function captureFindingsTools(cfg: ReturnType<typeof defaultConfig>): Map<string, (args: unknown) => Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>> {
+  const handlers = new Map<string, (args: unknown) => Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>>()
+  const registrar = {
+    registerTool: (name: string, _info: unknown, _schema: unknown, handler: (args: unknown) => Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }>) => {
+      handlers.set(name, handler)
+    },
+  }
+  registerFindingsTools(registrar as never, cfg)
+  return handlers
+}
+
+test('findings: the verbatim receipt check — verified only with proof binding + POE≥3 + quotes found whitespace-normalized', () => {
+  const { dir, cfg } = findingsRoot()
+  try {
+    const body = writeBody(dir, 'bio-response.html', '<html>\n  <body>\n    Profile updated: "<script>alert(1)</script>"\n  </body>\n</html>')
+    const finding = baseFinding(body, ['<script>alert(1)</script>'])
+    const result = assessFinding(cfg, finding)
+    assert.equal(result.status, 'verified')
+    assert.equal(result.receipts[0]!.foundIn, 'bio-response.html')
+
+    // Bar 1: no proof-role binding.
+    assert.equal(assessFinding(cfg, baseFinding(body, ['<script>alert(1)</script>'], { bindings: [{ path: body, sha256: finding.bindings[0]!.sha256, role: 'baseline' }] })).status, 'unverified')
+    // Bar 2: declared POE below L3.
+    assert.equal(assessFinding(cfg, baseFinding(body, ['<script>alert(1)</script>'], { poe: 2 })).status, 'unverified')
+    // Bar 3: the quote is NOT in the bound body (the lane's memory is not proof).
+    const miss = assessFinding(cfg, baseFinding(body, ['"injected-payload-not-present"']))
+    assert.equal(miss.status, 'unverified')
+    assert.match(miss.note, /verbatim receipt check/)
+    // Bar 4: short quotes are refused outright (the receipt names the bar).
+    const shortQ = assessFinding(cfg, baseFinding(body, ['short']))
+    assert.equal(shortQ.status, 'unverified')
+    assert.match(String(shortQ.receipts[0]!.miss), /short quote/)
+    // normalizeWs: minified and pretty-printed bodies match the same quote.
+    assert.equal(normalizeWs('a\n\n  b\t\tc'), 'a b c')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('findings: fail-closed not_assessed — missing or drifted evidence is never a claim', () => {
+  const { dir, cfg } = findingsRoot()
+  try {
+    const body = writeBody(dir, 'resp.json', '{"leaked":"tenant-two@example.test"}')
+    // Missing file.
+    const ghost = baseFinding(path.join(dir, 'ghost.json'), ['leaked'])
+    ghost.bindings[0]!.sha256 = '0'.repeat(64)
+    assert.equal(assessFinding(cfg, ghost).status, 'not_assessed')
+    assert.match(assessFinding(cfg, ghost).note, /missing/)
+    // sha drift: the file changed after binding.
+    const finding = baseFinding(body, ['tenant-two@example.test'])
+    fs.writeFileSync(body, '{"leaked":"CHANGED"}')
+    const drifted = assessFinding(cfg, finding)
+    assert.equal(drifted.status, 'not_assessed')
+    assert.match(drifted.note, /EVIDENCE DRIFT/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('findings: chain anchors are validated — a mismatched anchor is a CHAIN MISMATCH', () => {
+  const { dir, cfg } = findingsRoot()
+  try {
+    const body = writeBody(dir, 'resp.json', '{"ok":true,"secret-marker":"abcdef123456"}')
+    const entry: ChainEntry = {
+      seq: 7, ts: new Date().toISOString(), owner: 'lane-a', label: 'capture',
+      entry_hash: createHash('sha256').update('entry').digest('hex'), prev_hash: '0'.repeat(64),
+    }
+    const good = baseFinding(body, ['secret-marker'])
+    good.bindings[0]!.chain_seq = 7
+    good.bindings[0]!.chain_hash = entry.entry_hash
+    assert.equal(assessFinding(cfg, good, [entry]).status, 'verified')
+    const bad = baseFinding(body, ['secret-marker'])
+    bad.bindings[0]!.chain_seq = 7
+    bad.bindings[0]!.chain_hash = 'f'.repeat(64)
+    const mismatch = assessFinding(cfg, bad, [entry])
+    assert.equal(mismatch.status, 'unverified')
+    assert.match(mismatch.note, /CHAIN MISMATCH/)
+    const absent = baseFinding(body, ['secret-marker'])
+    absent.bindings[0]!.chain_seq = 99
+    absent.bindings[0]!.chain_hash = entry.entry_hash
+    assert.match(assessFinding(cfg, absent, [entry]).note, /does not exist/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('findings: store round-trip, id allocation, stale detection', () => {
+  const { dir, cfg } = findingsRoot()
+  try {
+    assert.equal(loadFindings(cfg).length, 0)
+    assert.equal(nextFindingId([]), 'F-001')
+    const f1 = baseFinding(path.join(dir, 'x'), [], { id: 'F-001', title: 'one' })
+    const f2 = baseFinding(path.join(dir, 'x'), [], { id: 'F-002', title: 'two' })
+    saveFindings(cfg, [f1, f2])
+    assert.deepEqual(loadFindings(cfg).map(f => f.id), ['F-001', 'F-002'])
+    assert.equal(nextFindingId(loadFindings(cfg)), 'F-003')
+    f1.report_evidence_version = 1
+    assert.equal(findingIsStale(f1), false)
+    f1.evidence_version = 2
+    assert.equal(findingIsStale(f1), true, 'report written against older evidence is stale')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('findings: tools end-to-end — add verifies, update re-verifies, export freezes + flags stale', async () => {
+  const { dir, cfg } = findingsRoot()
+  try {
+    fs.mkdirSync(cfg.outputDir, { recursive: true })
+    const body = writeBody(dir, 'proof.html', '<div id="bio">INJECTED-MARKER-123456 rendered</div>')
+    const tools = captureFindingsTools(cfg)
+    const text = (r: { content: Array<{ text: string }> }) => r.content[0]!.text
+
+    const added = await tools.get('findings_add')!({ title: 'Bio field renders raw HTML', poe: 3, owner: 'lane-a', bindings: [{ path: body, role: 'proof' }], quotes: ['INJECTED-MARKER-123456'] })
+    assert.match(text(added), /F-001/)
+    assert.match(text(added), /verified/i)
+    assert.equal((added as { isError?: boolean }).isError, undefined)
+
+    // update: bind a second (baseline) file and bump — re-verified, version 2.
+    const control = writeBody(dir, 'control.html', '<div id="bio">clean bio text</div>')
+    const updated = await tools.get('findings_update')!({ id: 'F-001', add_bindings: [{ path: control, role: 'baseline', note: 'unaffected tenant' }] })
+    assert.match(text(updated), /evidence v2/)
+    assert.match(text(updated), /verified/i)
+
+    // export: md + manifest + hash-verified copies; records the version.
+    const exported = await tools.get('findings_export')!({ id: 'F-001' })
+    assert.match(text(exported), /findings-export/)
+    const exportDir = /Evidence pack frozen: (.+)/.exec(text(exported))![1]!
+    assert.ok(fs.existsSync(path.join(exportDir, 'manifest.json')))
+    const manifest = JSON.parse(fs.readFileSync(path.join(exportDir, 'manifest.json'), 'utf8')) as { findings: Finding[] }
+    assert.equal(manifest.findings[0]!.id, 'F-001')
+    assert.equal(manifest.findings[0]!.report_evidence_version, 2)
+    const copy = path.join(exportDir, 'evidence', 'F-001', `proof-${path.basename(body)}`)
+    assert.ok(fs.existsSync(copy), 'bound file frozen into the pack')
+    assert.equal(createHash('sha256').update(fs.readFileSync(copy)).digest('hex'), manifest.findings[0]!.bindings.find(b => b.role === 'proof')!.sha256)
+
+    // list: fresh export is not stale; after another update it is.
+    const listedFresh = await tools.get('findings_list')!({})
+    assert.doesNotMatch(text(listedFresh), /STALE/)
+    await tools.get('findings_update')!({ id: 'F-001', status: 'confirmed' })
+    const listedStale = await tools.get('findings_list')!({})
+    assert.match(text(listedStale), /STALE/)
+
+    // The persisted index carries the machine verdict, not the agent's word.
+    const persisted = loadFindings(cfg)
+    assert.equal(persisted[0]!.verification, 'verified')
+    assert.equal(persisted[0]!.status, 'confirmed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
